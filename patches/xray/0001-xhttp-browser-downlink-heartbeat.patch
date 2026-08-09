@@ -1,0 +1,204 @@
+From 5ca6f4b7d4dc20a881d4330e498892697627ec0c Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 14:00:00 +0800
+Subject: [PATCH] xhttp: frame browser downlinks and send heartbeats
+
+Browser clients cannot issue HTTP/2 PING frames. Opted-in AndroidCyaml
+downlinks therefore frame proxy data and receive an empty heartbeat frame
+every 30 seconds on the active response body. Unmodified clients retain the
+original byte stream.
+
+diff --git a/transport/internet/splithttp/downlink_frame_test.go b/transport/internet/splithttp/downlink_frame_test.go
+new file mode 100644
+index 0000000..720e7f8
+--- /dev/null
++++ b/transport/internet/splithttp/downlink_frame_test.go
+@@ -0,0 +1,51 @@
++package splithttp
++
++import (
++	"bytes"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/xtls/xray-core/common/signal/done"
++)
++
++func TestFramedDownlinkWritesDataAndHeartbeat(t *testing.T) {
++	recorder := httptest.NewRecorder()
++	conn := &httpServerConn{
++		Instance:       done.New(),
++		ResponseWriter: recorder,
++		framedDownlink: true,
++	}
++
++	payload := []byte("proxy bytes")
++	n, err := conn.Write(payload)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if n != len(payload) {
++		t.Fatalf("Write returned %d, want %d", n, len(payload))
++	}
++	if err := conn.writeDownlinkHeartbeat(); err != nil {
++		t.Fatal(err)
++	}
++
++	want := append([]byte{downlinkDataFrame, 0, 0, 0, byte(len(payload))}, payload...)
++	want = append(want, downlinkHeartbeatFrame, 0, 0, 0, 0)
++	if !bytes.Equal(recorder.Body.Bytes(), want) {
++		t.Fatalf("framed body = %x, want %x", recorder.Body.Bytes(), want)
++	}
++}
++
++func TestUnframedDownlinkRemainsRaw(t *testing.T) {
++	recorder := httptest.NewRecorder()
++	conn := &httpServerConn{
++		Instance:       done.New(),
++		ResponseWriter: recorder,
++	}
++	payload := []byte("raw proxy bytes")
++	if _, err := conn.Write(payload); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(recorder.Body.Bytes(), payload) {
++		t.Fatalf("body = %x, want %x", recorder.Body.Bytes(), payload)
++	}
++}
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index d664c86..484e2e0 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	gotls "crypto/tls"
+ 	"encoding/base64"
++	"encoding/binary"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+@@ -32,6 +33,15 @@ import (
+ 	"github.com/xtls/xray-core/transport/internet/tls"
+ )
+ 
++const (
++	downlinkFramingHeader     = "X-AndroidCyaml-XHTTP-Framing"
++	downlinkFramingV1         = "v1"
++	downlinkDataFrame         = byte(0)
++	downlinkHeartbeatFrame    = byte(1)
++	downlinkHeartbeatInterval = 30 * time.Second
++	downlinkFrameHeaderSize   = 5
++)
++
+ type requestHandler struct {
+ 	config         *Config
+ 	host           string
+@@ -346,6 +356,8 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
+ 
+ 		writer.WriteHeader(http.StatusOK)
+ 	} else if request.Method == "GET" || sessionId == "" { // stream-down, stream-one
++		framedDownlink := sessionId != "" &&
++			request.Header.Get(downlinkFramingHeader) == downlinkFramingV1
+ 		if sessionId != "" {
+ 			// after GET is done, the connection is finished. disable automatic
+ 			// session reaping, and handle it in defer
+@@ -364,6 +376,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
+ 			// magic header to make the HTTP middle box consider this as SSE to disable buffer
+ 			writer.Header().Set("Content-Type", "text/event-stream")
+ 		}
++		if framedDownlink {
++			writer.Header().Set(downlinkFramingHeader, downlinkFramingV1)
++		}
+ 
+ 		writer.WriteHeader(http.StatusOK)
+ 		writer.(http.Flusher).Flush()
+@@ -372,6 +387,10 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
+ 			Instance:       done.New(),
+ 			Reader:         request.Body,
+ 			ResponseWriter: writer,
++			framedDownlink: framedDownlink,
++		}
++		if framedDownlink {
++			go httpSC.runDownlinkHeartbeats(request.Context(), downlinkHeartbeatInterval)
+ 		}
+ 		localAddr := h.localAddr
+ 		if la, ok := request.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && la != nil {
+@@ -407,6 +426,7 @@ type httpServerConn struct {
+ 	*done.Instance
+ 	io.Reader // no need to Close request.Body
+ 	http.ResponseWriter
++	framedDownlink bool
+ }
+ 
+ func (c *httpServerConn) Write(b []byte) (int, error) {
+@@ -415,13 +435,66 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
+ 	if c.Done() {
+ 		return 0, io.ErrClosedPipe
+ 	}
+-	n, err := c.ResponseWriter.Write(b)
++	var n int
++	var err error
++	if c.framedDownlink {
++		n, err = writeDownlinkFrame(c.ResponseWriter, downlinkDataFrame, b)
++	} else {
++		n, err = c.ResponseWriter.Write(b)
++	}
+ 	if err == nil {
+ 		c.ResponseWriter.(http.Flusher).Flush()
+ 	}
+ 	return n, err
+ }
+ 
++func (c *httpServerConn) writeDownlinkHeartbeat() error {
++	c.Lock()
++	defer c.Unlock()
++	if c.Done() {
++		return io.ErrClosedPipe
++	}
++	_, err := writeDownlinkFrame(c.ResponseWriter, downlinkHeartbeatFrame, nil)
++	if err == nil {
++		c.ResponseWriter.(http.Flusher).Flush()
++	}
++	return err
++}
++
++func (c *httpServerConn) runDownlinkHeartbeats(ctx context.Context, interval time.Duration) {
++	ticker := time.NewTicker(interval)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ctx.Done():
++			return
++		case <-c.Wait():
++			return
++		case <-ticker.C:
++			if err := c.writeDownlinkHeartbeat(); err != nil {
++				_ = c.Close()
++				return
++			}
++		}
++	}
++}
++
++func writeDownlinkFrame(writer io.Writer, frameType byte, payload []byte) (int, error) {
++	if uint64(len(payload)) > uint64(^uint32(0)) {
++		return 0, fmt.Errorf("xhttp downlink frame is too large: %d", len(payload))
++	}
++	var header [downlinkFrameHeaderSize]byte
++	header[0] = frameType
++	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
++	if _, err := writer.Write(header[:]); err != nil {
++		return 0, err
++	}
++	if len(payload) == 0 {
++		return 0, nil
++	}
++	return writer.Write(payload)
++}
++
+ func (c *httpServerConn) Close() error {
+ 	c.Lock()
+ 	defer c.Unlock()
+--
+2.47.3
+

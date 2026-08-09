@@ -1,0 +1,38 @@
+name: Test downstream patches
+
+on:
+  push:
+    branches:
+      - AndroidCyaml
+    paths:
+      - "patches/xray/**"
+      - ".github/workflows/sync-upstream.yml"
+      - ".github/workflows/test-patches.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out patch branch
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: false
+
+      - name: Apply and test XHTTP patch
+        run: |
+          set -euo pipefail
+          for patch in patches/xray/*.patch; do
+            git apply --check "${patch}"
+            git apply "${patch}"
+          done
+          git diff --check
+          go test ./transport/internet/splithttp
