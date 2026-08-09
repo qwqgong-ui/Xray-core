@@ -62,7 +62,7 @@ func newAggregationTestConn(interval time.Duration) (*httpServerConn, *recording
 	}, writer
 }
 
-func TestDownlinkAggregationDefaultsMatchHTTP2Frame(t *testing.T) {
+func TestDownlinkAggregationDefaultsUseHTTP2SizedSoftTarget(t *testing.T) {
 	if downlinkFlushThreshold != 16*1024 {
 		t.Fatalf("threshold = %d, want 16384", downlinkFlushThreshold)
 	}
@@ -88,7 +88,7 @@ func TestDownlinkAggregationDisabledFlushesEachWrite(t *testing.T) {
 	}
 }
 
-func TestDownlinkAggregationRollsOverflowIntoNextWindow(t *testing.T) {
+func TestDownlinkAggregationDoesNotSplitLargeWrite(t *testing.T) {
 	conn, writer := newAggregationTestConn(time.Hour)
 	conn.SetDownlinkWriteAggregation(true)
 
@@ -101,30 +101,53 @@ func TestDownlinkAggregationRollsOverflowIntoNextWindow(t *testing.T) {
 	}
 
 	writes, flushes := writer.snapshot()
-	if len(writes) != 2 {
-		t.Fatalf("writes before close = %d, want 2 full windows", len(writes))
+	if len(writes) != 1 || len(writes[0]) != len(payload) {
+		t.Fatalf("write lengths = %v, want [%d]", writeLengths(writes), len(payload))
 	}
-	for i, write := range writes {
-		if len(write) != downlinkFlushThreshold {
-			t.Fatalf("write[%d] length = %d, want %d", i, len(write), downlinkFlushThreshold)
-		}
+	if flushes != 1 {
+		t.Fatalf("flushes = %d, want 1", flushes)
 	}
-	if flushes != 2 {
-		t.Fatalf("flushes before close = %d, want 2", flushes)
+	if got := bytes.Join(writes, nil); !bytes.Equal(got, payload) {
+		t.Fatal("large write changed payload bytes or ordering")
 	}
-
+	if cap(conn.writeBuf) != 0 {
+		t.Fatalf("large-write fast path retained %d bytes of buffer capacity", cap(conn.writeBuf))
+	}
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
-	writes, flushes = writer.snapshot()
-	if len(writes) != 3 || len(writes[2]) != 37 {
-		t.Fatalf("write lengths after close = %v, want [16384 16384 37]", writeLengths(writes))
+}
+
+func TestDownlinkAggregationFlushesWholeBatchPastSoftTarget(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	conn.SetDownlinkWriteAggregation(true)
+
+	first := bytes.Repeat([]byte{1}, downlinkFlushThreshold/2)
+	second := bytes.Repeat([]byte{2}, downlinkFlushThreshold/2+37)
+	if _, err := conn.Write(first); err != nil {
+		t.Fatal(err)
 	}
-	if flushes != 3 {
-		t.Fatalf("flushes after close = %d, want 3", flushes)
+	if writes, flushes := writer.snapshot(); len(writes) != 0 || flushes != 0 {
+		t.Fatalf("first partial write flushed early: writes=%v flushes=%d", writeLengths(writes), flushes)
 	}
-	if got := bytes.Join(writes, nil); !bytes.Equal(got, payload) {
-		t.Fatal("windowed writes changed payload bytes or ordering")
+	if _, err := conn.Write(second); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, flushes := writer.snapshot()
+	wantLength := len(first) + len(second)
+	if len(writes) != 1 || len(writes[0]) != wantLength {
+		t.Fatalf("write lengths = %v, want [%d]", writeLengths(writes), wantLength)
+	}
+	if flushes != 1 {
+		t.Fatalf("flushes = %d, want 1", flushes)
+	}
+	want := append(bytes.Clone(first), second...)
+	if !bytes.Equal(writes[0], want) {
+		t.Fatal("soft-target batch changed payload bytes or ordering")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -138,9 +161,9 @@ func TestDownlinkAggregationTimerFlushesPartialWindow(t *testing.T) {
 	deadline := time.Now().Add(250 * time.Millisecond)
 	for {
 		writes, flushes := writer.snapshot()
-		if len(writes) == 1 {
-			if string(writes[0]) != "partial" || flushes != 1 {
-				t.Fatalf("writes = %q, flushes = %d", writes, flushes)
+		if len(writes) == 1 && flushes == 1 {
+			if string(writes[0]) != "partial" {
+				t.Fatalf("writes = %q, want partial", writes)
 			}
 			break
 		}
@@ -252,6 +275,7 @@ func TestFramedDownlinkAggregationPreservesStream(t *testing.T) {
 	writes, _ := writer.snapshot()
 	stream := bytes.Join(writes, nil)
 	var decoded []byte
+	dataFrames := 0
 	for len(stream) > 0 {
 		if len(stream) < downlinkFrameHeaderSize {
 			t.Fatalf("truncated frame header: %d bytes", len(stream))
@@ -264,9 +288,7 @@ func TestFramedDownlinkAggregationPreservesStream(t *testing.T) {
 		}
 		switch frameType {
 		case downlinkDataFrame:
-			if length > downlinkFlushThreshold {
-				t.Fatalf("data frame length = %d, want <= %d", length, downlinkFlushThreshold)
-			}
+			dataFrames++
 			decoded = append(decoded, stream[:length]...)
 		case downlinkHeartbeatFrame:
 			if length != 0 {
@@ -279,6 +301,9 @@ func TestFramedDownlinkAggregationPreservesStream(t *testing.T) {
 	}
 	if !bytes.Equal(decoded, payload) {
 		t.Fatal("framed aggregation changed payload bytes or ordering")
+	}
+	if dataFrames != 1 {
+		t.Fatalf("framed large write used %d data frames, want 1 application frame", dataFrames)
 	}
 }
 

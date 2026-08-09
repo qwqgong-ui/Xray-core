@@ -437,6 +437,8 @@ type httpServerConn struct {
 }
 
 const (
+	// downlinkFlushThreshold is a soft batching target, not a frame size.
+	// net/http decides the final HTTP/2 DATA frame boundaries.
 	downlinkFlushThreshold = 16 << 10
 	downlinkFlushInterval  = time.Millisecond
 )
@@ -457,30 +459,29 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
 		return c.writeAndFlushLocked(b)
 	}
 
-	total := len(b)
-	written := 0
-	for len(b) > 0 {
-		if len(c.writeBuf) == 0 {
-			c.armFlushTimerLocked()
-		}
-
-		remaining := downlinkFlushThreshold - len(c.writeBuf)
-		if remaining > len(b) {
-			remaining = len(b)
-		}
-		c.writeBuf = append(c.writeBuf, b[:remaining]...)
-		b = b[remaining:]
-		written += remaining
-
-		if len(c.writeBuf) == downlinkFlushThreshold {
-			c.stopFlushTimerLocked()
-			if err := c.flushLocked(); err != nil {
+	if len(c.writeBuf) == 0 {
+		// A write that already reaches the batching target does not need a
+		// copy or an artificial 16 KiB split. Flush it as one application
+		// write and let net/http perform protocol-level framing.
+		if len(b) >= downlinkFlushThreshold {
+			n, err := c.writeAndFlushLocked(b)
+			if err != nil {
 				c.writeErr = err
-				return written, err
 			}
+			return n, err
+		}
+		c.armFlushTimerLocked()
+	}
+
+	c.writeBuf = append(c.writeBuf, b...)
+	if len(c.writeBuf) >= downlinkFlushThreshold {
+		c.stopFlushTimerLocked()
+		if err := c.flushLocked(); err != nil {
+			c.writeErr = err
+			return len(b), err
 		}
 	}
-	return total, nil
+	return len(b), nil
 }
 
 // SetDownlinkWriteAggregation is called by an upper-layer protocol only after
