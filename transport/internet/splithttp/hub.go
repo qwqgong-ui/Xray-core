@@ -439,9 +439,39 @@ type httpServerConn struct {
 const (
 	// downlinkFlushThreshold is a soft batching target, not a frame size.
 	// net/http decides the final HTTP/2 DATA frame boundaries.
-	downlinkFlushThreshold = 16 << 10
-	downlinkFlushInterval  = time.Millisecond
+	downlinkFlushThreshold   = 16 << 10
+	downlinkFlushInterval    = time.Millisecond
+	downlinkPrewarmedBuffers = 8
 )
+
+var downlinkWriteBufferPool = newDownlinkWriteBufferPool()
+
+func newDownlinkWriteBufferPool() chan []byte {
+	pool := make(chan []byte, downlinkPrewarmedBuffers)
+	for i := 0; i < downlinkPrewarmedBuffers; i++ {
+		pool <- make([]byte, 0, downlinkFlushThreshold)
+	}
+	return pool
+}
+
+func acquireDownlinkWriteBuffer(pool chan []byte) []byte {
+	select {
+	case buffer := <-pool:
+		return buffer[:0]
+	default:
+		return make([]byte, 0, downlinkFlushThreshold)
+	}
+}
+
+func releaseDownlinkWriteBuffer(pool chan []byte, buffer []byte) {
+	if cap(buffer) != downlinkFlushThreshold {
+		return
+	}
+	select {
+	case pool <- buffer[:0]:
+	default:
+	}
+}
 
 func (c *httpServerConn) Write(b []byte) (int, error) {
 	c.Lock()
@@ -470,7 +500,31 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
 			}
 			return n, err
 		}
+		// Allocate the complete soft-target capacity on the first buffered
+		// small write. This stays lazy so enabling aggregation and the large-
+		// write fast path do not reserve per-connection memory.
+		if cap(c.writeBuf) < downlinkFlushThreshold {
+			c.writeBuf = acquireDownlinkWriteBuffer(downlinkWriteBufferPool)
+		}
 		c.armFlushTimerLocked()
+	}
+
+	// A soft-target batch may cross 16 KiB when the next application write is
+	// larger than the remaining capacity. Build that one batch separately so
+	// it is still emitted as a single write without growing (and permanently
+	// losing) one of the reusable 16 KiB windows.
+	if len(c.writeBuf)+len(b) > cap(c.writeBuf) {
+		c.stopFlushTimerLocked()
+		batch := make([]byte, len(c.writeBuf)+len(b))
+		copy(batch, c.writeBuf)
+		copy(batch[len(c.writeBuf):], b)
+		_, err := c.writeAndFlushLocked(batch)
+		c.writeBuf = c.writeBuf[:0]
+		if err != nil {
+			c.writeErr = err
+			return len(b), err
+		}
+		return len(b), nil
 	}
 
 	c.writeBuf = append(c.writeBuf, b...)
@@ -499,6 +553,7 @@ func (c *httpServerConn) SetDownlinkWriteAggregation(enabled bool) {
 		if err := c.flushLocked(); err != nil && c.writeErr == nil {
 			c.writeErr = err
 		}
+		c.releaseWriteBufferLocked()
 	}
 }
 
@@ -633,6 +688,11 @@ func (c *httpServerConn) flushLocked() error {
 	return err
 }
 
+func (c *httpServerConn) releaseWriteBufferLocked() {
+	releaseDownlinkWriteBuffer(downlinkWriteBufferPool, c.writeBuf)
+	c.writeBuf = nil
+}
+
 func (c *httpServerConn) Close() error {
 	c.Lock()
 	defer c.Unlock()
@@ -642,6 +702,7 @@ func (c *httpServerConn) Close() error {
 	if !c.Done() && c.writeErr == nil {
 		flushErr = c.flushLocked()
 	}
+	c.releaseWriteBufferLocked()
 	closeErr := c.Instance.Close()
 	if flushErr != nil {
 		return flushErr

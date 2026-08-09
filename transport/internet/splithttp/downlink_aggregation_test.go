@@ -69,6 +69,43 @@ func TestDownlinkAggregationDefaultsUseHTTP2SizedSoftTarget(t *testing.T) {
 	if downlinkFlushInterval != time.Millisecond {
 		t.Fatalf("interval = %s, want 1ms", downlinkFlushInterval)
 	}
+	if downlinkPrewarmedBuffers != 8 {
+		t.Fatalf("prewarmed buffers = %d, want 8", downlinkPrewarmedBuffers)
+	}
+}
+
+func TestDownlinkWriteBufferPoolPrewarmsEightWindows(t *testing.T) {
+	pool := newDownlinkWriteBufferPool()
+	if len(pool) != downlinkPrewarmedBuffers || cap(pool) != downlinkPrewarmedBuffers {
+		t.Fatalf("pool = len %d cap %d, want %d", len(pool), cap(pool), downlinkPrewarmedBuffers)
+	}
+	for i := 0; i < downlinkPrewarmedBuffers; i++ {
+		buffer := <-pool
+		if len(buffer) != 0 || cap(buffer) != downlinkFlushThreshold {
+			t.Fatalf("buffer[%d] = len %d cap %d, want len 0 cap %d", i, len(buffer), cap(buffer), downlinkFlushThreshold)
+		}
+	}
+}
+
+func TestDownlinkWriteBufferPoolUsesNonblockingBoundedFallback(t *testing.T) {
+	pool := newDownlinkWriteBufferPool()
+	buffers := make([][]byte, downlinkPrewarmedBuffers+1)
+	for i := range buffers {
+		buffers[i] = acquireDownlinkWriteBuffer(pool)
+		if len(buffers[i]) != 0 || cap(buffers[i]) != downlinkFlushThreshold {
+			t.Fatalf("buffer[%d] = len %d cap %d, want len 0 cap %d", i, len(buffers[i]), cap(buffers[i]), downlinkFlushThreshold)
+		}
+	}
+	if len(pool) != 0 {
+		t.Fatalf("pool length after %d acquisitions = %d, want 0", len(buffers), len(pool))
+	}
+
+	for _, buffer := range buffers {
+		releaseDownlinkWriteBuffer(pool, buffer)
+	}
+	if len(pool) != downlinkPrewarmedBuffers {
+		t.Fatalf("pool length after %d releases = %d, want bounded length %d", len(buffers), len(pool), downlinkPrewarmedBuffers)
+	}
 }
 
 func TestDownlinkAggregationDisabledFlushesEachWrite(t *testing.T) {
@@ -116,6 +153,52 @@ func TestDownlinkAggregationDoesNotSplitLargeWrite(t *testing.T) {
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if cap(conn.writeBuf) != 0 {
+		t.Fatalf("closed connection retained %d bytes of buffer capacity", cap(conn.writeBuf))
+	}
+}
+
+func TestDownlinkAggregationLazilyPreallocatesAndReusesSoftTarget(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	if cap(conn.writeBuf) != 0 {
+		t.Fatalf("initial buffer capacity = %d, want 0", cap(conn.writeBuf))
+	}
+	conn.SetDownlinkWriteAggregation(true)
+	if cap(conn.writeBuf) != 0 {
+		t.Fatalf("enabling aggregation allocated %d bytes, want 0", cap(conn.writeBuf))
+	}
+
+	const firstSize = 2 * 1024
+	if _, err := conn.Write(bytes.Repeat([]byte{1}, firstSize)); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.writeBuf) != firstSize || cap(conn.writeBuf) != downlinkFlushThreshold {
+		t.Fatalf("buffer after first small write = len %d cap %d, want len %d cap %d", len(conn.writeBuf), cap(conn.writeBuf), firstSize, downlinkFlushThreshold)
+	}
+
+	if _, err := conn.Write(bytes.Repeat([]byte{2}, downlinkFlushThreshold-firstSize)); err != nil {
+		t.Fatal(err)
+	}
+	if len(conn.writeBuf) != 0 || cap(conn.writeBuf) != downlinkFlushThreshold {
+		t.Fatalf("buffer after threshold flush = len %d cap %d, want len 0 cap %d", len(conn.writeBuf), cap(conn.writeBuf), downlinkFlushThreshold)
+	}
+	writes, flushes := writer.snapshot()
+	if len(writes) != 1 || len(writes[0]) != downlinkFlushThreshold || flushes != 1 {
+		t.Fatalf("writes = %v, flushes = %d, want one %d-byte write and flush", writeLengths(writes), flushes, downlinkFlushThreshold)
+	}
+
+	if _, err := conn.Write([]byte("reused")); err != nil {
+		t.Fatal(err)
+	}
+	if cap(conn.writeBuf) != downlinkFlushThreshold {
+		t.Fatalf("reused buffer capacity = %d, want %d", cap(conn.writeBuf), downlinkFlushThreshold)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if cap(conn.writeBuf) != 0 {
+		t.Fatalf("closed connection retained %d bytes of buffer capacity", cap(conn.writeBuf))
+	}
 }
 
 func TestDownlinkAggregationFlushesWholeBatchPastSoftTarget(t *testing.T) {
@@ -142,9 +225,42 @@ func TestDownlinkAggregationFlushesWholeBatchPastSoftTarget(t *testing.T) {
 	if flushes != 1 {
 		t.Fatalf("flushes = %d, want 1", flushes)
 	}
+	if len(conn.writeBuf) != 0 || cap(conn.writeBuf) != downlinkFlushThreshold {
+		t.Fatalf("buffer after soft-target overshoot = len %d cap %d, want len 0 cap %d", len(conn.writeBuf), cap(conn.writeBuf), downlinkFlushThreshold)
+	}
 	want := append(bytes.Clone(first), second...)
 	if !bytes.Equal(writes[0], want) {
 		t.Fatal("soft-target batch changed payload bytes or ordering")
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDownlinkAggregationDoesNotGrowWindowForLargeWriteAfterPartialBatch(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	conn.SetDownlinkWriteAggregation(true)
+
+	first := bytes.Repeat([]byte{1}, 2*1024)
+	second := bytes.Repeat([]byte{2}, 4*downlinkFlushThreshold)
+	if _, err := conn.Write(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(second); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, flushes := writer.snapshot()
+	wantLength := len(first) + len(second)
+	if len(writes) != 1 || len(writes[0]) != wantLength || flushes != 1 {
+		t.Fatalf("write lengths = %v, flushes = %d, want one %d-byte write and flush", writeLengths(writes), flushes, wantLength)
+	}
+	if len(conn.writeBuf) != 0 || cap(conn.writeBuf) != downlinkFlushThreshold {
+		t.Fatalf("buffer after large following write = len %d cap %d, want len 0 cap %d", len(conn.writeBuf), cap(conn.writeBuf), downlinkFlushThreshold)
+	}
+	want := append(bytes.Clone(first), second...)
+	if !bytes.Equal(writes[0], want) {
+		t.Fatal("large following write changed payload bytes or ordering")
 	}
 	if err := conn.Close(); err != nil {
 		t.Fatal(err)
