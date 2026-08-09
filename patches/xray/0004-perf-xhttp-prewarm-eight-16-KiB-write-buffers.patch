@@ -1,0 +1,355 @@
+From 1616db0721406b1d9704dbf3a687c913bfa0f4f1 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 17:30:49 +0800
+Subject: [PATCH] perf(xhttp): prewarm eight 16 KiB write buffers
+
+---
+ .../splithttp/downlink_aggregation_test.go    | 116 ++++++++++++++++++
+ .../splithttp/downlink_prealloc_bench_test.go |  77 ++++++++++++
+ transport/internet/splithttp/hub.go           |  65 +++++++++-
+ 3 files changed, 256 insertions(+), 2 deletions(-)
+ create mode 100644 transport/internet/splithttp/downlink_prealloc_bench_test.go
+
+diff --git a/transport/internet/splithttp/downlink_aggregation_test.go b/transport/internet/splithttp/downlink_aggregation_test.go
+index 2693fed..add95ee 100644
+--- a/transport/internet/splithttp/downlink_aggregation_test.go
++++ b/transport/internet/splithttp/downlink_aggregation_test.go
+@@ -69,6 +69,43 @@ func TestDownlinkAggregationDefaultsUseHTTP2SizedSoftTarget(t *testing.T) {
+ 	if downlinkFlushInterval != time.Millisecond {
+ 		t.Fatalf("interval = %s, want 1ms", downlinkFlushInterval)
+ 	}
++	if downlinkPrewarmedBuffers != 8 {
++		t.Fatalf("prewarmed buffers = %d, want 8", downlinkPrewarmedBuffers)
++	}
++}
++
++func TestDownlinkWriteBufferPoolPrewarmsEightWindows(t *testing.T) {
++	pool := newDownlinkWriteBufferPool()
++	if len(pool) != downlinkPrewarmedBuffers || cap(pool) != downlinkPrewarmedBuffers {
++		t.Fatalf("pool = len %d cap %d, want %d", len(pool), cap(pool), downlinkPrewarmedBuffers)
++	}
++	for i := 0; i < downlinkPrewarmedBuffers; i++ {
++		buffer := <-pool
++		if len(buffer) != 0 || cap(buffer) != downlinkFlushThreshold {
++			t.Fatalf("buffer[%d] = len %d cap %d, want len 0 cap %d", i, len(buffer), cap(buffer), downlinkFlushThreshold)
++		}
++	}
++}
++
++func TestDownlinkWriteBufferPoolUsesNonblockingBoundedFallback(t *testing.T) {
++	pool := newDownlinkWriteBufferPool()
++	buffers := make([][]byte, downlinkPrewarmedBuffers+1)
++	for i := range buffers {
++		buffers[i] = acquireDownlinkWriteBuffer(pool)
++		if len(buffers[i]) != 0 || cap(buffers[i]) != downlinkFlushThreshold {
++			t.Fatalf("buffer[%d] = len %d cap %d, want len 0 cap %d", i, len(buffers[i]), cap(buffers[i]), downlinkFlushThreshold)
++		}
++	}
++	if len(pool) != 0 {
++		t.Fatalf("pool length after %d acquisitions = %d, want 0", len(buffers), len(pool))
++	}
++
++	for _, buffer := range buffers {
++		releaseDownlinkWriteBuffer(pool, buffer)
++	}
++	if len(pool) != downlinkPrewarmedBuffers {
++		t.Fatalf("pool length after %d releases = %d, want bounded length %d", len(buffers), len(pool), downlinkPrewarmedBuffers)
++	}
+ }
+ 
+ func TestDownlinkAggregationDisabledFlushesEachWrite(t *testing.T) {
+@@ -116,6 +153,52 @@ func TestDownlinkAggregationDoesNotSplitLargeWrite(t *testing.T) {
+ 	if err := conn.Close(); err != nil {
+ 		t.Fatal(err)
+ 	}
++	if cap(conn.writeBuf) != 0 {
++		t.Fatalf("closed connection retained %d bytes of buffer capacity", cap(conn.writeBuf))
++	}
++}
++
++func TestDownlinkAggregationLazilyPreallocatesAndReusesSoftTarget(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	if cap(conn.writeBuf) != 0 {
++		t.Fatalf("initial buffer capacity = %d, want 0", cap(conn.writeBuf))
++	}
++	conn.SetDownlinkWriteAggregation(true)
++	if cap(conn.writeBuf) != 0 {
++		t.Fatalf("enabling aggregation allocated %d bytes, want 0", cap(conn.writeBuf))
++	}
++
++	const firstSize = 2 * 1024
++	if _, err := conn.Write(bytes.Repeat([]byte{1}, firstSize)); err != nil {
++		t.Fatal(err)
++	}
++	if len(conn.writeBuf) != firstSize || cap(conn.writeBuf) != downlinkFlushThreshold {
++		t.Fatalf("buffer after first small write = len %d cap %d, want len %d cap %d", len(conn.writeBuf), cap(conn.writeBuf), firstSize, downlinkFlushThreshold)
++	}
++
++	if _, err := conn.Write(bytes.Repeat([]byte{2}, downlinkFlushThreshold-firstSize)); err != nil {
++		t.Fatal(err)
++	}
++	if len(conn.writeBuf) != 0 || cap(conn.writeBuf) != downlinkFlushThreshold {
++		t.Fatalf("buffer after threshold flush = len %d cap %d, want len 0 cap %d", len(conn.writeBuf), cap(conn.writeBuf), downlinkFlushThreshold)
++	}
++	writes, flushes := writer.snapshot()
++	if len(writes) != 1 || len(writes[0]) != downlinkFlushThreshold || flushes != 1 {
++		t.Fatalf("writes = %v, flushes = %d, want one %d-byte write and flush", writeLengths(writes), flushes, downlinkFlushThreshold)
++	}
++
++	if _, err := conn.Write([]byte("reused")); err != nil {
++		t.Fatal(err)
++	}
++	if cap(conn.writeBuf) != downlinkFlushThreshold {
++		t.Fatalf("reused buffer capacity = %d, want %d", cap(conn.writeBuf), downlinkFlushThreshold)
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if cap(conn.writeBuf) != 0 {
++		t.Fatalf("closed connection retained %d bytes of buffer capacity", cap(conn.writeBuf))
++	}
+ }
+ 
+ func TestDownlinkAggregationFlushesWholeBatchPastSoftTarget(t *testing.T) {
+@@ -142,6 +225,9 @@ func TestDownlinkAggregationFlushesWholeBatchPastSoftTarget(t *testing.T) {
+ 	if flushes != 1 {
+ 		t.Fatalf("flushes = %d, want 1", flushes)
+ 	}
++	if len(conn.writeBuf) != 0 || cap(conn.writeBuf) != downlinkFlushThreshold {
++		t.Fatalf("buffer after soft-target overshoot = len %d cap %d, want len 0 cap %d", len(conn.writeBuf), cap(conn.writeBuf), downlinkFlushThreshold)
++	}
+ 	want := append(bytes.Clone(first), second...)
+ 	if !bytes.Equal(writes[0], want) {
+ 		t.Fatal("soft-target batch changed payload bytes or ordering")
+@@ -151,6 +237,36 @@ func TestDownlinkAggregationFlushesWholeBatchPastSoftTarget(t *testing.T) {
+ 	}
+ }
+ 
++func TestDownlinkAggregationDoesNotGrowWindowForLargeWriteAfterPartialBatch(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	conn.SetDownlinkWriteAggregation(true)
++
++	first := bytes.Repeat([]byte{1}, 2*1024)
++	second := bytes.Repeat([]byte{2}, 4*downlinkFlushThreshold)
++	if _, err := conn.Write(first); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := conn.Write(second); err != nil {
++		t.Fatal(err)
++	}
++
++	writes, flushes := writer.snapshot()
++	wantLength := len(first) + len(second)
++	if len(writes) != 1 || len(writes[0]) != wantLength || flushes != 1 {
++		t.Fatalf("write lengths = %v, flushes = %d, want one %d-byte write and flush", writeLengths(writes), flushes, wantLength)
++	}
++	if len(conn.writeBuf) != 0 || cap(conn.writeBuf) != downlinkFlushThreshold {
++		t.Fatalf("buffer after large following write = len %d cap %d, want len 0 cap %d", len(conn.writeBuf), cap(conn.writeBuf), downlinkFlushThreshold)
++	}
++	want := append(bytes.Clone(first), second...)
++	if !bytes.Equal(writes[0], want) {
++		t.Fatal("large following write changed payload bytes or ordering")
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
+ func TestDownlinkAggregationTimerFlushesPartialWindow(t *testing.T) {
+ 	conn, writer := newAggregationTestConn(0)
+ 	conn.SetDownlinkWriteAggregation(true)
+diff --git a/transport/internet/splithttp/downlink_prealloc_bench_test.go b/transport/internet/splithttp/downlink_prealloc_bench_test.go
+new file mode 100644
+index 0000000..6cf1469
+--- /dev/null
++++ b/transport/internet/splithttp/downlink_prealloc_bench_test.go
+@@ -0,0 +1,77 @@
++package splithttp
++
++import (
++	"bytes"
++	"net/http"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/signal/done"
++)
++
++type discardFlushingResponseWriter struct {
++	header http.Header
++}
++
++func (w *discardFlushingResponseWriter) Header() http.Header {
++	return w.header
++}
++
++func (*discardFlushingResponseWriter) WriteHeader(int) {}
++
++func (*discardFlushingResponseWriter) Write(p []byte) (int, error) {
++	return len(p), nil
++}
++
++func (*discardFlushingResponseWriter) Flush() {}
++
++func runDownlinkAggregationSmallWriteLifecycle(payload []byte, writer http.ResponseWriter) error {
++	conn := &httpServerConn{
++		Instance:       done.New(),
++		Reader:         bytes.NewReader(nil),
++		ResponseWriter: writer,
++		flushInterval:  time.Hour,
++	}
++	conn.SetDownlinkWriteAggregation(true)
++	for written := 0; written < downlinkFlushThreshold; written += len(payload) {
++		if _, err := conn.Write(payload); err != nil {
++			return err
++		}
++	}
++	return conn.Close()
++}
++
++func BenchmarkDownlinkAggregationSmallWriteLifecycle(b *testing.B) {
++	payload := bytes.Repeat([]byte{1}, 2*1024)
++	writer := &discardFlushingResponseWriter{header: make(http.Header)}
++
++	b.ReportAllocs()
++	b.SetBytes(downlinkFlushThreshold)
++	b.ResetTimer()
++	for i := 0; i < b.N; i++ {
++		if err := runDownlinkAggregationSmallWriteLifecycle(payload, writer); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
++
++func BenchmarkDownlinkAggregationSmallWriteLifecycleParallel(b *testing.B) {
++	payload := bytes.Repeat([]byte{1}, 2*1024)
++
++	// Eight workers per P deliberately creates more simultaneous lifecycles
++	// than the bounded prewarmed pool on ordinary 2-vCPU servers. This covers
++	// both pooled acquisition and the non-blocking allocation fallback.
++	b.SetParallelism(8)
++	b.ReportAllocs()
++	b.SetBytes(downlinkFlushThreshold)
++	b.ResetTimer()
++	b.RunParallel(func(pb *testing.PB) {
++		writer := &discardFlushingResponseWriter{header: make(http.Header)}
++		for pb.Next() {
++			if err := runDownlinkAggregationSmallWriteLifecycle(payload, writer); err != nil {
++				b.Error(err)
++				return
++			}
++		}
++	})
++}
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index afb845f..670e2d8 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -439,10 +439,40 @@ type httpServerConn struct {
+ const (
+ 	// downlinkFlushThreshold is a soft batching target, not a frame size.
+ 	// net/http decides the final HTTP/2 DATA frame boundaries.
+-	downlinkFlushThreshold = 16 << 10
+-	downlinkFlushInterval  = time.Millisecond
++	downlinkFlushThreshold   = 16 << 10
++	downlinkFlushInterval    = time.Millisecond
++	downlinkPrewarmedBuffers = 8
+ )
+ 
++var downlinkWriteBufferPool = newDownlinkWriteBufferPool()
++
++func newDownlinkWriteBufferPool() chan []byte {
++	pool := make(chan []byte, downlinkPrewarmedBuffers)
++	for i := 0; i < downlinkPrewarmedBuffers; i++ {
++		pool <- make([]byte, 0, downlinkFlushThreshold)
++	}
++	return pool
++}
++
++func acquireDownlinkWriteBuffer(pool chan []byte) []byte {
++	select {
++	case buffer := <-pool:
++		return buffer[:0]
++	default:
++		return make([]byte, 0, downlinkFlushThreshold)
++	}
++}
++
++func releaseDownlinkWriteBuffer(pool chan []byte, buffer []byte) {
++	if cap(buffer) != downlinkFlushThreshold {
++		return
++	}
++	select {
++	case pool <- buffer[:0]:
++	default:
++	}
++}
++
+ func (c *httpServerConn) Write(b []byte) (int, error) {
+ 	c.Lock()
+ 	defer c.Unlock()
+@@ -470,9 +500,33 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
+ 			}
+ 			return n, err
+ 		}
++		// Allocate the complete soft-target capacity on the first buffered
++		// small write. This stays lazy so enabling aggregation and the large-
++		// write fast path do not reserve per-connection memory.
++		if cap(c.writeBuf) < downlinkFlushThreshold {
++			c.writeBuf = acquireDownlinkWriteBuffer(downlinkWriteBufferPool)
++		}
+ 		c.armFlushTimerLocked()
+ 	}
+ 
++	// A soft-target batch may cross 16 KiB when the next application write is
++	// larger than the remaining capacity. Build that one batch separately so
++	// it is still emitted as a single write without growing (and permanently
++	// losing) one of the reusable 16 KiB windows.
++	if len(c.writeBuf)+len(b) > cap(c.writeBuf) {
++		c.stopFlushTimerLocked()
++		batch := make([]byte, len(c.writeBuf)+len(b))
++		copy(batch, c.writeBuf)
++		copy(batch[len(c.writeBuf):], b)
++		_, err := c.writeAndFlushLocked(batch)
++		c.writeBuf = c.writeBuf[:0]
++		if err != nil {
++			c.writeErr = err
++			return len(b), err
++		}
++		return len(b), nil
++	}
++
+ 	c.writeBuf = append(c.writeBuf, b...)
+ 	if len(c.writeBuf) >= downlinkFlushThreshold {
+ 		c.stopFlushTimerLocked()
+@@ -499,6 +553,7 @@ func (c *httpServerConn) SetDownlinkWriteAggregation(enabled bool) {
+ 		if err := c.flushLocked(); err != nil && c.writeErr == nil {
+ 			c.writeErr = err
+ 		}
++		c.releaseWriteBufferLocked()
+ 	}
+ }
+ 
+@@ -633,6 +688,11 @@ func (c *httpServerConn) flushLocked() error {
+ 	return err
+ }
+ 
++func (c *httpServerConn) releaseWriteBufferLocked() {
++	releaseDownlinkWriteBuffer(downlinkWriteBufferPool, c.writeBuf)
++	c.writeBuf = nil
++}
++
+ func (c *httpServerConn) Close() error {
+ 	c.Lock()
+ 	defer c.Unlock()
+@@ -642,6 +702,7 @@ func (c *httpServerConn) Close() error {
+ 	if !c.Done() && c.writeErr == nil {
+ 		flushErr = c.flushLocked()
+ 	}
++	c.releaseWriteBufferLocked()
+ 	closeErr := c.Instance.Close()
+ 	if flushErr != nil {
+ 		return flushErr
+-- 
+2.55.0
+
