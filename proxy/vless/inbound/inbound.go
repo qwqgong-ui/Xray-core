@@ -614,6 +614,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 	if requestAddons.Flow == vless.XRV {
 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, connection, input, rawInput, nil)
 	}
+	if shouldAggregateDownlink(request) {
+		proxy.SetDownlinkWriteAggregation(inbound.Conn, true)
+	}
 
 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))
 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
@@ -639,6 +642,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
 		return errors.New("failed to dispatch request").Base(err)
 	}
 	return nil
+}
+
+func shouldAggregateDownlink(request *protocol.RequestHeader) bool {
+	return request != nil && request.Command == protocol.RequestCommandTCP && request.Port == net.Port(443)
 }
 
 type Reverse struct {

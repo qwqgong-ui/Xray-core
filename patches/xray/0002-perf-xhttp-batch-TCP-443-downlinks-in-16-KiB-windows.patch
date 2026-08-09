@@ -1,0 +1,701 @@
+From e0c5d65d560bf4ef2f0fc80c46980a5ca19ee590 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <248246420+qwqgong-ui@users.noreply.github.com>
+Date: Sun, 9 Aug 2026 15:38:34 +0800
+Subject: [PATCH] perf(xhttp): batch TCP 443 downlinks in 16 KiB windows
+
+---
+ proxy/downlink_aggregation_test.go            |  34 ++
+ proxy/proxy.go                                |  18 +
+ .../inbound/downlink_aggregation_test.go      |  30 ++
+ proxy/vless/inbound/inbound.go                |   7 +
+ transport/internet/splithttp/connection.go    |  12 +
+ .../splithttp/downlink_aggregation_test.go    | 307 ++++++++++++++++++
+ transport/internet/splithttp/hub.go           | 158 ++++++++-
+ 7 files changed, 562 insertions(+), 4 deletions(-)
+ create mode 100644 proxy/downlink_aggregation_test.go
+ create mode 100644 proxy/vless/inbound/downlink_aggregation_test.go
+ create mode 100644 transport/internet/splithttp/downlink_aggregation_test.go
+
+diff --git a/proxy/downlink_aggregation_test.go b/proxy/downlink_aggregation_test.go
+new file mode 100644
+index 0000000..767cf9e
+--- /dev/null
++++ b/proxy/downlink_aggregation_test.go
+@@ -0,0 +1,34 @@
++package proxy
++
++import (
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/transport/internet/stat"
++)
++
++type aggregationTestConn struct {
++	net.Conn
++	enabled bool
++}
++
++func (c *aggregationTestConn) SetDownlinkWriteAggregation(enabled bool) {
++	c.enabled = enabled
++}
++
++func TestSetDownlinkWriteAggregationUnwrapsStatsConnection(t *testing.T) {
++	raw := new(aggregationTestConn)
++	conn := &stat.CounterConnection{Connection: raw}
++	if !SetDownlinkWriteAggregation(conn, true) {
++		t.Fatal("supported connection was not detected")
++	}
++	if !raw.enabled {
++		t.Fatal("aggregation was not enabled on the underlying connection")
++	}
++}
++
++func TestSetDownlinkWriteAggregationIgnoresUnsupportedConnection(t *testing.T) {
++	if SetDownlinkWriteAggregation(nil, true) {
++		t.Fatal("nil connection unexpectedly reported aggregation support")
++	}
++}
+diff --git a/proxy/proxy.go b/proxy/proxy.go
+index ab7d7ab..e7df7bb 100644
+--- a/proxy/proxy.go
++++ b/proxy/proxy.go
+@@ -712,6 +712,24 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
+ 	return conn, readCounter, writerCounter
+ }
+ 
++type downlinkWriteAggregator interface {
++	SetDownlinkWriteAggregation(bool)
++}
++
++// SetDownlinkWriteAggregation asks a supporting transport to batch response
++// writes. Protocol handlers call this only after they have decoded enough
++// metadata to decide whether aggregation is appropriate. Unsupported
++// transports keep their existing write behavior.
++func SetDownlinkWriteAggregation(conn net.Conn, enabled bool) bool {
++	conn, _, _ = UnwrapRawConn(conn)
++	aggregator, ok := conn.(downlinkWriteAggregator)
++	if !ok {
++		return false
++	}
++	aggregator.SetDownlinkWriteAggregation(enabled)
++	return true
++}
++
+ // CopyRawConnIfExist use the most efficient copy method.
+ // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
+ // - writer are from *transport.Link
+diff --git a/proxy/vless/inbound/downlink_aggregation_test.go b/proxy/vless/inbound/downlink_aggregation_test.go
+new file mode 100644
+index 0000000..b2f9884
+--- /dev/null
++++ b/proxy/vless/inbound/downlink_aggregation_test.go
+@@ -0,0 +1,30 @@
++package inbound
++
++import (
++	"testing"
++
++	"github.com/xtls/xray-core/common/net"
++	"github.com/xtls/xray-core/common/protocol"
++)
++
++func TestShouldAggregateDownlink(t *testing.T) {
++	tests := []struct {
++		name    string
++		request *protocol.RequestHeader
++		want    bool
++	}{
++		{name: "tcp 443", request: &protocol.RequestHeader{Command: protocol.RequestCommandTCP, Port: net.Port(443)}, want: true},
++		{name: "tcp 80", request: &protocol.RequestHeader{Command: protocol.RequestCommandTCP, Port: net.Port(80)}},
++		{name: "udp 443", request: &protocol.RequestHeader{Command: protocol.RequestCommandUDP, Port: net.Port(443)}},
++		{name: "xudp mux", request: &protocol.RequestHeader{Command: protocol.RequestCommandMux, Port: net.Port(443)}},
++		{name: "nil request"},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			if got := shouldAggregateDownlink(test.request); got != test.want {
++				t.Fatalf("shouldAggregateDownlink() = %v, want %v", got, test.want)
++			}
++		})
++	}
++}
+diff --git a/proxy/vless/inbound/inbound.go b/proxy/vless/inbound/inbound.go
+index 2d10a00..9da4e35 100644
+--- a/proxy/vless/inbound/inbound.go
++++ b/proxy/vless/inbound/inbound.go
+@@ -614,6 +614,9 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 	if requestAddons.Flow == vless.XRV {
+ 		clientReader = proxy.NewVisionReader(clientReader, trafficState, true, ctx, connection, input, rawInput, nil)
+ 	}
++	if shouldAggregateDownlink(request) {
++		proxy.SetDownlinkWriteAggregation(inbound.Conn, true)
++	}
+ 
+ 	bufferWriter := buf.NewBufferedWriter(buf.NewWriter(connection))
+ 	if err := encoding.EncodeResponseHeader(bufferWriter, request, responseAddons); err != nil {
+@@ -641,6 +644,10 @@ func (h *Handler) Process(ctx context.Context, network net.Network, connection s
+ 	return nil
+ }
+ 
++func shouldAggregateDownlink(request *protocol.RequestHeader) bool {
++	return request != nil && request.Command == protocol.RequestCommandTCP && request.Port == net.Port(443)
++}
++
+ type Reverse struct {
+ 	tag    string
+ 	picker *reverse.StaticMuxPicker
+diff --git a/transport/internet/splithttp/connection.go b/transport/internet/splithttp/connection.go
+index 613e1f3..23585a7 100644
+--- a/transport/internet/splithttp/connection.go
++++ b/transport/internet/splithttp/connection.go
+@@ -14,6 +14,10 @@ type splitConn struct {
+ 	onClose    func()
+ }
+ 
++type downlinkWriteAggregator interface {
++	SetDownlinkWriteAggregation(bool)
++}
++
+ func (c *splitConn) Write(b []byte) (int, error) {
+ 	return c.writer.Write(b)
+ }
+@@ -22,6 +26,14 @@ func (c *splitConn) Read(b []byte) (int, error) {
+ 	return c.reader.Read(b)
+ }
+ 
++// SetDownlinkWriteAggregation toggles transport-level response batching when
++// the upper-layer proxy has enough metadata to opt this connection in.
++func (c *splitConn) SetDownlinkWriteAggregation(enabled bool) {
++	if writer, ok := c.writer.(downlinkWriteAggregator); ok {
++		writer.SetDownlinkWriteAggregation(enabled)
++	}
++}
++
+ func (c *splitConn) Close() error {
+ 	if c.onClose != nil {
+ 		c.onClose()
+diff --git a/transport/internet/splithttp/downlink_aggregation_test.go b/transport/internet/splithttp/downlink_aggregation_test.go
+new file mode 100644
+index 0000000..8881884
+--- /dev/null
++++ b/transport/internet/splithttp/downlink_aggregation_test.go
+@@ -0,0 +1,307 @@
++package splithttp
++
++import (
++	"bytes"
++	"errors"
++	"io"
++	"net/http"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/xtls/xray-core/common/signal/done"
++)
++
++type recordingResponseWriter struct {
++	mu       sync.Mutex
++	header   http.Header
++	writes   [][]byte
++	flushes  int
++	writeErr error
++}
++
++func (w *recordingResponseWriter) Header() http.Header {
++	return w.header
++}
++
++func (w *recordingResponseWriter) WriteHeader(int) {}
++
++func (w *recordingResponseWriter) Write(p []byte) (int, error) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	if w.writeErr != nil {
++		return 0, w.writeErr
++	}
++	w.writes = append(w.writes, bytes.Clone(p))
++	return len(p), nil
++}
++
++func (w *recordingResponseWriter) Flush() {
++	w.mu.Lock()
++	w.flushes++
++	w.mu.Unlock()
++}
++
++func (w *recordingResponseWriter) snapshot() ([][]byte, int) {
++	w.mu.Lock()
++	defer w.mu.Unlock()
++	writes := make([][]byte, len(w.writes))
++	for i := range w.writes {
++		writes[i] = bytes.Clone(w.writes[i])
++	}
++	return writes, w.flushes
++}
++
++func newAggregationTestConn(interval time.Duration) (*httpServerConn, *recordingResponseWriter) {
++	writer := &recordingResponseWriter{header: make(http.Header)}
++	return &httpServerConn{
++		Instance:       done.New(),
++		Reader:         bytes.NewReader(nil),
++		ResponseWriter: writer,
++		flushInterval:  interval,
++	}, writer
++}
++
++func TestDownlinkAggregationDefaultsMatchHTTP2Frame(t *testing.T) {
++	if downlinkFlushThreshold != 16*1024 {
++		t.Fatalf("threshold = %d, want 16384", downlinkFlushThreshold)
++	}
++	if downlinkFlushInterval != time.Millisecond {
++		t.Fatalf("interval = %s, want 1ms", downlinkFlushInterval)
++	}
++}
++
++func TestDownlinkAggregationDisabledFlushesEachWrite(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	if _, err := conn.Write([]byte("one")); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := conn.Write([]byte("two")); err != nil {
++		t.Fatal(err)
++	}
++	writes, flushes := writer.snapshot()
++	if len(writes) != 2 || string(writes[0]) != "one" || string(writes[1]) != "two" {
++		t.Fatalf("writes = %q, want two immediate writes", writes)
++	}
++	if flushes != 2 {
++		t.Fatalf("flushes = %d, want 2", flushes)
++	}
++}
++
++func TestDownlinkAggregationRollsOverflowIntoNextWindow(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	conn.SetDownlinkWriteAggregation(true)
++
++	payload := make([]byte, 2*downlinkFlushThreshold+37)
++	for i := range payload {
++		payload[i] = byte(i)
++	}
++	if n, err := conn.Write(payload); err != nil || n != len(payload) {
++		t.Fatalf("Write() = %d, %v; want %d, nil", n, err, len(payload))
++	}
++
++	writes, flushes := writer.snapshot()
++	if len(writes) != 2 {
++		t.Fatalf("writes before close = %d, want 2 full windows", len(writes))
++	}
++	for i, write := range writes {
++		if len(write) != downlinkFlushThreshold {
++			t.Fatalf("write[%d] length = %d, want %d", i, len(write), downlinkFlushThreshold)
++		}
++	}
++	if flushes != 2 {
++		t.Fatalf("flushes before close = %d, want 2", flushes)
++	}
++
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++	writes, flushes = writer.snapshot()
++	if len(writes) != 3 || len(writes[2]) != 37 {
++		t.Fatalf("write lengths after close = %v, want [16384 16384 37]", writeLengths(writes))
++	}
++	if flushes != 3 {
++		t.Fatalf("flushes after close = %d, want 3", flushes)
++	}
++	if got := bytes.Join(writes, nil); !bytes.Equal(got, payload) {
++		t.Fatal("windowed writes changed payload bytes or ordering")
++	}
++}
++
++func TestDownlinkAggregationTimerFlushesPartialWindow(t *testing.T) {
++	conn, writer := newAggregationTestConn(0)
++	conn.SetDownlinkWriteAggregation(true)
++	if _, err := conn.Write([]byte("partial")); err != nil {
++		t.Fatal(err)
++	}
++
++	deadline := time.Now().Add(250 * time.Millisecond)
++	for {
++		writes, flushes := writer.snapshot()
++		if len(writes) == 1 {
++			if string(writes[0]) != "partial" || flushes != 1 {
++				t.Fatalf("writes = %q, flushes = %d", writes, flushes)
++			}
++			break
++		}
++		if time.Now().After(deadline) {
++			t.Fatal("partial window was not flushed by its timer")
++		}
++		time.Sleep(time.Millisecond)
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestDownlinkAggregationDisableFlushesPendingBytes(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	conn.SetDownlinkWriteAggregation(true)
++	if _, err := conn.Write([]byte("pending")); err != nil {
++		t.Fatal(err)
++	}
++	conn.SetDownlinkWriteAggregation(false)
++
++	writes, flushes := writer.snapshot()
++	if len(writes) != 1 || string(writes[0]) != "pending" || flushes != 1 {
++		t.Fatalf("writes = %q, flushes = %d", writes, flushes)
++	}
++}
++
++func TestDownlinkAggregationAsyncErrorIsSticky(t *testing.T) {
++	wantErr := errors.New("write failed")
++	conn, writer := newAggregationTestConn(time.Hour)
++	conn.SetDownlinkWriteAggregation(true)
++	if _, err := conn.Write([]byte("pending")); err != nil {
++		t.Fatal(err)
++	}
++	writer.mu.Lock()
++	writer.writeErr = wantErr
++	writer.mu.Unlock()
++
++	conn.Lock()
++	conn.flushDeadline = time.Now()
++	conn.Unlock()
++	conn.flushPending()
++
++	if _, err := conn.Write([]byte("later")); !errors.Is(err, wantErr) {
++		t.Fatalf("subsequent Write error = %v, want %v", err, wantErr)
++	}
++	if err := conn.Close(); !errors.Is(err, wantErr) {
++		t.Fatalf("Close error = %v, want %v", err, wantErr)
++	}
++}
++
++func TestDownlinkAggregationConcurrentWrites(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	conn.SetDownlinkWriteAggregation(true)
++
++	const (
++		writers       = 64
++		bytesPerWrite = 257
++	)
++	errCh := make(chan error, writers)
++	var wg sync.WaitGroup
++	for i := 0; i < writers; i++ {
++		wg.Add(1)
++		go func(value byte) {
++			defer wg.Done()
++			_, err := conn.Write(bytes.Repeat([]byte{value}, bytesPerWrite))
++			errCh <- err
++		}(byte(i))
++	}
++	wg.Wait()
++	close(errCh)
++	for err := range errCh {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	writes, _ := writer.snapshot()
++	got := bytes.Join(writes, nil)
++	if len(got) != writers*bytesPerWrite {
++		t.Fatalf("combined length = %d, want %d", len(got), writers*bytesPerWrite)
++	}
++	for i := 0; i < writers; i++ {
++		if count := bytes.Count(got, []byte{byte(i)}); count != bytesPerWrite {
++			t.Fatalf("byte %d count = %d, want %d", i, count, bytesPerWrite)
++		}
++	}
++}
++
++func TestFramedDownlinkAggregationPreservesStream(t *testing.T) {
++	conn, writer := newAggregationTestConn(time.Hour)
++	conn.framedDownlink = true
++	conn.SetDownlinkWriteAggregation(true)
++
++	payload := bytes.Repeat([]byte("framed-payload-"), 3000)
++	if _, err := conn.Write(payload); err != nil {
++		t.Fatal(err)
++	}
++	if err := conn.writeDownlinkHeartbeat(); err != nil {
++		t.Fatal(err)
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	writes, _ := writer.snapshot()
++	stream := bytes.Join(writes, nil)
++	var decoded []byte
++	for len(stream) > 0 {
++		if len(stream) < downlinkFrameHeaderSize {
++			t.Fatalf("truncated frame header: %d bytes", len(stream))
++		}
++		frameType := stream[0]
++		length := int(stream[1])<<24 | int(stream[2])<<16 | int(stream[3])<<8 | int(stream[4])
++		stream = stream[downlinkFrameHeaderSize:]
++		if length > len(stream) {
++			t.Fatalf("frame length %d exceeds remaining %d", length, len(stream))
++		}
++		switch frameType {
++		case downlinkDataFrame:
++			if length > downlinkFlushThreshold {
++				t.Fatalf("data frame length = %d, want <= %d", length, downlinkFlushThreshold)
++			}
++			decoded = append(decoded, stream[:length]...)
++		case downlinkHeartbeatFrame:
++			if length != 0 {
++				t.Fatalf("heartbeat length = %d, want 0", length)
++			}
++		default:
++			t.Fatalf("unexpected frame type %d", frameType)
++		}
++		stream = stream[length:]
++	}
++	if !bytes.Equal(decoded, payload) {
++		t.Fatal("framed aggregation changed payload bytes or ordering")
++	}
++}
++
++func TestSplitConnDelegatesDownlinkAggregation(t *testing.T) {
++	httpConn, _ := newAggregationTestConn(time.Hour)
++	conn := &splitConn{writer: httpConn, reader: io.NopCloser(bytes.NewReader(nil))}
++	conn.SetDownlinkWriteAggregation(true)
++
++	httpConn.Lock()
++	enabled := httpConn.aggregateDownlink
++	httpConn.Unlock()
++	if !enabled {
++		t.Fatal("splitConn did not enable its HTTP writer")
++	}
++	if err := conn.Close(); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func writeLengths(writes [][]byte) []int {
++	lengths := make([]int, len(writes))
++	for i := range writes {
++		lengths[i] = len(writes[i])
++	}
++	return lengths
++}
+diff --git a/transport/internet/splithttp/hub.go b/transport/internet/splithttp/hub.go
+index 484e2e0..e07bdbd 100644
+--- a/transport/internet/splithttp/hub.go
++++ b/transport/internet/splithttp/hub.go
+@@ -426,15 +426,82 @@ type httpServerConn struct {
+ 	*done.Instance
+ 	io.Reader // no need to Close request.Body
+ 	http.ResponseWriter
+-	framedDownlink bool
++
++	framedDownlink    bool
++	aggregateDownlink bool
++	writeBuf          []byte
++	flushTimer        *time.Timer
++	flushDeadline     time.Time
++	flushInterval     time.Duration
++	writeErr          error
+ }
+ 
++const (
++	downlinkFlushThreshold = 16 << 10
++	downlinkFlushInterval  = time.Millisecond
++)
++
+ func (c *httpServerConn) Write(b []byte) (int, error) {
+ 	c.Lock()
+ 	defer c.Unlock()
++	if c.writeErr != nil {
++		return 0, c.writeErr
++	}
+ 	if c.Done() {
+ 		return 0, io.ErrClosedPipe
+ 	}
++	if len(b) == 0 {
++		return 0, nil
++	}
++	if !c.aggregateDownlink {
++		return c.writeAndFlushLocked(b)
++	}
++
++	total := len(b)
++	written := 0
++	for len(b) > 0 {
++		if len(c.writeBuf) == 0 {
++			c.armFlushTimerLocked()
++		}
++
++		remaining := downlinkFlushThreshold - len(c.writeBuf)
++		if remaining > len(b) {
++			remaining = len(b)
++		}
++		c.writeBuf = append(c.writeBuf, b[:remaining]...)
++		b = b[remaining:]
++		written += remaining
++
++		if len(c.writeBuf) == downlinkFlushThreshold {
++			c.stopFlushTimerLocked()
++			if err := c.flushLocked(); err != nil {
++				c.writeErr = err
++				return written, err
++			}
++		}
++	}
++	return total, nil
++}
++
++// SetDownlinkWriteAggregation is called by an upper-layer protocol only after
++// it has identified an eligible stream. XHTTP itself cannot distinguish TCP,
++// UDP, or the destination port from the opaque response bytes.
++func (c *httpServerConn) SetDownlinkWriteAggregation(enabled bool) {
++	c.Lock()
++	defer c.Unlock()
++	if c.Done() || c.aggregateDownlink == enabled {
++		return
++	}
++	c.aggregateDownlink = enabled
++	if !enabled {
++		c.stopFlushTimerLocked()
++		if err := c.flushLocked(); err != nil && c.writeErr == nil {
++			c.writeErr = err
++		}
++	}
++}
++
++func (c *httpServerConn) writeAndFlushLocked(b []byte) (int, error) {
+ 	var n int
+ 	var err error
+ 	if c.framedDownlink {
+@@ -442,8 +509,13 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
+ 	} else {
+ 		n, err = c.ResponseWriter.Write(b)
+ 	}
++	if err == nil && n != len(b) {
++		err = io.ErrShortWrite
++	}
+ 	if err == nil {
+-		c.ResponseWriter.(http.Flusher).Flush()
++		if flusher, ok := c.ResponseWriter.(http.Flusher); ok {
++			flusher.Flush()
++		}
+ 	}
+ 	return n, err
+ }
+@@ -451,12 +523,27 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
+ func (c *httpServerConn) writeDownlinkHeartbeat() error {
+ 	c.Lock()
+ 	defer c.Unlock()
++	if c.writeErr != nil {
++		return c.writeErr
++	}
+ 	if c.Done() {
+ 		return io.ErrClosedPipe
+ 	}
++	if len(c.writeBuf) > 0 {
++		c.stopFlushTimerLocked()
++		if err := c.flushLocked(); err != nil {
++			c.writeErr = err
++			return err
++		}
++	}
+ 	_, err := writeDownlinkFrame(c.ResponseWriter, downlinkHeartbeatFrame, nil)
+ 	if err == nil {
+-		c.ResponseWriter.(http.Flusher).Flush()
++		if flusher, ok := c.ResponseWriter.(http.Flusher); ok {
++			flusher.Flush()
++		}
++	}
++	if err != nil {
++		c.writeErr = err
+ 	}
+ 	return err
+ }
+@@ -495,10 +582,73 @@ func writeDownlinkFrame(writer io.Writer, frameType byte, payload []byte) (int,
+ 	return writer.Write(payload)
+ }
+ 
++func (c *httpServerConn) aggregationInterval() time.Duration {
++	if c.flushInterval > 0 {
++		return c.flushInterval
++	}
++	return downlinkFlushInterval
++}
++
++func (c *httpServerConn) armFlushTimerLocked() {
++	interval := c.aggregationInterval()
++	c.flushDeadline = time.Now().Add(interval)
++	if c.flushTimer == nil {
++		c.flushTimer = time.AfterFunc(interval, c.flushPending)
++		return
++	}
++	c.flushTimer.Reset(interval)
++}
++
++func (c *httpServerConn) stopFlushTimerLocked() {
++	c.flushDeadline = time.Time{}
++	if c.flushTimer != nil {
++		c.flushTimer.Stop()
++	}
++}
++
++func (c *httpServerConn) flushPending() {
++	c.Lock()
++	defer c.Unlock()
++	if c.Done() || !c.aggregateDownlink || len(c.writeBuf) == 0 || c.flushDeadline.IsZero() {
++		return
++	}
++	if remaining := time.Until(c.flushDeadline); remaining > 0 {
++		c.flushTimer.Reset(remaining)
++		return
++	}
++	c.flushDeadline = time.Time{}
++	if err := c.flushLocked(); err != nil {
++		c.writeErr = err
++		_ = c.Instance.Close()
++	}
++}
++
++func (c *httpServerConn) flushLocked() error {
++	if len(c.writeBuf) == 0 {
++		return nil
++	}
++	_, err := c.writeAndFlushLocked(c.writeBuf)
++	c.writeBuf = c.writeBuf[:0]
++	return err
++}
++
+ func (c *httpServerConn) Close() error {
+ 	c.Lock()
+ 	defer c.Unlock()
+-	return c.Instance.Close()
++	c.stopFlushTimerLocked()
++	c.flushTimer = nil
++	var flushErr error
++	if !c.Done() && c.writeErr == nil {
++		flushErr = c.flushLocked()
++	}
++	closeErr := c.Instance.Close()
++	if flushErr != nil {
++		return flushErr
++	}
++	if c.writeErr != nil {
++		return c.writeErr
++	}
++	return closeErr
+ }
+ 
+ type Listener struct {
+-- 
+2.55.0
+

@@ -5,6 +5,7 @@ import (
 	"context"
 	gotls "crypto/tls"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net/http"
@@ -30,6 +31,15 @@ import (
 	"github.com/xtls/xray-core/transport/internet/reality"
 	"github.com/xtls/xray-core/transport/internet/stat"
 	"github.com/xtls/xray-core/transport/internet/tls"
+)
+
+const (
+	downlinkFramingHeader     = "X-AndroidCyaml-XHTTP-Framing"
+	downlinkFramingV1         = "v1"
+	downlinkDataFrame         = byte(0)
+	downlinkHeartbeatFrame    = byte(1)
+	downlinkHeartbeatInterval = 30 * time.Second
+	downlinkFrameHeaderSize   = 5
 )
 
 type requestHandler struct {
@@ -346,6 +356,8 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 
 		writer.WriteHeader(http.StatusOK)
 	} else if request.Method == "GET" || sessionId == "" { // stream-down, stream-one
+		framedDownlink := sessionId != "" &&
+			request.Header.Get(downlinkFramingHeader) == downlinkFramingV1
 		if sessionId != "" {
 			// after GET is done, the connection is finished. disable automatic
 			// session reaping, and handle it in defer
@@ -364,6 +376,9 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			// magic header to make the HTTP middle box consider this as SSE to disable buffer
 			writer.Header().Set("Content-Type", "text/event-stream")
 		}
+		if framedDownlink {
+			writer.Header().Set(downlinkFramingHeader, downlinkFramingV1)
+		}
 
 		writer.WriteHeader(http.StatusOK)
 		writer.(http.Flusher).Flush()
@@ -372,6 +387,10 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			Instance:       done.New(),
 			Reader:         request.Body,
 			ResponseWriter: writer,
+			framedDownlink: framedDownlink,
+		}
+		if framedDownlink {
+			go httpSC.runDownlinkHeartbeats(request.Context(), downlinkHeartbeatInterval)
 		}
 		localAddr := h.localAddr
 		if la, ok := request.Context().Value(http.LocalAddrContextKey).(net.Addr); ok && la != nil {
@@ -407,25 +426,229 @@ type httpServerConn struct {
 	*done.Instance
 	io.Reader // no need to Close request.Body
 	http.ResponseWriter
+
+	framedDownlink    bool
+	aggregateDownlink bool
+	writeBuf          []byte
+	flushTimer        *time.Timer
+	flushDeadline     time.Time
+	flushInterval     time.Duration
+	writeErr          error
 }
+
+const (
+	downlinkFlushThreshold = 16 << 10
+	downlinkFlushInterval  = time.Millisecond
+)
 
 func (c *httpServerConn) Write(b []byte) (int, error) {
 	c.Lock()
 	defer c.Unlock()
+	if c.writeErr != nil {
+		return 0, c.writeErr
+	}
 	if c.Done() {
 		return 0, io.ErrClosedPipe
 	}
-	n, err := c.ResponseWriter.Write(b)
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if !c.aggregateDownlink {
+		return c.writeAndFlushLocked(b)
+	}
+
+	total := len(b)
+	written := 0
+	for len(b) > 0 {
+		if len(c.writeBuf) == 0 {
+			c.armFlushTimerLocked()
+		}
+
+		remaining := downlinkFlushThreshold - len(c.writeBuf)
+		if remaining > len(b) {
+			remaining = len(b)
+		}
+		c.writeBuf = append(c.writeBuf, b[:remaining]...)
+		b = b[remaining:]
+		written += remaining
+
+		if len(c.writeBuf) == downlinkFlushThreshold {
+			c.stopFlushTimerLocked()
+			if err := c.flushLocked(); err != nil {
+				c.writeErr = err
+				return written, err
+			}
+		}
+	}
+	return total, nil
+}
+
+// SetDownlinkWriteAggregation is called by an upper-layer protocol only after
+// it has identified an eligible stream. XHTTP itself cannot distinguish TCP,
+// UDP, or the destination port from the opaque response bytes.
+func (c *httpServerConn) SetDownlinkWriteAggregation(enabled bool) {
+	c.Lock()
+	defer c.Unlock()
+	if c.Done() || c.aggregateDownlink == enabled {
+		return
+	}
+	c.aggregateDownlink = enabled
+	if !enabled {
+		c.stopFlushTimerLocked()
+		if err := c.flushLocked(); err != nil && c.writeErr == nil {
+			c.writeErr = err
+		}
+	}
+}
+
+func (c *httpServerConn) writeAndFlushLocked(b []byte) (int, error) {
+	var n int
+	var err error
+	if c.framedDownlink {
+		n, err = writeDownlinkFrame(c.ResponseWriter, downlinkDataFrame, b)
+	} else {
+		n, err = c.ResponseWriter.Write(b)
+	}
+	if err == nil && n != len(b) {
+		err = io.ErrShortWrite
+	}
 	if err == nil {
-		c.ResponseWriter.(http.Flusher).Flush()
+		if flusher, ok := c.ResponseWriter.(http.Flusher); ok {
+			flusher.Flush()
+		}
 	}
 	return n, err
+}
+
+func (c *httpServerConn) writeDownlinkHeartbeat() error {
+	c.Lock()
+	defer c.Unlock()
+	if c.writeErr != nil {
+		return c.writeErr
+	}
+	if c.Done() {
+		return io.ErrClosedPipe
+	}
+	if len(c.writeBuf) > 0 {
+		c.stopFlushTimerLocked()
+		if err := c.flushLocked(); err != nil {
+			c.writeErr = err
+			return err
+		}
+	}
+	_, err := writeDownlinkFrame(c.ResponseWriter, downlinkHeartbeatFrame, nil)
+	if err == nil {
+		if flusher, ok := c.ResponseWriter.(http.Flusher); ok {
+			flusher.Flush()
+		}
+	}
+	if err != nil {
+		c.writeErr = err
+	}
+	return err
+}
+
+func (c *httpServerConn) runDownlinkHeartbeats(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.Wait():
+			return
+		case <-ticker.C:
+			if err := c.writeDownlinkHeartbeat(); err != nil {
+				_ = c.Close()
+				return
+			}
+		}
+	}
+}
+
+func writeDownlinkFrame(writer io.Writer, frameType byte, payload []byte) (int, error) {
+	if uint64(len(payload)) > uint64(^uint32(0)) {
+		return 0, fmt.Errorf("xhttp downlink frame is too large: %d", len(payload))
+	}
+	var header [downlinkFrameHeaderSize]byte
+	header[0] = frameType
+	binary.BigEndian.PutUint32(header[1:], uint32(len(payload)))
+	if _, err := writer.Write(header[:]); err != nil {
+		return 0, err
+	}
+	if len(payload) == 0 {
+		return 0, nil
+	}
+	return writer.Write(payload)
+}
+
+func (c *httpServerConn) aggregationInterval() time.Duration {
+	if c.flushInterval > 0 {
+		return c.flushInterval
+	}
+	return downlinkFlushInterval
+}
+
+func (c *httpServerConn) armFlushTimerLocked() {
+	interval := c.aggregationInterval()
+	c.flushDeadline = time.Now().Add(interval)
+	if c.flushTimer == nil {
+		c.flushTimer = time.AfterFunc(interval, c.flushPending)
+		return
+	}
+	c.flushTimer.Reset(interval)
+}
+
+func (c *httpServerConn) stopFlushTimerLocked() {
+	c.flushDeadline = time.Time{}
+	if c.flushTimer != nil {
+		c.flushTimer.Stop()
+	}
+}
+
+func (c *httpServerConn) flushPending() {
+	c.Lock()
+	defer c.Unlock()
+	if c.Done() || !c.aggregateDownlink || len(c.writeBuf) == 0 || c.flushDeadline.IsZero() {
+		return
+	}
+	if remaining := time.Until(c.flushDeadline); remaining > 0 {
+		c.flushTimer.Reset(remaining)
+		return
+	}
+	c.flushDeadline = time.Time{}
+	if err := c.flushLocked(); err != nil {
+		c.writeErr = err
+		_ = c.Instance.Close()
+	}
+}
+
+func (c *httpServerConn) flushLocked() error {
+	if len(c.writeBuf) == 0 {
+		return nil
+	}
+	_, err := c.writeAndFlushLocked(c.writeBuf)
+	c.writeBuf = c.writeBuf[:0]
+	return err
 }
 
 func (c *httpServerConn) Close() error {
 	c.Lock()
 	defer c.Unlock()
-	return c.Instance.Close()
+	c.stopFlushTimerLocked()
+	c.flushTimer = nil
+	var flushErr error
+	if !c.Done() && c.writeErr == nil {
+		flushErr = c.flushLocked()
+	}
+	closeErr := c.Instance.Close()
+	if flushErr != nil {
+		return flushErr
+	}
+	if c.writeErr != nil {
+		return c.writeErr
+	}
+	return closeErr
 }
 
 type Listener struct {

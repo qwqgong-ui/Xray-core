@@ -14,12 +14,24 @@ type splitConn struct {
 	onClose    func()
 }
 
+type downlinkWriteAggregator interface {
+	SetDownlinkWriteAggregation(bool)
+}
+
 func (c *splitConn) Write(b []byte) (int, error) {
 	return c.writer.Write(b)
 }
 
 func (c *splitConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
+}
+
+// SetDownlinkWriteAggregation toggles transport-level response batching when
+// the upper-layer proxy has enough metadata to opt this connection in.
+func (c *splitConn) SetDownlinkWriteAggregation(enabled bool) {
+	if writer, ok := c.writer.(downlinkWriteAggregator); ok {
+		writer.SetDownlinkWriteAggregation(enabled)
+	}
 }
 
 func (c *splitConn) Close() error {

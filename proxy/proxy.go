@@ -712,6 +712,24 @@ func UnwrapRawConn(conn net.Conn) (net.Conn, stats.Counter, stats.Counter) {
 	return conn, readCounter, writerCounter
 }
 
+type downlinkWriteAggregator interface {
+	SetDownlinkWriteAggregation(bool)
+}
+
+// SetDownlinkWriteAggregation asks a supporting transport to batch response
+// writes. Protocol handlers call this only after they have decoded enough
+// metadata to decide whether aggregation is appropriate. Unsupported
+// transports keep their existing write behavior.
+func SetDownlinkWriteAggregation(conn net.Conn, enabled bool) bool {
+	conn, _, _ = UnwrapRawConn(conn)
+	aggregator, ok := conn.(downlinkWriteAggregator)
+	if !ok {
+		return false
+	}
+	aggregator.SetDownlinkWriteAggregation(enabled)
+	return true
+}
+
 // CopyRawConnIfExist use the most efficient copy method.
 // - If caller don't want to turn on splice, do not pass in both reader conn and writer conn
 // - writer are from *transport.Link
