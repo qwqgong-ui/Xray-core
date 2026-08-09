@@ -3,7 +3,7 @@ name: Test downstream patches
 on:
   push:
     branches:
-      - AndroidCyaml
+      - SingleUser
     paths:
       - "patches/xray/**"
       - ".github/workflows/sync-upstream.yml"
@@ -17,8 +17,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - name: Check out patch branch
+      - name: Check out SingleUser
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -27,12 +29,18 @@ jobs:
           check-latest: true
           cache: false
 
-      - name: Apply and test XHTTP patch
+      - name: Apply patch series to clean upstream main and test
         run: |
           set -euo pipefail
-          for patch in patches/xray/*.patch; do
-            git apply --check "${patch}"
-            git apply "${patch}"
+          patch_root="${PWD}/patches/xray"
+          worktree="${RUNNER_TEMP}/xray-patched"
+          git fetch --no-tags origin main
+          git worktree add --detach "${worktree}" origin/main
+          trap 'git worktree remove --force "${worktree}"' EXIT
+          for patch in "${patch_root}"/*.patch; do
+            git -C "${worktree}" apply --check --whitespace=error-all "${patch}"
+            git -C "${worktree}" apply --whitespace=error-all "${patch}"
           done
-          git diff --check
-          go test ./transport/internet/splithttp
+          git -C "${worktree}" diff --check
+          cd "${worktree}"
+          go test ./proxy ./proxy/vless/inbound ./transport/internet/splithttp

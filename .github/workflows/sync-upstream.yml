@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: sync-upstream-${{ github.ref }}
+  group: sync-upstream-main
   cancel-in-progress: false
 
 jobs:
@@ -17,49 +17,29 @@ jobs:
     if: github.repository == 'qwqgong-ui/Xray-core'
     runs-on: ubuntu-latest
     steps:
-      - name: Check out patch branch
+      - name: Check out repository
         uses: actions/checkout@v7
         with:
-          ref: AndroidCyaml
           fetch-depth: 0
 
-      - name: Replace upstream tree and preserve downstream patches
+      - name: Mirror upstream into main
         env:
-          TARGET_BRANCH: AndroidCyaml
+          TARGET_BRANCH: main
           UPSTREAM_BRANCH: main
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/XTLS/Xray-core.git 2>/dev/null ||
             git remote set-url upstream https://github.com/XTLS/Xray-core.git
+          git fetch --no-tags origin "${TARGET_BRANCH}"
           git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
 
-          if git merge-base --is-ancestor "upstream/${UPSTREAM_BRANCH}" HEAD; then
-            echo "Already contains upstream/${UPSTREAM_BRANCH}"
+          current_sha="$(git rev-parse "origin/${TARGET_BRANCH}")"
+          upstream_sha="$(git rev-parse "upstream/${UPSTREAM_BRANCH}")"
+          if [[ "${current_sha}" == "${upstream_sha}" ]]; then
+            echo "${TARGET_BRANCH} already matches upstream/${UPSTREAM_BRANCH}"
             exit 0
           fi
 
-          upstream_sha="$(git rev-parse --short=12 "upstream/${UPSTREAM_BRANCH}")"
-          tar -czf "${RUNNER_TEMP}/xray-downstream.tgz" \
-            patches/xray \
-            .github/workflows/sync-upstream.yml \
-            .github/workflows/test-patches.yml
-
-          git reset --hard "upstream/${UPSTREAM_BRANCH}"
-          git clean -fdx
-          tar -xzf "${RUNNER_TEMP}/xray-downstream.tgz"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f patches/xray
-          git add .github/workflows/sync-upstream.yml \
-            .github/workflows/test-patches.yml
-
-          if git diff --cached --quiet; then
-            echo "Upstream changed only files already preserved downstream"
-            exit 0
-          fi
-
-          git commit -m "chore: sync upstream Xray-core to ${upstream_sha}"
           git push \
-            --force-with-lease="refs/heads/${TARGET_BRANCH}:${GITHUB_SHA}" \
-            origin "HEAD:refs/heads/${TARGET_BRANCH}"
+            --force-with-lease="refs/heads/${TARGET_BRANCH}:${current_sha}" \
+            origin "upstream/${UPSTREAM_BRANCH}:refs/heads/${TARGET_BRANCH}"
