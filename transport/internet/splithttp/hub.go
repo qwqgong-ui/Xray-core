@@ -405,6 +405,10 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 		if sessionId != "" { // if not stream-one
 			conn.reader = currentSession.uploadQueue
 		}
+		// Start the single blocking producer before handing the connection to
+		// the inbound. Data which arrives during protocol setup can then be
+		// delivered as one MultiBuffer without delaying the first read.
+		conn.enableReadyInput()
 
 		h.ln.addConn(stat.Connection(&conn))
 

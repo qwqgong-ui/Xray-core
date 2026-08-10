@@ -1,0 +1,299 @@
+//go:build linux
+
+package buf
+
+import (
+	"encoding/binary"
+	"errors"
+	"io"
+	"runtime"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/transport/internet/stat"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	zeroCopyThreshold = 16 << 10
+	zeroCopyMaxIov    = 1024
+)
+
+type zeroCopyBatch struct {
+	buffers   MultiBuffer
+	remaining int
+}
+
+type zeroCopyPending struct {
+	id    uint32
+	batch *zeroCopyBatch
+}
+
+type zeroCopyWriter struct {
+	fallback Writer
+	rawConn  syscall.RawConn
+	counter  stats.Counter
+
+	writeMutex sync.Mutex
+	stateMutex sync.Mutex
+	nextID     uint32
+	pending    []zeroCopyPending
+	polling    bool
+}
+
+// NewZeroCopyWriter returns a MSG_ZEROCOPY writer only when SO_ZEROCOPY is
+// already enabled on the socket. This keeps zerocopy explicitly controlled by
+// the existing customSockopt configuration and preserves the normal writer as
+// the fallback for unsupported sockets and small writes.
+func NewZeroCopyWriter(writer io.Writer) Writer {
+	fallback := NewWriter(writer)
+	underlying := writer
+	var counter stats.Counter
+	if statConn, ok := writer.(*stat.CounterConnection); ok {
+		underlying = statConn.Connection
+		counter = statConn.WriteCounter
+	}
+
+	syscallConn, ok := underlying.(syscall.Conn)
+	if !ok {
+		return fallback
+	}
+	rawConn, err := syscallConn.SyscallConn()
+	if err != nil {
+		return fallback
+	}
+
+	enabled := false
+	if err := rawConn.Control(func(fd uintptr) {
+		value, sockErr := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_ZEROCOPY)
+		enabled = sockErr == nil && value != 0
+	}); err != nil || !enabled {
+		return fallback
+	}
+
+	return &zeroCopyWriter{
+		fallback: fallback,
+		rawConn:  rawConn,
+		counter:  counter,
+	}
+}
+
+func (w *zeroCopyWriter) WriteMultiBuffer(mb MultiBuffer) error {
+	if mb.IsEmpty() {
+		ReleaseMulti(mb)
+		return nil
+	}
+	if mb.Len() < zeroCopyThreshold {
+		return w.fallback.WriteMultiBuffer(mb)
+	}
+
+	payloads := make([][]byte, 0, len(mb))
+	for _, buffer := range mb {
+		if buffer != nil && !buffer.IsEmpty() {
+			payloads = append(payloads, buffer.Bytes())
+		}
+	}
+	if len(payloads) == 0 || len(payloads) > zeroCopyMaxIov {
+		return w.fallback.WriteMultiBuffer(mb)
+	}
+
+	w.writeMutex.Lock()
+	defer w.writeMutex.Unlock()
+
+	batch := &zeroCopyBatch{buffers: mb}
+	remaining := payloads
+	written := 0
+	for len(remaining) > 0 {
+		var n int
+		var sendErr error
+		rawErr := w.rawConn.Write(func(fd uintptr) bool {
+			n, sendErr = unix.SendmsgBuffers(int(fd), remaining, nil, nil, unix.MSG_ZEROCOPY)
+			return !errors.Is(sendErr, unix.EAGAIN) && !errors.Is(sendErr, unix.EWOULDBLOCK)
+		})
+		if rawErr != nil && sendErr == nil {
+			sendErr = rawErr
+		}
+		if n > 0 {
+			written += n
+			w.recordPending(batch)
+			remaining = advanceByteSlices(remaining, n)
+		}
+		if sendErr != nil {
+			if written == 0 {
+				return w.fallback.WriteMultiBuffer(mb)
+			}
+			w.addToCounter(written)
+			w.startCompletionLoop()
+			runtime.KeepAlive(mb)
+			return sendErr
+		}
+		if n == 0 {
+			if written == 0 {
+				return w.fallback.WriteMultiBuffer(mb)
+			}
+			w.addToCounter(written)
+			w.startCompletionLoop()
+			runtime.KeepAlive(mb)
+			return io.ErrUnexpectedEOF
+		}
+	}
+
+	w.addToCounter(written)
+	w.startCompletionLoop()
+	runtime.KeepAlive(mb)
+	return nil
+}
+
+func (w *zeroCopyWriter) addToCounter(n int) {
+	if w.counter != nil {
+		w.counter.Add(int64(n))
+	}
+}
+
+func advanceByteSlices(buffers [][]byte, n int) [][]byte {
+	for len(buffers) > 0 && n >= len(buffers[0]) {
+		n -= len(buffers[0])
+		buffers = buffers[1:]
+	}
+	if len(buffers) > 0 && n > 0 {
+		buffers[0] = buffers[0][n:]
+	}
+	return buffers
+}
+
+func (w *zeroCopyWriter) recordPending(batch *zeroCopyBatch) {
+	w.stateMutex.Lock()
+	batch.remaining++
+	w.pending = append(w.pending, zeroCopyPending{id: w.nextID, batch: batch})
+	w.nextID++
+	w.stateMutex.Unlock()
+}
+
+func (w *zeroCopyWriter) startCompletionLoop() {
+	w.stateMutex.Lock()
+	if w.polling || len(w.pending) == 0 {
+		w.stateMutex.Unlock()
+		return
+	}
+	w.polling = true
+	w.stateMutex.Unlock()
+	go w.completionLoop()
+}
+
+func (w *zeroCopyWriter) completionLoop() {
+	for {
+		w.stateMutex.Lock()
+		if len(w.pending) == 0 {
+			w.polling = false
+			w.stateMutex.Unlock()
+			return
+		}
+		w.stateMutex.Unlock()
+
+		completed, err := w.drainCompletions()
+		if err != nil {
+			w.releaseAllPending()
+			return
+		}
+		if !completed {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func (w *zeroCopyWriter) drainCompletions() (bool, error) {
+	w.writeMutex.Lock()
+	defer w.writeMutex.Unlock()
+
+	completed := false
+	var receiveErr error
+	controlErr := w.rawConn.Control(func(fd uintptr) {
+		control := make([]byte, unix.CmsgSpace(32))
+		for {
+			_, controlLen, _, _, recvErr := unix.Recvmsg(int(fd), nil, control, unix.MSG_ERRQUEUE|unix.MSG_DONTWAIT)
+			if errors.Is(recvErr, unix.EAGAIN) || errors.Is(recvErr, unix.EWOULDBLOCK) {
+				return
+			}
+			if errors.Is(recvErr, unix.EINTR) {
+				continue
+			}
+			if recvErr != nil {
+				receiveErr = recvErr
+				return
+			}
+			messages, parseErr := unix.ParseSocketControlMessage(control[:controlLen])
+			if parseErr != nil {
+				receiveErr = parseErr
+				return
+			}
+			for _, message := range messages {
+				if len(message.Data) < 16 {
+					continue
+				}
+				origin := message.Data[4]
+				if origin != unix.SO_EE_ORIGIN_ZEROCOPY {
+					continue
+				}
+				first := binary.NativeEndian.Uint32(message.Data[8:12])
+				last := binary.NativeEndian.Uint32(message.Data[12:16])
+				w.completeRange(first, last)
+				completed = true
+			}
+		}
+	})
+	if controlErr != nil {
+		return completed, controlErr
+	}
+	return completed, receiveErr
+}
+
+func zeroCopyIDInRange(id, first, last uint32) bool {
+	if first <= last {
+		return id >= first && id <= last
+	}
+	return id >= first || id <= last
+}
+
+func (w *zeroCopyWriter) completeRange(first, last uint32) {
+	var release []MultiBuffer
+	w.stateMutex.Lock()
+	kept := w.pending[:0]
+	for _, pending := range w.pending {
+		if zeroCopyIDInRange(pending.id, first, last) {
+			pending.batch.remaining--
+			if pending.batch.remaining == 0 {
+				release = append(release, pending.batch.buffers)
+				pending.batch.buffers = nil
+			}
+			continue
+		}
+		kept = append(kept, pending)
+	}
+	w.pending = kept
+	w.stateMutex.Unlock()
+	for _, mb := range release {
+		ReleaseMulti(mb)
+	}
+}
+
+func (w *zeroCopyWriter) releaseAllPending() {
+	var release []MultiBuffer
+	w.stateMutex.Lock()
+	seen := make(map[*zeroCopyBatch]struct{})
+	for _, pending := range w.pending {
+		if _, ok := seen[pending.batch]; ok {
+			continue
+		}
+		seen[pending.batch] = struct{}{}
+		release = append(release, pending.batch.buffers)
+		pending.batch.buffers = nil
+	}
+	w.pending = nil
+	w.polling = false
+	w.stateMutex.Unlock()
+	for _, mb := range release {
+		ReleaseMulti(mb)
+	}
+}

@@ -405,7 +405,7 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 					writer:   conn,
 				})
 			} else {
-				writer = buf.NewWriter(conn)
+				writer = buf.NewZeroCopyWriter(conn)
 			}
 		} else {
 			writer = NewPacketWriter(conn, h, defaultRule, UDPOverride, destination)

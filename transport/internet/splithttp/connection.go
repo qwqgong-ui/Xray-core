@@ -3,7 +3,11 @@ package splithttp
 import (
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/xtls/xray-core/common/buf"
 )
 
 type splitConn struct {
@@ -12,6 +16,12 @@ type splitConn struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	onClose    func()
+
+	readyEnabled bool
+	readOnce     sync.Once
+	readMutex    sync.Mutex
+	buffered     *buf.BufferedReader
+	readyInput   atomic.Pointer[buf.ReadyReader]
 }
 
 type downlinkWriteAggregator interface {
@@ -23,7 +33,43 @@ func (c *splitConn) Write(b []byte) (int, error) {
 }
 
 func (c *splitConn) Read(b []byte) (int, error) {
-	return c.reader.Read(b)
+	if !c.readyEnabled {
+		return c.reader.Read(b)
+	}
+	c.readMutex.Lock()
+	defer c.readMutex.Unlock()
+	c.initReadyInput()
+	return c.buffered.Read(b)
+}
+
+func (c *splitConn) initReadyInput() {
+	c.readOnce.Do(func() {
+		ready := buf.NewReadyReader(c.reader)
+		c.readyInput.Store(ready)
+		c.buffered = &buf.BufferedReader{Reader: ready}
+	})
+}
+
+func (c *splitConn) enableReadyInput() {
+	c.readyEnabled = true
+	c.initReadyInput()
+}
+
+// ReadMultiBuffer lets XHTTP uplinks retain the 8 KiB chunks which are
+// already available instead of collapsing the stream into one Buffer per
+// copy iteration.
+func (c *splitConn) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	if !c.readyEnabled {
+		buffer, err := buf.ReadBuffer(c.reader)
+		if buffer == nil {
+			return nil, err
+		}
+		return buf.MultiBuffer{buffer}, err
+	}
+	c.readMutex.Lock()
+	defer c.readMutex.Unlock()
+	c.initReadyInput()
+	return c.buffered.ReadMultiBuffer()
 }
 
 // SetDownlinkWriteAggregation toggles transport-level response batching when
@@ -37,6 +83,10 @@ func (c *splitConn) SetDownlinkWriteAggregation(enabled bool) {
 func (c *splitConn) Close() error {
 	if c.onClose != nil {
 		c.onClose()
+	}
+
+	if ready := c.readyInput.Load(); ready != nil {
+		ready.Interrupt()
 	}
 
 	err := c.writer.Close()
