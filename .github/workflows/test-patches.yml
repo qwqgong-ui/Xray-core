@@ -43,4 +43,9 @@ jobs:
           done
           git -C "${worktree}" diff --check
           cd "${worktree}"
-          go test ./proxy ./proxy/vless/inbound ./transport/internet/splithttp
+          go test \
+            ./common/buf \
+            ./proxy \
+            ./proxy/freedom \
+            ./proxy/vless/inbound \
+            ./transport/internet/splithttp
