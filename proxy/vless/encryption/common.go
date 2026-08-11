@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/crypto"
 	"github.com/xtls/xray-core/common/errors"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -20,7 +21,7 @@ import (
 
 var OutBytesPool = sync.Pool{
 	New: func() any {
-		return make([]byte, 5+8192+16)
+		return make([]byte, 5+buf.Size+16)
 	},
 }
 
@@ -37,11 +38,52 @@ type CommonConn struct {
 	input       bytes.Reader
 }
 
+var _ buf.Writer = (*CommonConn)(nil)
+
 func NewCommonConn(conn net.Conn, useAES bool) *CommonConn {
 	return &CommonConn{
 		Conn:   conn,
 		UseAES: useAES,
 	}
+}
+
+func (c *CommonConn) writeRecord(outBytes, plaintext []byte) error {
+	headerAndData := outBytes[:5+len(plaintext)+16]
+	EncodeHeader(headerAndData, len(plaintext)+16)
+	max := false
+	if bytes.Equal(c.AEAD.Nonce[:], MaxNonce) {
+		max = true
+	}
+	c.AEAD.Seal(headerAndData[:5], nil, plaintext, headerAndData[:5])
+	if max {
+		c.AEAD = NewAEAD(headerAndData, c.UnitedKey, c.UseAES)
+	}
+	if c.PreWrite != nil {
+		headerAndData = append(c.PreWrite, headerAndData...)
+		c.PreWrite = nil
+	}
+	n, err := c.Conn.Write(headerAndData)
+	if err != nil {
+		return err
+	}
+	if n != len(headerAndData) {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (c *CommonConn) writeBytes(outBytes, plaintext []byte) error {
+	for len(plaintext) > 0 {
+		chunk := plaintext
+		if len(chunk) > buf.Size {
+			chunk = chunk[:buf.Size]
+		}
+		if err := c.writeRecord(outBytes, chunk); err != nil {
+			return err
+		}
+		plaintext = plaintext[len(chunk):]
+	}
+	return nil
 }
 
 func (c *CommonConn) Write(b []byte) (int, error) {
@@ -50,31 +92,94 @@ func (c *CommonConn) Write(b []byte) (int, error) {
 	}
 	outBytes := OutBytesPool.Get().([]byte)
 	defer OutBytesPool.Put(outBytes)
-	for n := 0; n < len(b); {
-		b := b[n:]
-		if len(b) > 8192 {
-			b = b[:8192] // for avoiding another copy() in peer's Read()
-		}
-		n += len(b)
-		headerAndData := outBytes[:5+len(b)+16]
-		EncodeHeader(headerAndData, len(b)+16)
-		max := false
-		if bytes.Equal(c.AEAD.Nonce[:], MaxNonce) {
-			max = true
-		}
-		c.AEAD.Seal(headerAndData[:5], nil, b, headerAndData[:5])
-		if max {
-			c.AEAD = NewAEAD(headerAndData, c.UnitedKey, c.UseAES)
-		}
-		if c.PreWrite != nil {
-			headerAndData = append(c.PreWrite, headerAndData...)
-			c.PreWrite = nil
-		}
-		if _, err := c.Conn.Write(headerAndData); err != nil {
-			return 0, err
-		}
+	if err := c.writeBytes(outBytes, b); err != nil {
+		return 0, err
 	}
 	return len(b), nil
+}
+
+// WriteMultiBuffer keeps the batch intact across the VLESS encryption wrapper.
+// Adjacent buffers are packed into the same encrypted record up to buf.Size,
+// instead of being converted into one scalar Write call per Buffer.
+func (c *CommonConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	defer buf.ReleaseMulti(mb)
+	if mb.IsEmpty() {
+		return nil
+	}
+
+	outBytes := OutBytesPool.Get().([]byte)
+	defer OutBytesPool.Put(outBytes)
+
+	if len(mb) == 1 {
+		if mb[0] == nil {
+			return nil
+		}
+		return c.writeBytes(outBytes, mb[0].Bytes())
+	}
+
+	var first *buf.Buffer
+	var tailBytes int32
+	for _, buffer := range mb {
+		if buffer == nil || buffer.IsEmpty() {
+			continue
+		}
+		if first == nil {
+			first = buffer
+			continue
+		}
+		tailBytes += buffer.Len()
+	}
+	if first == nil {
+		return nil
+	}
+	if tailBytes <= first.Available() {
+		seenFirst := false
+		for _, buffer := range mb {
+			if buffer == nil || buffer.IsEmpty() {
+				continue
+			}
+			if !seenFirst {
+				seenFirst = true
+				continue
+			}
+			if _, err := first.Write(buffer.Bytes()); err != nil {
+				return err
+			}
+		}
+		return c.writeBytes(outBytes, first.Bytes())
+	}
+
+	plaintext := buf.StackNew()
+	defer plaintext.Release()
+	for _, buffer := range mb {
+		if buffer == nil || buffer.IsEmpty() {
+			continue
+		}
+		remaining := buffer.Bytes()
+		for len(remaining) > 0 {
+			if plaintext.IsEmpty() && len(remaining) >= buf.Size {
+				if err := c.writeRecord(outBytes, remaining[:buf.Size]); err != nil {
+					return err
+				}
+				remaining = remaining[buf.Size:]
+				continue
+			}
+
+			n := min(len(remaining), int(plaintext.Available()))
+			_, _ = plaintext.Write(remaining[:n])
+			remaining = remaining[n:]
+			if plaintext.IsFull() {
+				if err := c.writeRecord(outBytes, plaintext.Bytes()); err != nil {
+					return err
+				}
+				plaintext.Clear()
+			}
+		}
+	}
+	if plaintext.IsEmpty() {
+		return nil
+	}
+	return c.writeRecord(outBytes, plaintext.Bytes())
 }
 
 func (c *CommonConn) Read(b []byte) (int, error) {
