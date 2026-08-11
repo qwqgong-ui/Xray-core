@@ -87,6 +87,9 @@ jobs:
           # Exclude i386 on darwin
           - goarch: 386
             goos: darwin
+          # Linux AMD64 is released only for the v3 microarchitecture.
+          - goarch: amd64
+            goos: linux
         include:
           # BEGIN Linux AMD64 v3
           - goos: linux
