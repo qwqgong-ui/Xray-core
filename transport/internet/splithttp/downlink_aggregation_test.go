@@ -6,10 +6,13 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/signal/done"
+	"github.com/xtls/xray-core/transport/internet/stat"
 )
 
 type recordingResponseWriter struct {
@@ -123,6 +126,194 @@ func TestDownlinkAggregationDisabledFlushesEachWrite(t *testing.T) {
 	if flushes != 2 {
 		t.Fatalf("flushes = %d, want 2", flushes)
 	}
+}
+
+func TestDownlinkMultiBufferUsesOneApplicationWrite(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	split := &splitConn{writer: conn, reader: io.NopCloser(bytes.NewReader(nil))}
+	batchWriter := buf.NewWriter(split)
+
+	first := buf.New()
+	second := buf.New()
+	_, _ = first.Write([]byte("first-"))
+	_, _ = second.Write([]byte("second"))
+	if err := batchWriter.WriteMultiBuffer(buf.MultiBuffer{
+		first,
+		second,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, flushes := writer.snapshot()
+	if len(writes) != 1 || flushes != 1 {
+		t.Fatalf("writes = %v, flushes = %d, want one application write and flush", writeLengths(writes), flushes)
+	}
+	if got, want := writes[0], []byte("first-second"); !bytes.Equal(got, want) {
+		t.Fatalf("payload = %q, want %q", got, want)
+	}
+	if first.Cap() != 0 || second.Cap() != 0 {
+		t.Fatalf("buffer ownership was not released: caps = %d, %d", first.Cap(), second.Cap())
+	}
+}
+
+func TestDownlinkMultiBufferSurvivesStatsConnection(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	split := &splitConn{writer: conn, reader: io.NopCloser(bytes.NewReader(nil))}
+	counter := new(testCounter)
+	wrapped := &stat.CounterConnection{Connection: split, WriteCounter: counter}
+
+	if err := buf.NewWriter(wrapped).WriteMultiBuffer(buf.MultiBuffer{
+		buf.FromBytes([]byte("first-")),
+		buf.FromBytes([]byte("second")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, _ := writer.snapshot()
+	if len(writes) != 1 || string(writes[0]) != "first-second" {
+		t.Fatalf("writes through stats connection = %q, want one ordered write", writes)
+	}
+	if got, want := counter.Value(), int64(len("first-second")); got != want {
+		t.Fatalf("write counter = %d, want %d", got, want)
+	}
+}
+
+type testCounter struct {
+	value atomic.Int64
+}
+
+func (c *testCounter) Value() int64 { return c.value.Load() }
+
+func (c *testCounter) Set(value int64) int64 { return c.value.Swap(value) }
+
+func (c *testCounter) Add(value int64) int64 { return c.value.Add(value) }
+
+func TestDownlinkMultiBufferFallbackUsesOneApplicationWrite(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	first := buf.New()
+	second := buf.New()
+	_, _ = first.Write(bytes.Repeat([]byte{'a'}, buf.Size))
+	_, _ = second.Write(bytes.Repeat([]byte{'b'}, buf.Size))
+
+	if err := conn.WriteMultiBuffer(buf.MultiBuffer{first, second}); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, flushes := writer.snapshot()
+	if len(writes) != 1 || flushes != 1 || len(writes[0]) != 2*buf.Size {
+		t.Fatalf("writes = %v, flushes = %d, want one %d-byte fallback write", writeLengths(writes), flushes, 2*buf.Size)
+	}
+	if !bytes.Equal(writes[0][:buf.Size], bytes.Repeat([]byte{'a'}, buf.Size)) ||
+		!bytes.Equal(writes[0][buf.Size:], bytes.Repeat([]byte{'b'}, buf.Size)) {
+		t.Fatal("fallback write changed payload bytes or ordering")
+	}
+	if first.Cap() != 0 || second.Cap() != 0 {
+		t.Fatalf("fallback buffer ownership was not released: caps = %d, %d", first.Cap(), second.Cap())
+	}
+}
+
+func TestDownlinkSingleBufferStillUsesOneApplicationWrite(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	split := &splitConn{writer: conn, reader: io.NopCloser(bytes.NewReader(nil))}
+	payload := []byte("single")
+
+	if err := buf.NewWriter(split).WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(payload)}); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, flushes := writer.snapshot()
+	if len(writes) != 1 || flushes != 1 || !bytes.Equal(writes[0], payload) {
+		t.Fatalf("writes = %q, flushes = %d, want one unchanged write", writes, flushes)
+	}
+}
+
+func TestDownlinkMultiBufferAggregationPreservesBatch(t *testing.T) {
+	conn, writer := newAggregationTestConn(time.Hour)
+	conn.SetDownlinkWriteAggregation(true)
+	first := []byte("aggregated-")
+	second := []byte("batch")
+
+	if err := conn.WriteMultiBuffer(buf.MultiBuffer{buf.FromBytes(first), buf.FromBytes(second)}); err != nil {
+		t.Fatal(err)
+	}
+	if writes, flushes := writer.snapshot(); len(writes) != 0 || flushes != 0 {
+		t.Fatalf("batch flushed before aggregation boundary: writes=%v flushes=%d", writeLengths(writes), flushes)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	writes, flushes := writer.snapshot()
+	want := append(bytes.Clone(first), second...)
+	if len(writes) != 1 || flushes != 1 || !bytes.Equal(writes[0], want) {
+		t.Fatalf("writes = %q, flushes = %d, want one ordered aggregated batch %q", writes, flushes, want)
+	}
+}
+
+func TestDownlinkMultiBufferReportsPartialWrite(t *testing.T) {
+	wantErr := io.ErrShortWrite
+	writer := &partialResponseWriter{
+		header: make(http.Header),
+		limit:  4,
+	}
+	conn := &httpServerConn{
+		Instance:       done.New(),
+		Reader:         bytes.NewReader(nil),
+		ResponseWriter: writer,
+	}
+
+	first := buf.New()
+	second := buf.New()
+	_, _ = first.Write([]byte("hello"))
+	_, _ = second.Write([]byte("world"))
+	err := conn.WriteMultiBuffer(buf.MultiBuffer{first, second})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("WriteMultiBuffer error = %v, want %v", err, wantErr)
+	}
+	if writer.calls != 1 {
+		t.Fatalf("ResponseWriter.Write calls = %d, want 1", writer.calls)
+	}
+	if got, want := writer.payload, []byte("hell"); !bytes.Equal(got, want) {
+		t.Fatalf("partial payload = %q, want %q", got, want)
+	}
+	if first.Cap() != 0 || second.Cap() != 0 {
+		t.Fatalf("buffers were not released after partial write: caps = %d, %d", first.Cap(), second.Cap())
+	}
+}
+
+func TestDownlinkMultiBufferPropagatesWriteError(t *testing.T) {
+	wantErr := errors.New("write failed")
+	conn, writer := newAggregationTestConn(time.Hour)
+	writer.writeErr = wantErr
+	first := buf.New()
+	second := buf.New()
+	_, _ = first.Write([]byte("first"))
+	_, _ = second.Write([]byte("second"))
+
+	if err := conn.WriteMultiBuffer(buf.MultiBuffer{first, second}); !errors.Is(err, wantErr) {
+		t.Fatalf("WriteMultiBuffer error = %v, want %v", err, wantErr)
+	}
+	if first.Cap() != 0 || second.Cap() != 0 {
+		t.Fatalf("buffers were not released after write error: caps = %d, %d", first.Cap(), second.Cap())
+	}
+}
+
+type partialResponseWriter struct {
+	header  http.Header
+	limit   int
+	calls   int
+	payload []byte
+}
+
+func (w *partialResponseWriter) Header() http.Header { return w.header }
+
+func (*partialResponseWriter) WriteHeader(int) {}
+
+func (w *partialResponseWriter) Write(p []byte) (int, error) {
+	w.calls++
+	n := min(w.limit, len(p))
+	w.payload = append(w.payload, p[:n]...)
+	return n, nil
 }
 
 func TestDownlinkAggregationDoesNotSplitLargeWrite(t *testing.T) {

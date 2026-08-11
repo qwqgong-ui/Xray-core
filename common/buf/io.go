@@ -83,6 +83,20 @@ type Writer interface {
 	WriteMultiBuffer(MultiBuffer) error
 }
 
+type sizeStatWriter struct {
+	Writer
+	counter stats.Counter
+}
+
+func (w *sizeStatWriter) WriteMultiBuffer(mb MultiBuffer) error {
+	size := mb.Len()
+	if err := w.Writer.WriteMultiBuffer(mb); err != nil {
+		return err
+	}
+	w.counter.Add(int64(size))
+	return nil
+}
+
 // WriteAllBytes ensures all bytes are written into the given writer.
 func WriteAllBytes(writer io.Writer, payload []byte, c stats.Counter) error {
 	wc := 0
@@ -174,8 +188,20 @@ func NewWriter(writer io.Writer) Writer {
 	}
 
 	iConn := writer
+	var counter stats.Counter
 	if statConn, ok := writer.(*stat.CounterConnection); ok {
 		iConn = statConn.Connection
+		counter = statConn.WriteCounter
+	}
+
+	if mw, ok := iConn.(Writer); ok {
+		if counter == nil {
+			return mw
+		}
+		return &sizeStatWriter{
+			Writer:  mw,
+			counter: counter,
+		}
 	}
 
 	if isPacketWriter(iConn) {
@@ -184,11 +210,6 @@ func NewWriter(writer io.Writer) Writer {
 		}
 	}
 
-	var counter stats.Counter
-
-	if statConn, ok := writer.(*stat.CounterConnection); ok {
-		counter = statConn.WriteCounter
-	}
 	return &BufferToBytesWriter{
 		Writer:  iConn,
 		counter: counter,

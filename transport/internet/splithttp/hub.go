@@ -542,6 +542,54 @@ func (c *httpServerConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// WriteMultiBuffer keeps a batch intact until the ResponseWriter boundary.
+// The measured XHTTP batches overwhelmingly fit in the unused tail of their
+// first 8 KiB buffer, which avoids a new allocation. Only batches which cannot
+// be joined in place need a contiguous fallback because http.ResponseWriter
+// exposes scalar Write only.
+func (c *httpServerConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if mb.IsEmpty() {
+		buf.ReleaseMulti(mb)
+		return nil
+	}
+	defer buf.ReleaseMulti(mb)
+
+	var first *buf.Buffer
+	for _, buffer := range mb {
+		if buffer != nil && !buffer.IsEmpty() {
+			first = buffer
+			break
+		}
+	}
+
+	if mb.Len()-first.Len() <= first.Available() {
+		for _, buffer := range mb {
+			if buffer == nil || buffer == first || buffer.IsEmpty() {
+				continue
+			}
+			if _, err := first.Write(buffer.Bytes()); err != nil {
+				return err
+			}
+		}
+		_, err := c.Write(first.Bytes())
+		return err
+	}
+
+	combined := buf.NewWithSize(mb.Len())
+	defer combined.Release()
+	for _, buffer := range mb {
+		if buffer == nil || buffer.IsEmpty() {
+			continue
+		}
+		if _, err := combined.Write(buffer.Bytes()); err != nil {
+			return err
+		}
+	}
+
+	_, err := c.Write(combined.Bytes())
+	return err
+}
+
 // SetDownlinkWriteAggregation is called by an upper-layer protocol only after
 // it has identified an eligible stream. XHTTP itself cannot distinguish TCP,
 // UDP, or the destination port from the opaque response bytes.

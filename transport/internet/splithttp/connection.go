@@ -32,6 +32,19 @@ func (c *splitConn) Write(b []byte) (int, error) {
 	return c.writer.Write(b)
 }
 
+// WriteMultiBuffer preserves batch boundaries for writers which understand
+// them. Client-side upload writers (notably io.Pipe) still use the same
+// sequential fallback as buf.SequentialWriter.
+func (c *splitConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if writer, ok := c.writer.(buf.Writer); ok {
+		return writer.WriteMultiBuffer(mb)
+	}
+
+	mb, err := buf.WriteMultiBuffer(c, mb)
+	buf.ReleaseMulti(mb)
+	return err
+}
+
 func (c *splitConn) Read(b []byte) (int, error) {
 	if !c.readyEnabled {
 		return c.reader.Read(b)
