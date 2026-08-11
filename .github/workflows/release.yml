@@ -87,16 +87,16 @@ jobs:
           # Exclude i386 on darwin
           - goarch: 386
             goos: darwin
-          # Linux AMD64 is released only for the v3 microarchitecture.
+          # Linux AMD64 is released only for the v4 microarchitecture.
           - goarch: amd64
             goos: linux
         include:
-          # BEGIN Linux AMD64 v3
+          # BEGIN Linux AMD64 v4
           - goos: linux
             goarch: amd64
-            goamd64: v3
-            patch-assetname: linux-amd64-v3
-          # END Linux AMD64 v3
+            goamd64: v4
+            patch-assetname: linux-amd64-v4
+          # END Linux AMD64 v4
           # BEGIN MacOS ARM64
           - goos: darwin
             goarch: arm64
