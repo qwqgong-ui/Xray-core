@@ -88,6 +88,12 @@ jobs:
           - goarch: 386
             goos: darwin
         include:
+          # BEGIN Linux AMD64 v3
+          - goos: linux
+            goarch: amd64
+            goamd64: v3
+            patch-assetname: linux-amd64-v3
+          # END Linux AMD64 v3
           # BEGIN MacOS ARM64
           - goos: darwin
             goarch: arm64
@@ -189,8 +195,12 @@ jobs:
         run: |
           _NAME=${{ matrix.patch-assetname }}
           [ -n "$_NAME" ] || _NAME=$(jq ".[\"$GOOS-$GOARCH$GOARM$GOMIPS\"].friendlyName" -r < .github/build/friendly-filenames.json)
-          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOARM: $GOARM, GOMIPS: $GOMIPS, RELEASE_NAME: $_NAME"
+          echo "GOOS: $GOOS, GOARCH: $GOARCH, GOAMD64: ${{ matrix.goamd64 }}, GOARM: $GOARM, GOMIPS: $GOMIPS, RELEASE_NAME: $_NAME"
           echo "ASSET_NAME=$_NAME" >> $GITHUB_ENV
+
+      - name: Configure AMD64 microarchitecture
+        if: matrix.goamd64 != ''
+        run: echo "GOAMD64=${{ matrix.goamd64 }}" >> "$GITHUB_ENV"
 
       - name: Set up Go
         uses: actions/setup-go@v7
