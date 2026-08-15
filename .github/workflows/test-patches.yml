@@ -47,6 +47,12 @@ jobs:
           cd "${worktree}"
           dependency_flags="$("${GITHUB_WORKSPACE}/patches/apply-dependency-patches.sh" "${worktree}")"
           export "${dependency_flags}"
+          quic_dir="$(go list -m -f '{{.Dir}}' github.com/apernet/quic-go)"
+          (
+            cd "${quic_dir}"
+            GOFLAGS= go test ./internal/ackhandler
+          )
+          cd "${worktree}"
           go test \
             ./common/buf \
             ./proxy \
