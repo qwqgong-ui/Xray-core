@@ -313,6 +313,8 @@ type bbrSender struct {
 	// Recorded on packet sent. equivalent |unacked_packets_->bytes_in_flight()|
 	bytesInFlight congestion.ByteCount
 
+	ecn ecnBBRState
+
 	debug bool
 }
 
@@ -495,7 +497,9 @@ func (b *bbrSender) SetMaxDatagramSize(s congestion.ByteCount) {
 	}
 	oldMinCongestionWindow := b.minCongestionWindow
 	oldInitialCongestionWindow := b.initialCongestionWindow
+	oldMaxDatagramSize := b.maxDatagramSize
 	b.rescalePacketSizedWindows(s)
+	b.ecn.rescaleWindows(oldMaxDatagramSize, s)
 	switch b.congestionWindow {
 	case oldMinCongestionWindow:
 		b.congestionWindow = b.minCongestionWindow
@@ -541,6 +545,7 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 
 	var isRoundStart, minRttExpired bool
 	var excessAcked, bytesLost congestion.ByteCount
+	hasSafetyLoss := b.hasSafetyLoss(priorInFlight, lostPackets)
 
 	// The send state of the largest packet in acked_packets, unless it is
 	// empty. If acked_packets is empty, it's the send state of the largest
@@ -561,7 +566,7 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	if len(ackedPackets) != 0 {
 		lastAckedPacket := ackedPackets[len(ackedPackets)-1].PacketNumber
 		isRoundStart = b.updateRoundTripCounter(lastAckedPacket)
-		b.updateRecoveryState(lastAckedPacket, len(lostPackets) != 0, isRoundStart)
+		b.updateRecoveryState(lastAckedPacket, hasSafetyLoss, isRoundStart)
 	}
 
 	sample := b.sampler.OnCongestionEvent(eventTime,
@@ -588,14 +593,14 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	excessAcked = sample.extraAcked
 	lastPacketSendState = sample.lastPacketSendState
 
-	if len(lostPackets) != 0 {
+	if hasSafetyLoss {
 		b.numLossEventsInRound++
 		b.bytesLostInRound += bytesLost
 	}
 
 	// Handle logic specific to PROBE_BW mode.
 	if b.mode == bbrModeProbeBw {
-		b.updateGainCyclePhase(eventTime, priorInFlight, len(lostPackets) != 0)
+		b.updateGainCyclePhase(eventTime, priorInFlight, hasSafetyLoss)
 	}
 
 	// Handle logic specific to STARTUP and DRAIN modes.
@@ -613,9 +618,14 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 
 	// After the model is updated, recalculate the pacing rate and congestion
 	// window.
-	b.calculatePacingRate(bytesLost)
+	pacingLoss := bytesLost
+	if b.ecn.capable && !hasSafetyLoss {
+		pacingLoss = 0
+	}
+	b.calculatePacingRate(pacingLoss)
 	b.calculateCongestionWindow(bytesAcked, excessAcked)
-	b.calculateRecoveryWindow(bytesAcked, bytesLost)
+	b.calculateRecoveryWindow(bytesAcked, pacingLoss)
+	b.applyECNPolicy(isRoundStart, hasSafetyLoss)
 
 	// Cleanup internal state.
 	// This is where we clean up obsolete (acked or lost) packets from the bandwidth sampler.

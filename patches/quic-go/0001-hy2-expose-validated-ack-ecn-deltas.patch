@@ -1,0 +1,374 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Sat, 15 Aug 2026 20:10:00 +0900
+Subject: [PATCH] quic: expose validated ACK_ECN deltas to congestion control
+
+Keep RFC 9000 ECN validation unchanged, but retain the exact per-ACK ECT(0), ECT(1), and CE counter deltas instead of reducing them to a boolean. Forward them through an optional congestion-controller hook, preserve compatible custom controllers across path migration, and restart ECN validation on the new path.
+---
+diff --git a/internal/ackhandler/cc_adapter.go b/internal/ackhandler/cc_adapter.go
+index d6daa0fd..da3d9c3c 100644
+--- a/internal/ackhandler/cc_adapter.go
++++ b/internal/ackhandler/cc_adapter.go
+@@ -41,6 +41,12 @@ func (a *ccAdapter) OnCongestionEvent(number protocol.PacketNumber, lostBytes pr
+ 	a.CC.OnCongestionEvent(congestion.PacketNumber(number), congestion.ByteCount(lostBytes), congestion.ByteCount(priorInFlight))
+ }
+ 
++func (a *ccAdapter) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64) bool {
++	return forwardECNFeedback(a.CC, capable, failed, ect0, ect1, ecnce)
++}
++
++func (a *ccAdapter) OnPathMigration() bool { return forwardPathMigration(a.CC) }
++
+ func (a *ccAdapter) OnRetransmissionTimeout(packetsRetransmitted bool) {
+ 	a.CC.OnRetransmissionTimeout(packetsRetransmitted)
+ }
+diff --git a/internal/ackhandler/cc_adapter_ex.go b/internal/ackhandler/cc_adapter_ex.go
+index e8d3bf0a..89abc4dd 100644
+--- a/internal/ackhandler/cc_adapter_ex.go
++++ b/internal/ackhandler/cc_adapter_ex.go
+@@ -48,6 +48,12 @@ func (a *ccAdapterEx) OnCongestionEventEx(priorInFlight protocol.ByteCount, even
+ 	a.CC.OnCongestionEventEx(congestion.ByteCount(priorInFlight), eventTime, ackedPackets, lostPackets)
+ }
+ 
++func (a *ccAdapterEx) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64) bool {
++	return forwardECNFeedback(a.CC, capable, failed, ect0, ect1, ecnce)
++}
++
++func (a *ccAdapterEx) OnPathMigration() bool { return forwardPathMigration(a.CC) }
++
+ func (a *ccAdapterEx) OnRetransmissionTimeout(packetsRetransmitted bool) {
+ 	a.CC.OnRetransmissionTimeout(packetsRetransmitted)
+ }
+diff --git a/internal/ackhandler/congestion_signals.go b/internal/ackhandler/congestion_signals.go
+new file mode 100644
+index 00000000..cbdbc3c8
+--- /dev/null
++++ b/internal/ackhandler/congestion_signals.go
+@@ -0,0 +1,38 @@
++package ackhandler
++
++// These optional interfaces deliberately use primitive arguments. External
++// congestion controllers can consume validated ACK_ECN deltas and path changes
++// without changing the public CongestionControl interface.
++type ecnFeedbackReceiver interface {
++	OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64) bool
++}
++
++type pathMigrationReceiver interface {
++	OnPathMigration() bool
++}
++
++type externalECNFeedbackReceiver interface {
++	OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64)
++}
++
++type externalPathMigrationReceiver interface {
++	OnPathMigration()
++}
++
++func forwardECNFeedback(cc any, capable, failed bool, ect0, ect1, ecnce uint64) bool {
++	receiver, ok := cc.(externalECNFeedbackReceiver)
++	if !ok {
++		return false
++	}
++	receiver.OnECNFeedback(capable, failed, ect0, ect1, ecnce)
++	return true
++}
++
++func forwardPathMigration(cc any) bool {
++	receiver, ok := cc.(externalPathMigrationReceiver)
++	if !ok {
++		return false
++	}
++	receiver.OnPathMigration()
++	return true
++}
+diff --git a/internal/ackhandler/ecn.go b/internal/ackhandler/ecn.go
+index 8195f043..6914d07f 100644
+--- a/internal/ackhandler/ecn.go
++++ b/internal/ackhandler/ecn.go
+@@ -38,6 +38,16 @@ const (
+ // must fit into an uint8, otherwise numSentTesting and numLostTesting must have a larger type
+ const numECNTestingPackets = 10
+ 
++// ecnFeedback is the validated per-ACK delta of the peer's ACK_ECN counters.
++// Counts are only populated after the path has reached ecnStateCapable.
++type ecnFeedback struct {
++	capable bool
++	failed  bool
++	ect0    uint64
++	ect1    uint64
++	ecnce   uint64
++}
++
+ type ecnHandler interface {
+ 	SentPacket(protocol.PacketNumber, protocol.ECN)
+ 	Mode() protocol.ECN
+@@ -61,6 +71,7 @@ type ecnTracker struct {
+ 
+ 	numSentECT0, numSentECT1                  int64
+ 	numAckedECT0, numAckedECT1, numAckedECNCE int64
++	lastFeedback                              ecnFeedback
+ 
+ 	qlogger qlogwriter.Recorder
+ 	logger  utils.Logger
+@@ -79,6 +90,8 @@ func newECNTracker(logger utils.Logger, qlogger qlogwriter.Recorder) *ecnTracker
+ 	}
+ }
+ 
++func (e *ecnTracker) Feedback() ecnFeedback { return e.lastFeedback }
++
+ func (e *ecnTracker) SentPacket(pn protocol.PacketNumber, ecn protocol.ECN) {
+ 	//nolint:exhaustive // These are the only ones we need to take care of.
+ 	switch ecn {
+@@ -169,6 +182,18 @@ func (e *ecnTracker) LostPacket(pn protocol.PacketNumber) {
+ // It must only be called for ACK frames that increase the largest acknowledged packet number,
+ // see section 13.4.2.1 of RFC 9000.
+ func (e *ecnTracker) HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ect1, ecnce int64) (congested bool) {
++	var newECT0, newECT1, newECNCE int64
++	defer func() {
++		e.lastFeedback = ecnFeedback{
++			capable: e.state == ecnStateCapable,
++			failed:  e.state == ecnStateFailed,
++		}
++		if e.state == ecnStateCapable {
++			e.lastFeedback.ect0 = uint64(newECT0)
++			e.lastFeedback.ect1 = uint64(newECT1)
++			e.lastFeedback.ecnce = uint64(newECNCE)
++		}
++	}()
+ 	if e.state == ecnStateFailed {
+ 		return false
+ 	}
+@@ -217,9 +242,9 @@ func (e *ecnTracker) HandleNewlyAcked(packets []packetWithPacketNumber, ect0, ec
+ 	}
+ 
+ 	// Determine the increase in ECT0, ECT1 and ECNCE marks
+-	newECT0 := ect0 - e.numAckedECT0
+-	newECT1 := ect1 - e.numAckedECT1
+-	newECNCE := ecnce - e.numAckedECNCE
++	newECT0 = ect0 - e.numAckedECT0
++	newECT1 = ect1 - e.numAckedECT1
++	newECNCE = ecnce - e.numAckedECNCE
+ 
+ 	// We're only processing ACKs that increase the Largest Acked.
+ 	// Therefore, the ECN counters should only ever increase.
+diff --git a/internal/ackhandler/ecn_feedback_test.go b/internal/ackhandler/ecn_feedback_test.go
+new file mode 100644
+index 00000000..35dbc3df
+--- /dev/null
++++ b/internal/ackhandler/ecn_feedback_test.go
+@@ -0,0 +1,147 @@
++package ackhandler
++
++import (
++	"testing"
++
++	congestionExt "github.com/apernet/quic-go/congestion"
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/apernet/quic-go/internal/wire"
++	"github.com/apernet/quic-go/testutils/events"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestECNFeedbackPreservesValidatedCounterDeltas(t *testing.T) {
++	var recorder events.Recorder
++	tracker := newECNTracker(utils.DefaultLogger, &recorder)
++	sendECNTestingPackets(t, tracker, &recorder)
++	for i := 10; i < 20; i++ {
++		tracker.SentPacket(protocol.PacketNumber(i), protocol.ECNNon)
++	}
++
++	require.True(t, tracker.HandleNewlyAcked(getAckedPackets(1, 2, 3, 12), 2, 0, 1))
++	require.Equal(t, ecnFeedback{capable: true, ect0: 2, ecnce: 1}, tracker.Feedback())
++
++	require.False(t, tracker.HandleNewlyAcked(getAckedPackets(4, 5, 6, 13), 5, 0, 1))
++	require.Equal(t, ecnFeedback{capable: true, ect0: 3}, tracker.Feedback())
++
++	require.True(t, tracker.HandleNewlyAcked(getAckedPackets(7, 8, 9, 14), 7, 0, 2))
++	require.Equal(t, ecnFeedback{capable: true, ect0: 2, ecnce: 1}, tracker.Feedback())
++}
++
++func TestECNFeedbackReportsValidationFailure(t *testing.T) {
++	var recorder events.Recorder
++	tracker := newECNTracker(utils.DefaultLogger, &recorder)
++	sendECNTestingPackets(t, tracker, &recorder)
++
++	require.False(t, tracker.HandleNewlyAcked(getAckedPackets(0, 1, 2, 3, 4, 5, 6, 7, 8, 9), 0, 0, 0))
++	require.Equal(t, ecnFeedback{failed: true}, tracker.Feedback())
++}
++
++type signalCongestionControl struct {
++	feedback   ecnFeedback
++	migrations int
++}
++
++func (c *signalCongestionControl) SetRTTStatsProvider(congestionExt.RTTStatsProvider) {}
++func (c *signalCongestionControl) TimeUntilSend(congestionExt.ByteCount) monotime.Time {
++	return monotime.Now()
++}
++func (c *signalCongestionControl) HasPacingBudget(monotime.Time) bool { return true }
++func (c *signalCongestionControl) OnPacketSent(monotime.Time, congestionExt.ByteCount, congestionExt.PacketNumber, congestionExt.ByteCount, bool) {
++}
++func (c *signalCongestionControl) CanSend(congestionExt.ByteCount) bool { return true }
++func (c *signalCongestionControl) MaybeExitSlowStart()                  {}
++func (c *signalCongestionControl) OnPacketAcked(congestionExt.PacketNumber, congestionExt.ByteCount, congestionExt.ByteCount, monotime.Time) {
++}
++func (c *signalCongestionControl) OnCongestionEvent(congestionExt.PacketNumber, congestionExt.ByteCount, congestionExt.ByteCount) {
++}
++func (c *signalCongestionControl) OnCongestionEventEx(congestionExt.ByteCount, monotime.Time, []congestionExt.AckedPacketInfo, []congestionExt.LostPacketInfo) {
++}
++func (c *signalCongestionControl) OnRetransmissionTimeout(bool)                 {}
++func (c *signalCongestionControl) SetMaxDatagramSize(congestionExt.ByteCount)   {}
++func (c *signalCongestionControl) InSlowStart() bool                            { return false }
++func (c *signalCongestionControl) InRecovery() bool                             { return false }
++func (c *signalCongestionControl) GetCongestionWindow() congestionExt.ByteCount { return 1 << 20 }
++
++func (c *signalCongestionControl) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64) {
++	c.feedback = ecnFeedback{capable: capable, failed: failed, ect0: ect0, ect1: ect1, ecnce: ecnce}
++}
++
++func (c *signalCongestionControl) OnPathMigration() { c.migrations++ }
++
++func TestCongestionAdapterForwardsECNAndMigrationSignals(t *testing.T) {
++	cc := &signalCongestionControl{}
++	adapter := &ccAdapterEx{CC: cc}
++
++	require.True(t, adapter.OnECNFeedback(true, false, 8, 1, 2))
++	require.Equal(t, ecnFeedback{capable: true, ect0: 8, ect1: 1, ecnce: 2}, cc.feedback)
++	require.True(t, adapter.OnPathMigration())
++	require.Equal(t, 1, cc.migrations)
++}
++
++func TestSentPacketHandlerForwardsValidatedACKECNDeltas(t *testing.T) {
++	handler := NewSentPacketHandler(
++		0,
++		1200,
++		utils.NewRTTStats(),
++		&utils.ConnectionStats{},
++		true,
++		true,
++		nil,
++		protocol.PerspectiveClient,
++		nil,
++		utils.DefaultLogger,
++	).(*sentPacketHandler)
++	cc := &signalCongestionControl{}
++	handler.SetCongestionControl(cc)
++
++	now := monotime.Now()
++	pns := make([]protocol.PacketNumber, 0, numECNTestingPackets)
++	for i := 0; i < numECNTestingPackets; i++ {
++		pn := handler.PopPacketNumber(protocol.Encryption1RTT)
++		ecn := handler.ECNMode(true)
++		require.Equal(t, protocol.ECT0, ecn)
++		handler.SentPacket(
++			now, pn, protocol.InvalidPacketNumber, nil,
++			[]Frame{{Frame: &wire.PingFrame{}}},
++			protocol.Encryption1RTT, ecn, 1200, false, false,
++		)
++		pns = append(pns, pn)
++	}
++
++	_, err := handler.ReceivedAck(&wire.AckFrame{
++		AckRanges: ackRanges(pns...),
++		ECT0:      numECNTestingPackets - 1,
++		ECNCE:     1,
++	}, protocol.Encryption1RTT, monotime.Now())
++	require.NoError(t, err)
++	require.Equal(t, ecnFeedback{capable: true, ect0: numECNTestingPackets - 1, ecnce: 1}, cc.feedback)
++}
++
++func TestPathMigrationRevalidatesECNAndKeepsAwareController(t *testing.T) {
++	handler := NewSentPacketHandler(
++		0,
++		1200,
++		utils.NewRTTStats(),
++		&utils.ConnectionStats{},
++		true,
++		true,
++		nil,
++		protocol.PerspectiveClient,
++		nil,
++		utils.DefaultLogger,
++	).(*sentPacketHandler)
++	cc := &signalCongestionControl{}
++	handler.SetCongestionControl(cc)
++	oldController := handler.congestion
++	oldTracker := handler.ecnTracker
++
++	handler.MigratedPath(monotime.Now(), 1200)
++
++	require.NotSame(t, oldTracker, handler.ecnTracker)
++	require.Same(t, oldController, handler.congestion)
++	require.Equal(t, 1, cc.migrations)
++}
+diff --git a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
+index 01e97e19..c102c00f 100644
+--- a/internal/ackhandler/sent_packet_handler.go
++++ b/internal/ackhandler/sent_packet_handler.go
+@@ -434,7 +434,20 @@ func (h *sentPacketHandler) ReceivedAck(ack *wire.AckFrame, encLevel protocol.En
+ 	// Only inform the ECN tracker about new 1-RTT ACKs if the ACK increases the largest acked.
+ 	if encLevel == protocol.Encryption1RTT && h.ecnTracker != nil && largestAcked > pnSpace.largestAcked {
+ 		congested := h.ecnTracker.HandleNewlyAcked(ackedPackets, int64(ack.ECT0), int64(ack.ECT1), int64(ack.ECNCE))
+-		if congested {
++		feedbackHandled := false
++		if tracker, ok := h.ecnTracker.(interface{ Feedback() ecnFeedback }); ok {
++			if receiver, ok := cc.(ecnFeedbackReceiver); ok {
++				feedback := tracker.Feedback()
++				feedbackHandled = receiver.OnECNFeedback(
++					feedback.capable,
++					feedback.failed,
++					feedback.ect0,
++					feedback.ect1,
++					feedback.ecnce,
++				)
++			}
++		}
++		if congested && !feedbackHandled {
+ 			cc.OnCongestionEvent(largestAcked, 0, priorInFlight)
+ 		}
+ 	}
+@@ -1155,6 +1168,9 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
+ 
+ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
+ 	h.rttStats.ResetForPathMigration()
++	if h.enableECN {
++		h.ecnTracker = newECNTracker(h.logger, h.qlogger)
++	}
+ 	for pn, p := range h.appDataPackets.history.Packets() {
+ 		h.appDataPackets.history.DeclareLost(pn)
+ 		if !p.isPathProbePacket {
+@@ -1167,14 +1183,21 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
+ 	for pn := range h.appDataPackets.history.PathProbes() {
+ 		h.appDataPackets.history.RemovePathProbe(pn)
+ 	}
+-	h.congestion = congestion.NewCubicSender(
+-		congestion.DefaultClock{},
+-		h.rttStats,
+-		h.connStats,
+-		initialMaxDatagramSize,
+-		true, // use Reno
+-		h.qlogger,
+-	)
++	cc := h.getCongestionControl()
++	migrationHandled := false
++	if receiver, ok := cc.(pathMigrationReceiver); ok {
++		migrationHandled = receiver.OnPathMigration()
++	}
++	if !migrationHandled {
++		h.congestion = congestion.NewCubicSender(
++			congestion.DefaultClock{},
++			h.rttStats,
++			h.connStats,
++			initialMaxDatagramSize,
++			true, // use Reno
++			h.qlogger,
++		)
++	}
+ 	h.setLossDetectionTimer(now)
+ }
+ 

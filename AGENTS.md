@@ -5,3 +5,4 @@
 - Name Linux AMD64 release artifacts `linux-amd64-v4` so the required CPU level is explicit.
 - The Japan production server supports v4 and should use `GOAMD64=v4` unless its CPU changes.
 - Keep generic `GOAMD64=v1` builds only when backward compatibility is explicitly required.
+- Before any build or test, run `sh patches/apply-dependency-patches.sh "$PWD" <env-file>` and use the emitted `GOFLAGS`; this applies the pinned QUIC dependency patches without changing `go.mod`.

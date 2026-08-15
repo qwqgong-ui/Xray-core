@@ -6,6 +6,8 @@ on:
       - SingleUser
     paths:
       - "patches/xray/**"
+      - "patches/quic-go/**"
+      - "patches/apply-dependency-patches.sh"
       - ".github/workflows/sync-upstream.yml"
       - ".github/workflows/test-patches.yml"
   workflow_dispatch:
@@ -43,9 +45,12 @@ jobs:
           done
           git -C "${worktree}" diff --check
           cd "${worktree}"
+          dependency_flags="$("${GITHUB_WORKSPACE}/patches/apply-dependency-patches.sh" "${worktree}")"
+          export "${dependency_flags}"
           go test \
             ./common/buf \
             ./proxy \
             ./proxy/freedom \
             ./proxy/vless/inbound \
+            ./transport/internet/hysteria/congestion/bbr \
             ./transport/internet/splithttp

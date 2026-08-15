@@ -211,6 +211,10 @@ jobs:
           go-version-file: go.mod
           check-latest: true
 
+      - name: Apply dependency patches
+        shell: bash
+        run: sh patches/apply-dependency-patches.sh "$PWD" "$GITHUB_ENV"
+
       - name: Get project dependencies
         run: go mod download
 

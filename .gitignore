@@ -39,6 +39,7 @@ errorgen
 
 # Build assets
 /build_assets/
+/.xray-patched-deps.*/
 
 # Output from dlv test
 **/debug.*

@@ -106,6 +106,10 @@ jobs:
           unzip ./go-for-win7-linux-amd64.zip -d $GOSDK
           rm ./go-for-win7-linux-amd64.zip
 
+      - name: Apply dependency patches
+        shell: bash
+        run: sh patches/apply-dependency-patches.sh "$PWD" "$GITHUB_ENV"
+
       - name: Get project dependencies
         run: go mod download
 
