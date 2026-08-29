@@ -79,9 +79,10 @@ type InterConn struct {
 	mutex  sync.Mutex
 	closed bool
 
-	write func(p []byte) error
-	close func()
-	user  *protocol.MemoryUser
+	write         func(p []byte) error
+	close         func()
+	user          *protocol.MemoryUser
+	hybridSession *hybridSession
 }
 
 func (i *InterConn) User() *protocol.MemoryUser {
@@ -161,6 +162,7 @@ type udpSessionManager struct {
 	addConn        internet.ConnHandler
 	udpIdleTimeout time.Duration
 	user           *protocol.MemoryUser
+	hybridSession  *hybridSession
 }
 
 func (m *udpSessionManager) close(udpConn *InterConn) {
@@ -287,6 +289,7 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 			m.Unlock()
 		}
 		udpConn.user = m.user
+		udpConn.hybridSession = m.hybridSession
 		m.m[id] = udpConn
 		m.addConn(udpConn)
 	}

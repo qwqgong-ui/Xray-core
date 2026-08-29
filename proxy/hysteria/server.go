@@ -115,6 +115,37 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		b.Resize(0, int32(n))
 		b.UDP = addr
 
+		if hybrid, ok := iConn.(interface {
+			HandleHybridQUIC(string, []byte) (bool, error)
+		}); ok {
+			handled, handleErr := hybrid.HandleHybridQUIC(addr.NetAddr(), b.Bytes())
+			if handled {
+				b.Release()
+				if handleErr != nil {
+					return handleErr
+				}
+				// UDPReader reassembles HY2 fragments before copying into this
+				// buffer. Hybrid control messages contain the original QUIC
+				// datagram plus a 42-byte registration header, so a buffer sized
+				// to one HY2 frame (1200 bytes) silently discards normal 1200-byte
+				// QUIC Initials after the first message.
+				control := make([]byte, 64*1024)
+				for {
+					n, nextAddr, readErr := reader.ReadFrom(control)
+					if readErr != nil {
+						return readErr
+					}
+					handled, handleErr = hybrid.HandleHybridQUIC(nextAddr.NetAddr(), control[:n])
+					if !handled {
+						return errors.New("hybrid QUIC control session changed destination")
+					}
+					if handleErr != nil {
+						return handleErr
+					}
+				}
+			}
+		}
+
 		reader.firstBuf = b
 
 		writer := &UDPWriter{
