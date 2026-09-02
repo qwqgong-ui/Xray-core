@@ -1,6 +1,7 @@
 package hysteria
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	xerrors "github.com/xtls/xray-core/common/errors"
 	xnet "github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/transport/internet"
 )
@@ -63,14 +65,9 @@ type hybridManager struct {
 type hybridSession struct {
 	manager *hybridManager
 	remote  netip.Addr
-	// send delivers a datagram back over this client's authenticated tunnel,
-	// attributed to the given source. It carries the target's replies until the
-	// flow's raw tuple is bound, and the registration acknowledgements.
-	send func(payload []byte, from xnet.Destination) error
-
-	mu     sync.Mutex
-	flows  map[[16]byte]*hybridFlow
-	closed bool
+	mu      sync.Mutex
+	flows   map[[16]byte]*hybridFlow
+	closed  bool
 }
 
 type hybridFlow struct {
@@ -89,6 +86,12 @@ type hybridFlow struct {
 	cids     []string
 	lastSeen time.Time
 	closed   bool
+	// send returns a datagram over the UDP link the registration arrived on.
+	// It belongs to the flow rather than the session: one authenticated tunnel
+	// carries many UDP links, each with its own writer, and a session-wide
+	// sender would still point at the first link long after the client closed
+	// it, so every later flow's replies would go nowhere.
+	send func(payload []byte, from xnet.Destination) error
 }
 
 type hybridPacketConn struct {
@@ -199,6 +202,10 @@ func (m *hybridManager) bind(client netip.AddrPort, packet []byte) *hybridFlow {
 		m.flows[client] = flow
 	}
 	m.mu.Unlock()
+	// The only point at which the raw path starts carrying this flow. Without
+	// it there is no way to tell a relay that is working from one that
+	// registered and then quietly fell back to the tunnel for everything.
+	xerrors.LogDebug(context.Background(), "hybrid QUIC bound ", client, " -> ", flow.target)
 	return flow
 }
 
@@ -322,13 +329,7 @@ func (m *hybridManager) newSession(remote net.Addr) *hybridSession {
 	return s
 }
 
-func (s *hybridSession) sender() func([]byte, xnet.Destination) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.send
-}
-
-func (s *hybridSession) handle(data []byte) error {
+func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) error) error {
 	if s == nil {
 		return errors.New("hybrid QUIC is unavailable for this session")
 	}
@@ -337,9 +338,9 @@ func (s *hybridSession) handle(data []byte) error {
 		return err
 	}
 
-	flow, err := s.register(id, target)
+	flow, err := s.register(id, target, send)
 	if err != nil {
-		s.ack(id, hybridAckFailed)
+		ackHybrid(send, id, hybridAckFailed, netip.AddrPort{})
 		return err
 	}
 	// The client's own Initial DCID is what its 0-RTT and Handshake packets are
@@ -349,10 +350,10 @@ func (s *hybridSession) handle(data []byte) error {
 		s.manager.claimCID(flow, dcid)
 	}
 	if err = flow.writeTarget(payload); err != nil {
-		s.ack(id, hybridAckFailed)
+		ackHybrid(send, id, hybridAckFailed, netip.AddrPort{})
 		return err
 	}
-	s.ack(id, hybridAckOK)
+	ackHybrid(send, id, hybridAckOK, flow.target)
 	return nil
 }
 
@@ -404,16 +405,33 @@ func parseHybridInitial(data []byte) (id [16]byte, target xnet.Destination, payl
 // ack reports the outcome of a registration over the tunnel. Without it a
 // rejected registration is indistinguishable to the client from a silent path
 // failure, and it would keep sending on a raw socket nothing is listening for.
-func (s *hybridSession) ack(id [16]byte, status byte) {
-	send := s.sender()
+//
+// A successful ack also carries the address the name resolved to. The client
+// registered a name precisely because it has none of its own -- under fake-IP
+// its only address is synthetic -- so it cannot label the replies arriving on
+// the raw path without being told. Only the server knows which address it
+// actually opened the flow to.
+func ackHybrid(send func([]byte, xnet.Destination) error, id [16]byte, status byte, target netip.AddrPort) {
 	if send == nil {
 		return
 	}
-	message := make([]byte, 22)
-	copy(message[:4], hybridMagic)
-	message[4] = hybridOpAck
-	copy(message[5:21], id[:])
-	message[21] = status
+	message := make([]byte, 0, 40)
+	message = append(message, hybridMagic...)
+	message = append(message, hybridOpAck)
+	message = append(message, id[:]...)
+	message = append(message, status)
+	if status == hybridAckOK && target.IsValid() {
+		if addr := target.Addr(); addr.Is4() {
+			v4 := addr.As4()
+			message = append(message, hybridTargetIPv4)
+			message = append(message, v4[:]...)
+		} else {
+			v6 := addr.As16()
+			message = append(message, hybridTargetIPv6)
+			message = append(message, v6[:]...)
+		}
+		message = binary.BigEndian.AppendUint16(message, target.Port())
+	}
 	_ = send(message, xnet.UDPDestination(xnet.DomainAddress("hybrid-quic.invalid"), xnet.Port(443)))
 }
 
@@ -447,7 +465,7 @@ func resolveHybridTarget(destination xnet.Destination) (netip.AddrPort, error) {
 // register creates the flow and its socket to the target. It deliberately does
 // not touch the manager's tuple table: the raw tuple is not known yet and is
 // filled in by bind once a raw packet has identified itself by connection ID.
-func (s *hybridSession) register(id [16]byte, destination xnet.Destination) (*hybridFlow, error) {
+func (s *hybridSession) register(id [16]byte, destination xnet.Destination, send func([]byte, xnet.Destination) error) (*hybridFlow, error) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -458,6 +476,11 @@ func (s *hybridSession) register(id [16]byte, destination xnet.Destination) (*hy
 		if existing.target.Port() != uint16(destination.Port) {
 			return nil, errors.New("hybrid QUIC flow id collision")
 		}
+		// A re-registration arrives on whichever link is live now; the one the
+		// flow was created on may already be gone.
+		existing.mu.Lock()
+		existing.send = send
+		existing.mu.Unlock()
 		return existing, nil
 	}
 	s.mu.Unlock()
@@ -486,7 +509,7 @@ func (s *hybridSession) register(id [16]byte, destination xnet.Destination) (*hy
 		_ = targetConn.Close()
 		return existing, nil
 	}
-	flow := &hybridFlow{session: s, id: id, target: target, conn: targetConn, lastSeen: time.Now()}
+	flow := &hybridFlow{session: s, id: id, target: target, conn: targetConn, lastSeen: time.Now(), send: send}
 	s.flows[id] = flow
 	s.mu.Unlock()
 
@@ -537,7 +560,9 @@ func (f *hybridFlow) readTarget() {
 			// back the way the registration came. This is also what removes the
 			// need for the client to punch a hole first: the server never
 			// speaks on the raw path before the client has.
-			send := f.session.sender()
+			f.mu.Lock()
+			send := f.send
+			f.mu.Unlock()
 			if send == nil {
 				f.close()
 				return
@@ -684,20 +709,5 @@ func (c *InterConn) HandleHybridQUIC(destination string, data []byte, send func(
 	if c.hybridSession == nil {
 		return true, errors.New("hybrid QUIC is unavailable for this session")
 	}
-	c.hybridSession.attachSender(send)
-	return true, c.hybridSession.handle(data)
-}
-
-// attachSender records the tunnel writer for this session. The session is
-// created at authentication time, before the proxy layer has built the writer
-// for its UDP link, so the first control message is what supplies it.
-func (s *hybridSession) attachSender(send func([]byte, xnet.Destination) error) {
-	if send == nil {
-		return
-	}
-	s.mu.Lock()
-	if s.send == nil {
-		s.send = send
-	}
-	s.mu.Unlock()
+	return true, c.hybridSession.handle(data, send)
 }

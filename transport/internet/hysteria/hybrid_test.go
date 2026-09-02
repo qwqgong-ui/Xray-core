@@ -214,7 +214,7 @@ func TestHybridControlRejectsUnsafeTargets(t *testing.T) {
 	message = append(message, netip.IPv6Loopback().AsSlice()...)
 	message = append(message, 1, 187) // 443
 	message = append(message, 0x2a)
-	if err := session.handle(message); err == nil {
+	if err := session.handle(message, nil); err == nil {
 		t.Fatal("loopback target was accepted")
 	}
 }

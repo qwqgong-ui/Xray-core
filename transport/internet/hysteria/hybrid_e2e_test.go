@@ -64,8 +64,10 @@ func TestHybridRepliesMoveFromTunnelToRawOnBind(t *testing.T) {
 	target := listenLoopback(t)
 	tunnel := &recordingTunnel{}
 	session := newTestSession(manager, netip.IPv6Loopback())
-	session.send = tunnel.send
 	flow := newBoundableFlow(t, session, target)
+	// The sender belongs to the flow: one tunnel carries many UDP links, and a
+	// flow answers on the one its registration arrived over.
+	flow.send = tunnel.send
 
 	dcid := []byte("connection-id-e2e")
 	manager.claimCID(flow, string(dcid))
