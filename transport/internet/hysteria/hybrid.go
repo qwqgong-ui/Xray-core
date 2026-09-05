@@ -16,13 +16,15 @@ import (
 
 const (
 	hybridControlHost = "hybrid-quic.invalid:443"
-	// The wire format changed incompatibly with HQV1: the client no longer
-	// reports its own raw port (the server observes it instead) and the target
-	// may now be a domain the server resolves itself. Bumping the magic makes
-	// an old peer fail cleanly rather than misparse a shifted header.
-	hybridMagic     = "HQV2"
+	// The wire format changed incompatibly with HQV2: the raw path now carries
+	// nothing but 1-RTT packets, so every long-header packet in either
+	// direction travels over the tunnel and the client needs an op that relays
+	// one without re-registering. Bumping the magic makes an HQV2 peer fail
+	// cleanly rather than misread an op it has no case for.
+	hybridMagic     = "HQV3"
 	hybridOpInitial = byte(1)
 	hybridOpAck     = byte(2)
+	hybridOpRelay   = byte(3)
 
 	hybridTargetDomain = byte(0)
 	hybridTargetIPv4   = byte(4)
@@ -34,8 +36,8 @@ const (
 	hybridFlowTTL = 2 * time.Minute
 
 	// hybridMaxFlowCIDs bounds the connection IDs one flow may claim. A flow
-	// needs two in the normal case (the client's original Initial DCID and the
-	// server's first SCID); the rest of the budget absorbs Retry and early
+	// needs one in the normal case (the SCID the target chose, which its 1-RTT
+	// packets are addressed to); the rest of the budget absorbs Retry and early
 	// rotation.
 	hybridMaxFlowCIDs = 8
 )
@@ -51,12 +53,19 @@ type hybridManager struct {
 	sessions map[*hybridSession]struct{}
 	hy2      map[netip.AddrPort]int
 	// byCID bootstraps a flow before its raw tuple is known. It holds the
-	// connection IDs a flow may be addressed by: the DCID of the client's own
-	// Initial (which also covers 0-RTT) and the SCID the target chose in its
-	// first reply. The client learns the latter only from that reply, which the
-	// server sends back through the tunnel, so a raw packet carrying it cannot
-	// arrive before the entry exists.
-	byCID       map[string]*hybridFlow
+	// connection IDs a flow may be addressed by, which the target chose and the
+	// client learns only from replies the server forwards over the tunnel, so a
+	// raw packet carrying one cannot arrive before the entry exists.
+	//
+	// A target that issues a zero-length connection ID cannot be matched this
+	// way and simply never binds: its flow stays on the tunnel for its whole
+	// life, which is slower but correct.
+	byCID map[string]*hybridFlow
+	// cidLengths counts the claimed connection IDs of each length. A 1-RTT
+	// packet does not encode its DCID length, so a raw packet from an unknown
+	// tuple can only be matched by trying the lengths this server has actually
+	// seen -- in practice one or two.
+	cidLengths  map[int]int
 	candidates  map[netip.AddrPort]time.Time
 	passUnknown bool
 	closed      chan struct{}
@@ -106,6 +115,7 @@ func newHybridManager(conn net.PacketConn) *hybridManager {
 		sessions:   make(map[*hybridSession]struct{}),
 		hy2:        make(map[netip.AddrPort]int),
 		byCID:      make(map[string]*hybridFlow),
+		cidLengths: make(map[int]int),
 		candidates: make(map[netip.AddrPort]time.Time),
 		closed:     make(chan struct{}),
 	}
@@ -150,11 +160,12 @@ func (c *hybridPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // bind attaches an as-yet-unseen raw tuple to the flow the packet's connection
 // ID belongs to, and reports that flow.
 //
-// Only long-header packets can bootstrap. A short header does not encode its
-// DCID length, so it cannot be parsed without already knowing the connection --
-// and it does not need to: the first packet a client sends on the raw path is
-// its Handshake (or 0-RTT), both of which are long-header. Anything short-header
-// from an unknown tuple is therefore not a flow of ours.
+// Only a 1-RTT packet can bootstrap. Every long-header packet of a hybrid flow
+// travels over the tunnel in both directions, so one arriving here is not ours.
+// A short header does not encode its DCID length, so it is matched against the
+// connection IDs this flow has claimed -- the target's own SCID, learned from
+// the handshake reply that was relayed through the tunnel, is what the client's
+// first 1-RTT packet is addressed to.
 //
 // The observed address must belong to the session that registered the flow.
 // Connection IDs travel in cleartext on the raw path, so an on-path observer can
@@ -162,13 +173,12 @@ func (c *hybridPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // the target's traffic to whoever sent the packet. NAT rewrites the port rather
 // than the address, so requiring the address still leaves IPv4 clients working.
 func (m *hybridManager) bind(client netip.AddrPort, packet []byte) *hybridFlow {
-	dcid, _, ok := longHeaderConnectionIDs(packet)
-	if !ok || dcid == "" {
+	if !isShortHeader(packet) {
 		return nil
 	}
 
 	m.mu.Lock()
-	flow := m.byCID[dcid]
+	flow := m.matchShortHeaderLocked(packet)
 	if flow == nil || m.hy2[client] > 0 || m.flows[client] != nil {
 		m.mu.Unlock()
 		return nil
@@ -234,8 +244,32 @@ func (m *hybridManager) claimCID(flow *hybridFlow, cid string) {
 	m.mu.Lock()
 	if m.byCID[cid] == nil {
 		m.byCID[cid] = flow
+		m.cidLengths[len(cid)]++
 	}
 	m.mu.Unlock()
+}
+
+// isShortHeader reports whether this is a 1-RTT packet: the header form bit
+// clear and the fixed bit set.
+func isShortHeader(packet []byte) bool {
+	return len(packet) > 1 && packet[0]&0xc0 == 0x40
+}
+
+// matchShortHeaderLocked finds the flow a 1-RTT packet belongs to by trying its
+// leading bytes against the connection IDs that have been claimed, longest
+// first. Only lengths some flow actually uses are tried, so this is a lookup or
+// two rather than a scan, and a longer ID is preferred so a short one can never
+// shadow it.
+func (m *hybridManager) matchShortHeaderLocked(packet []byte) *hybridFlow {
+	for length := 20; length >= 1; length-- {
+		if m.cidLengths[length] == 0 || len(packet) < 1+length {
+			continue
+		}
+		if flow := m.byCID[string(packet[1:1+length])]; flow != nil {
+			return flow
+		}
+	}
+	return nil
 }
 
 // longHeaderConnectionIDs reads the two connection IDs out of a QUIC long
@@ -333,6 +367,12 @@ func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) 
 	if s == nil {
 		return errors.New("hybrid QUIC is unavailable for this session")
 	}
+	if len(data) < 5 || string(data[:4]) != hybridMagic {
+		return errors.New("invalid hybrid QUIC control message")
+	}
+	if data[4] == hybridOpRelay {
+		return s.relay(data, send)
+	}
 	id, target, payload, err := parseHybridInitial(data)
 	if err != nil {
 		return err
@@ -343,18 +383,57 @@ func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) 
 		ackHybrid(send, id, hybridAckFailed, netip.AddrPort{})
 		return err
 	}
-	// The client's own Initial DCID is what its 0-RTT and Handshake packets are
-	// addressed to, so claiming it here is what lets the very first raw packet
-	// find this flow.
-	if dcid, _, ok := longHeaderConnectionIDs(payload); ok {
-		s.manager.claimCID(flow, dcid)
-	}
+	// The DCID the client picked for its own Initial is deliberately not
+	// claimed. Nothing on the raw path is ever addressed to it -- the raw path
+	// carries only 1-RTT packets, which are addressed to the ID the target
+	// chose -- so claiming it would add nothing but a value a stray datagram
+	// could match by accident.
 	if err = flow.writeTarget(payload); err != nil {
 		ackHybrid(send, id, hybridAckFailed, netip.AddrPort{})
 		return err
 	}
 	ackHybrid(send, id, hybridAckOK, flow.target)
 	return nil
+}
+
+// relay forwards one packet of an already-registered flow. The client sends
+// every long-header packet this way, and its first 1-RTT packets until the raw
+// path has answered, so a flow whose raw tuple never binds still completes over
+// the tunnel instead of stalling.
+//
+// A repeat of a packet the raw path also delivered is harmless: QUIC discards a
+// duplicate packet number, which is exactly what the overlap during the
+// handover produces.
+func (s *hybridSession) relay(data []byte, send func([]byte, xnet.Destination) error) error {
+	if len(data) < 22 {
+		return errors.New("invalid hybrid QUIC relay message")
+	}
+	var id [16]byte
+	copy(id[:], data[5:21])
+	payload := data[21:]
+
+	s.mu.Lock()
+	flow := s.flows[id]
+	if flow != nil {
+		// The link this arrived on is the live one; the flow may have been
+		// created on a link that is already gone.
+		flow.mu.Lock()
+		flow.send = send
+		flow.mu.Unlock()
+	}
+	s.mu.Unlock()
+	if flow == nil {
+		return errors.New("hybrid QUIC relay for an unregistered flow")
+	}
+
+	// The client's own connection IDs are claimed here as well as at
+	// registration: a Handshake packet is addressed to the ID the target chose,
+	// which is the one its later 1-RTT packets carry and the only way to match
+	// them on the raw path.
+	if dcid, _, ok := longHeaderConnectionIDs(payload); ok {
+		s.manager.claimCID(flow, dcid)
+	}
+	return flow.writeTarget(payload)
 }
 
 // parseHybridInitial decodes an op=1 registration. The target is either a
@@ -554,12 +633,19 @@ func (f *hybridFlow) readTarget() {
 			f.session.manager.claimCID(f, scid)
 		}
 
-		if !bound {
-			// Nothing has identified a raw tuple for this flow yet. Sending to
-			// a guessed one would be sending to a stranger, so the reply goes
-			// back the way the registration came. This is also what removes the
-			// need for the client to punch a hole first: the server never
-			// speaks on the raw path before the client has.
+		if !bound || !isShortHeader(buffer[:n]) {
+			// Two reasons to answer over the tunnel. Nothing may have
+			// identified a raw tuple for this flow yet, and sending to a
+			// guessed one would be sending to a stranger -- this is also what
+			// removes the need for the client to punch a hole first, since the
+			// server never speaks on the raw path before the client has.
+			//
+			// The other is that this is a long-header packet. The target's
+			// Initial and Handshake belong to the tunnel however far along the
+			// flow is: a raw path that carried them would show an observer a
+			// QUIC connection whose handshake is half missing, while one that
+			// only ever carries 1-RTT packets is shaped exactly like an
+			// ordinary connection migration.
 			f.mu.Lock()
 			send := f.send
 			f.mu.Unlock()
@@ -601,6 +687,11 @@ func (f *hybridFlow) close() {
 	for _, cid := range cids {
 		if m.byCID[cid] == f {
 			delete(m.byCID, cid)
+			if m.cidLengths[len(cid)] <= 1 {
+				delete(m.cidLengths, len(cid))
+			} else {
+				m.cidLengths[len(cid)]--
+			}
 		}
 	}
 	m.mu.Unlock()

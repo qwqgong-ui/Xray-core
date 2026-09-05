@@ -24,6 +24,16 @@ func longHeaderPacket(dcid, scid []byte, payload ...byte) []byte {
 	return append(packet, payload...)
 }
 
+// shortHeaderPacket builds a 1-RTT packet addressed to a connection ID. This is
+// the only shape the raw path carries.
+func shortHeaderPacket(dcid []byte, payload ...byte) []byte {
+	packet := append([]byte{0x40}, dcid...)
+	if len(payload) == 0 {
+		payload = []byte{0x2a}
+	}
+	return append(packet, payload...)
+}
+
 func listenLoopback(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
@@ -113,9 +123,9 @@ func TestHybridPacketConnRequiresExactRegistration(t *testing.T) {
 		_, _, _ = wrapper.ReadFrom(make([]byte, 1500))
 	}()
 
-	// A long-header packet naming a claimed connection ID is what binds the raw
+	// A 1-RTT packet naming a claimed connection ID is what binds the raw
 	// tuple; nothing was self-reported at registration time.
-	raw := longHeaderPacket(dcid, nil, 'h', 'i')
+	raw := shortHeaderPacket(dcid, 'h', 'i')
 	if _, err = client.WriteToUDP(raw, front.LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +183,7 @@ func TestHybridBindRejectsForeignAddress(t *testing.T) {
 	manager.claimCID(flow, string(dcid))
 
 	foreign := netip.MustParseAddrPort("[2001:db8::2]:40000")
-	if bound := manager.bind(foreign, longHeaderPacket(dcid, nil)); bound != nil {
+	if bound := manager.bind(foreign, shortHeaderPacket(dcid)); bound != nil {
 		t.Fatal("a connection id replayed from another address was accepted")
 	}
 	manager.mu.RLock()
@@ -184,9 +194,10 @@ func TestHybridBindRejectsForeignAddress(t *testing.T) {
 	}
 }
 
-// A short header does not encode its DCID length, so it cannot identify a flow
-// on its own. The first raw packet of a real flow is always long-header.
-func TestHybridBindIgnoresShortHeader(t *testing.T) {
+// Every long-header packet of a hybrid flow travels over the tunnel, so one
+// arriving on the raw path is not ours and must not bind a tuple -- otherwise a
+// handshake an observer can see would be enough to claim a flow.
+func TestHybridBindIgnoresLongHeader(t *testing.T) {
 	front := listenLoopback(t)
 	manager := newHybridManager(front)
 	defer manager.close()
@@ -197,10 +208,34 @@ func TestHybridBindIgnoresShortHeader(t *testing.T) {
 	dcid := []byte("connection-id-03")
 	manager.claimCID(flow, string(dcid))
 
-	shortHeader := append([]byte{0x40}, dcid...)
 	client := netip.AddrPortFrom(netip.IPv6Loopback(), 40001)
-	if bound := manager.bind(client, shortHeader); bound != nil {
-		t.Fatal("a short header bound a flow")
+	if bound := manager.bind(client, longHeaderPacket(dcid, nil)); bound != nil {
+		t.Fatal("a long header bound a flow")
+	}
+	if bound := manager.bind(client, shortHeaderPacket(dcid)); bound == nil {
+		t.Fatal("a 1-RTT packet naming the flow did not bind it")
+	}
+}
+
+// A 1-RTT packet is matched only against the connection ID lengths some flow
+// actually claimed, and a value that is not one of them matches nothing.
+func TestHybridShortHeaderMatchIsExact(t *testing.T) {
+	front := listenLoopback(t)
+	manager := newHybridManager(front)
+	defer manager.close()
+
+	target := listenLoopback(t)
+	session := newTestSession(manager, netip.IPv6Loopback())
+	flow := newBoundableFlow(t, session, target)
+	manager.claimCID(flow, "connection-id-04")
+
+	client := netip.AddrPortFrom(netip.IPv6Loopback(), 40002)
+	if bound := manager.bind(client, shortHeaderPacket([]byte("connection-id-XX"))); bound != nil {
+		t.Fatal("an unclaimed connection id bound a flow")
+	}
+	// The same bytes truncated to a length no flow uses must not match either.
+	if bound := manager.bind(client, shortHeaderPacket([]byte("connection-id"))); bound != nil {
+		t.Fatal("a prefix of a claimed connection id bound a flow")
 	}
 }
 

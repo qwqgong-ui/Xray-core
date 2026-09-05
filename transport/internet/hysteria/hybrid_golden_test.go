@@ -29,7 +29,7 @@ func TestHybridWireFormatGoldens(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			encoded, err := os.ReadFile(filepath.Join("testdata", "hqv2_"+test.name+".hex"))
+			encoded, err := os.ReadFile(filepath.Join("testdata", "hqv3_"+test.name+".hex"))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -69,5 +69,34 @@ func TestHybridWireFormatGoldens(t *testing.T) {
 				t.Fatalf("address = %v, want %q", destination.Address, test.wantIP)
 			}
 		})
+	}
+}
+
+// The relay op carries a packet of an already-registered flow. Its header is
+// fixed at magic, op and flow id, so a client that shifts it would send packets
+// this server silently mistakes for something else.
+func TestHybridRelayGolden(t *testing.T) {
+	encoded, err := os.ReadFile(filepath.Join("testdata", "hqv3_relay.hex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := hex.DecodeString(string(bytes.TrimSpace(encoded)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(message) < 22 || string(message[:4]) != hybridMagic || message[4] != hybridOpRelay {
+		t.Fatalf("the client's own relay message did not parse: %x", message)
+	}
+	var wantID [16]byte
+	copy(wantID[:], "0123456789abcdef")
+	if got := [16]byte(message[5:21]); got != wantID {
+		t.Fatalf("flow id = %x, want %x", got, wantID)
+	}
+	wantPayload := []byte{0x42, 0xaa, 0xbb, 0xcc, 0xdd, 0x00}
+	if !bytes.Equal(message[21:], wantPayload) {
+		t.Fatalf("payload = %x, want %x", message[21:], wantPayload)
+	}
+	if !isShortHeader(message[21:]) {
+		t.Fatal("the relay golden should carry a 1-RTT packet")
 	}
 }

@@ -101,8 +101,9 @@ func TestHybridRepliesMoveFromTunnelToRawOnBind(t *testing.T) {
 	go func() { _, _, _ = wrapper.ReadFrom(make([]byte, 2048)) }()
 
 	// Now the client speaks on the raw path, naming a claimed connection ID.
+	// Only a 1-RTT packet can do this: the handshake stays on the tunnel.
 	client := listenLoopback(t)
-	raw := longHeaderPacket(dcid, nil, 'r', 'a', 'w')
+	raw := shortHeaderPacket(dcid, 'r', 'a', 'w')
 	if _, err := client.WriteToUDP(raw, front.LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatal(err)
 	}
@@ -136,5 +137,23 @@ func TestHybridRepliesMoveFromTunnelToRawOnBind(t *testing.T) {
 	}
 	if tunnel.count() != before {
 		t.Fatal("a reply still went over the tunnel after the raw tuple was bound")
+	}
+
+	// A long-header reply goes back over the tunnel however far along the flow
+	// is. This is what keeps the raw path free of handshake packets: a tuple
+	// that answers with an Initial it was never asked for by one has no benign
+	// counterpart, while a tuple carrying only 1-RTT packets is shaped like an
+	// ordinary connection migration.
+	late := longHeaderPacket(nil, scid, 'l', 'a', 't', 'e')
+	if _, err = target.WriteToUDP(late, peer); err != nil {
+		t.Fatal(err)
+	}
+	replies = tunnel.await(t, before+1)
+	if !bytes.Equal(replies[len(replies)-1].payload, late) {
+		t.Fatalf("tunnel reply = %q, want %q", replies[len(replies)-1].payload, late)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, readErr := client.ReadFromUDP(buffer); readErr == nil {
+		t.Fatalf("a long-header reply took the raw path: %q", buffer[:n])
 	}
 }
