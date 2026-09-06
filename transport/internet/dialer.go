@@ -108,6 +108,23 @@ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) 
 	return ips, err
 }
 
+// QueryRecordDNS answers one record query with the instance's own DNS stack.
+// It exists so a component that must answer a DNS question on a client's
+// behalf, rather than merely dial, reuses the configured resolver instead of
+// embedding one -- and gets records back rather than wire bytes. It reports
+// dns.ErrRecordQueryUnsupported when the configured DNS only resolves
+// addresses.
+func QueryRecordDNS(ctx context.Context, domain string, qtype uint16) (*dns.RecordResponse, error) {
+	if dnsClient == nil {
+		return nil, errors.New("DNS client not initialized").AtError()
+	}
+	client, ok := dnsClient.(dns.RecordClient)
+	if !ok {
+		return nil, dns.ErrRecordQueryUnsupported
+	}
+	return client.QueryRecord(ctx, domain, qtype)
+}
+
 func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) net.Conn {
 	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
 	outbounds := session.OutboundsFromContext(ctx)

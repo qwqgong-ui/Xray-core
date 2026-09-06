@@ -282,6 +282,14 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 		ctx = session.ContextWithContent(ctx, content)
 	}
 
+	if isTunnelDNSDestination(destination) {
+		// Answered by this instance's own DNS, never routed anywhere. It is
+		// only a destination, so every inbound protocol can carry it.
+		inbound, outbound := d.getLink(ctx)
+		go serveTunnelDNS(ctx, outbound, destination.Network)
+		return inbound, nil
+	}
+
 	sniffingRequest := content.SniffingRequest
 	inbound, outbound := d.getLink(ctx)
 	if !sniffingRequest.Enabled {
@@ -339,6 +347,16 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		ctx = session.ContextWithContent(ctx, content)
 	}
 	outbound = WrapLink(ctx, d.policy, d.stats, outbound)
+
+	if isTunnelDNSDestination(destination) {
+		// The same check has to live at both entry points: VLESS, SOCKS, HTTP
+		// CONNECT, Hysteria, dokodemo, tun and wireguard all arrive here rather
+		// than at Dispatch. Unlike Dispatch, this one does not return until the
+		// link is finished, so it runs inline.
+		serveTunnelDNS(ctx, outbound, destination.Network)
+		return nil
+	}
+
 	sniffingRequest := content.SniffingRequest
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination)

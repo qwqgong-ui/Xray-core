@@ -26,6 +26,9 @@ type ClassicNameServer struct {
 	address         *net.Destination
 	requests        map[uint16]*udpDnsRequest
 	udpServer       *udp.Dispatcher
+	// dispatcher is kept so a record query can reach the same name server over
+	// TCP, which is the only transport that can carry one whole.
+	dispatcher      routing.Dispatcher
 	requestsCleanup *task.Periodic
 	reqID           uint32
 	clientIP        net.IP
@@ -47,6 +50,7 @@ func NewClassicNameServer(address net.Destination, dispatcher routing.Dispatcher
 		cacheController: NewCacheController(strings.ToUpper(address.String()), disableCache, serveStale, serveExpiredTTL),
 		address:         &address,
 		requests:        make(map[uint16]*udpDnsRequest),
+		dispatcher:      dispatcher,
 		clientIP:        clientIP,
 	}
 	s.requestsCleanup = &task.Periodic{
