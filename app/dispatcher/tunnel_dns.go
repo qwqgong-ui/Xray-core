@@ -36,12 +36,16 @@ const (
 
 // tunnelDNSTypes are the question types answered here.
 //
-// Address types are answered because a hybrid Hysteria2 relay needs the
-// address this very server would dial, which no other resolver can supply.
-// Service bindings are answered because they carry ech keys and alpn, which
-// an address lookup cannot express, so a client has no other way to obtain
-// this server's view of them. Everything else is refused: this is a fixed,
-// small surface, not a general-purpose resolver.
+// Service bindings are the reason this exists: they carry ech keys and alpn,
+// which an address lookup cannot express, so a client has no other way to
+// obtain this server's view of them through the tunnel. Address types are
+// answered too, for a client that wants the address this very server would
+// dial rather than the one its own resolver returns -- proxy protocols resolve
+// addresses remotely already, so this adds no reach they did not have.
+//
+// Everything else is refused. The surface is a fixed, small list on purpose:
+// answering whatever was asked would make this a general-purpose resolver for
+// anyone who can reach an inbound.
 var tunnelDNSTypes = map[uint16]bool{
 	mdns.TypeA:     true,
 	mdns.TypeAAAA:  true,
