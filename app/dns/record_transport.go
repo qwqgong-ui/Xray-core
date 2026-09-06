@@ -45,21 +45,12 @@ func (s *QUICNameServer) QueryRecord(ctx context.Context, domain string, qtype u
 		}
 		defer stream.Close()
 
-		// RFC 9250 requires a zero message id on the wire. The id is ours to
-		// choose here, so send zero and put it back on the way out instead of
-		// hoping the server echoes something it was told not to.
-		id := binary.BigEndian.Uint16(query[:2])
-		onWire := append([]byte(nil), query...)
-		binary.BigEndian.PutUint16(onWire[:2], 0)
-
+		onWire, id := zeroQUICMessageID(query)
 		response, err := exchangeOverStream(stream, onWire)
 		if err != nil {
 			return nil, err
 		}
-		if len(response) >= 2 {
-			binary.BigEndian.PutUint16(response[:2], id)
-		}
-		return response, nil
+		return restoreQUICMessageID(response, id), nil
 	}, domain, qtype)
 }
 
@@ -86,6 +77,29 @@ func (s *ClassicNameServer) QueryRecord(ctx context.Context, domain string, qtyp
 		defer conn.Close()
 		return exchangeOverStream(conn, query)
 	}, domain, qtype)
+}
+
+// zeroQUICMessageID returns the query as RFC 9250 requires it on the wire --
+// message id zero -- along with the id that was there. The id is ours to
+// choose, so it is sent as zero rather than sent as something the server was
+// told not to echo and then hoped for.
+func zeroQUICMessageID(query []byte) (onWire []byte, id uint16) {
+	onWire = append([]byte(nil), query...)
+	if len(onWire) < 2 {
+		return onWire, 0
+	}
+	id = binary.BigEndian.Uint16(onWire[:2])
+	binary.BigEndian.PutUint16(onWire[:2], 0)
+	return onWire, id
+}
+
+// restoreQUICMessageID puts the caller's id back on a response that came over
+// DoQ, so it can be matched like any other DNS answer.
+func restoreQUICMessageID(response []byte, id uint16) []byte {
+	if len(response) >= 2 {
+		binary.BigEndian.PutUint16(response[:2], id)
+	}
+	return response
 }
 
 // exchangeOverStream speaks length-prefixed DNS (RFC 1035 4.2.2), shared by

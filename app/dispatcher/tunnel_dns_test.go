@@ -237,3 +237,104 @@ var errTimeout = &timeoutError{}
 type timeoutError struct{}
 
 func (*timeoutError) Error() string { return "timed out waiting for a reply" }
+
+// framedQuery wraps a query the way a stream client sends it.
+func framedQuery(t *testing.T, name string, qtype uint16) []byte {
+	t.Helper()
+	message := query(t, name, qtype)
+	out := make([]byte, 2+len(message))
+	binary.BigEndian.PutUint16(out[:2], uint16(len(message)))
+	copy(out[2:], message)
+	return out
+}
+
+func writeBytes(t *testing.T, writer buf.Writer, payload []byte) {
+	t.Helper()
+	b := buf.New()
+	if _, err := b.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if err := writer.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+}
+
+// The reserved destination has to be recognised at BOTH dispatcher entry
+// points. VMess, Trojan and Shadowsocks arrive at Dispatch; VLESS, SOCKS, HTTP
+// CONNECT, Hysteria, dokodemo, tun and wireguard arrive at DispatchLink. A
+// check in only one of them leaves the whole feature dead on the other set --
+// which includes the most widely used inbound there is.
+//
+// Neither path touches the policy or stats managers for a session with no
+// user, so a bare dispatcher is enough to drive them.
+func TestDispatchAnswersTheReservedDestination(t *testing.T) {
+	d := &DefaultDispatcher{}
+
+	link, err := d.Dispatch(t.Context(), reserved(net.Network_TCP))
+	if err != nil {
+		t.Fatalf("dispatch: %v", err)
+	}
+	writeBytes(t, link.Writer, framedQuery(t, "example.com", mdns.TypeHTTPS))
+
+	if _, err := readReply(link.Reader, true); err != nil {
+		t.Fatalf("Dispatch did not answer the reserved destination: %v", err)
+	}
+}
+
+func TestDispatchLinkAnswersTheReservedDestination(t *testing.T) {
+	d := &DefaultDispatcher{}
+
+	uplinkReader, uplinkWriter := pipe.New()
+	downlinkReader, downlinkWriter := pipe.New()
+	writeBytes(t, uplinkWriter, framedQuery(t, "example.com", mdns.TypeHTTPS))
+
+	done := make(chan error, 1)
+	go func() {
+		done <- d.DispatchLink(t.Context(), reserved(net.Network_TCP),
+			&transport.Link{Reader: uplinkReader, Writer: downlinkWriter})
+	}()
+
+	if _, err := readReply(downlinkReader, true); err != nil {
+		t.Fatalf("DispatchLink did not answer the reserved destination: %v", err)
+	}
+
+	// DispatchLink does not return until the link is finished.
+	_ = uplinkWriter.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("DispatchLink: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("DispatchLink never returned")
+	}
+}
+
+// A message this cannot reply to at all closes the connection. The client is
+// meant to fall back to a resolver of its own and can only do that once its
+// read fails; holding the connection open with no reply would make it wait out
+// its whole DNS timeout for an answer that is never coming.
+func TestServeTunnelDNSClosesWhenItCannotReply(t *testing.T) {
+	uplinkReader, uplinkWriter := pipe.New()
+	downlinkReader, downlinkWriter := pipe.New()
+
+	// Two bytes framed as a DNS message: too short to parse, so there is not
+	// even a message id to answer with.
+	writeBytes(t, uplinkWriter, []byte{0x00, 0x02, 0x00, 0x01})
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		serveTunnelDNS(t.Context(), &transport.Link{Reader: uplinkReader, Writer: downlinkWriter}, net.Network_TCP)
+	}()
+
+	select {
+	case <-served:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler held the connection open on a query it could not reply to")
+	}
+
+	if _, err := readReply(downlinkReader, true); err == nil {
+		t.Fatal("the client's read must fail so it falls back immediately")
+	}
+}
