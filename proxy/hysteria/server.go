@@ -2,6 +2,8 @@ package hysteria
 
 import (
 	"context"
+	"io"
+	"sync"
 	"time"
 
 	"github.com/xtls/xray-core/common"
@@ -116,29 +118,25 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		b.UDP = addr
 
 		if hybrid, ok := iConn.(interface {
-			HandleHybridQUIC(string, []byte, func([]byte, net.Destination) error) (bool, error)
+			HandleHybridQUIC(string, []byte, func([]byte, net.Destination) error, func(net.Destination) (hysteria.HybridTargetLink, error)) (bool, error)
 		}); ok {
-			// The relay answers over this same UDP link: registration results,
-			// and the target's replies until a raw tuple has identified itself.
-			// UDPWriter takes the source address from each buffer, so a reply
-			// reaches the client attributed to the target it came from, exactly
-			// as an ordinary Hysteria UDP session would deliver it.
-			controlWriter := &UDPWriter{writer: conn, addr: addr.NetAddr()}
-			send := func(payload []byte, from net.Destination) error {
-				pb := buf.New()
-				if _, writeErr := pb.Write(payload); writeErr != nil {
-					pb.Release()
-					return writeErr
-				}
-				source := from
-				pb.UDP = &source
-				return controlWriter.WriteMultiBuffer(buf.MultiBuffer{pb})
+			send := newHybridControlSender(conn, addr.NetAddr())
+			// A hybrid flow reaches its target through the dispatcher, like
+			// every other UDP session this inbound serves, so routing rules,
+			// outbound selection, per-user accounting and access logs all see
+			// it. The context is detached from this link's lifetime because a
+			// flow outlives the link it was registered on: the client
+			// re-registers on whichever link is live, and the flow is closed
+			// through its own cancel.
+			flowCtx := context.WithoutCancel(ctx)
+			dial := func(destination net.Destination) (hysteria.HybridTargetLink, error) {
+				return newDispatchedTarget(flowCtx, dispatcher, destination)
 			}
-			handled, handleErr := hybrid.HandleHybridQUIC(addr.NetAddr(), b.Bytes(), send)
+			handled, handleErr := hybrid.HandleHybridQUIC(addr.NetAddr(), b.Bytes(), send, dial)
 			if handled {
 				b.Release()
 				if handleErr != nil {
-					return handleErr
+					errors.LogDebugInner(ctx, handleErr, "hybrid QUIC control message failed")
 				}
 				// UDPReader reassembles HY2 fragments before copying into this
 				// buffer. Hybrid control messages contain the original QUIC
@@ -151,12 +149,16 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 					if readErr != nil {
 						return readErr
 					}
-					handled, handleErr = hybrid.HandleHybridQUIC(nextAddr.NetAddr(), control[:n], send)
+					handled, handleErr = hybrid.HandleHybridQUIC(nextAddr.NetAddr(), control[:n], send, dial)
 					if !handled {
 						return errors.New("hybrid QUIC control session changed destination")
 					}
 					if handleErr != nil {
-						return handleErr
+						// One flow's failure is not this link's. Every other
+						// flow is still relaying over it, and a message for a
+						// flow the idle sweep just reclaimed is an ordinary
+						// event rather than a reason to tear the link down.
+						errors.LogDebugInner(ctx, handleErr, "hybrid QUIC control message failed")
 					}
 				}
 			}
@@ -222,4 +224,101 @@ func init() {
 	common.Must(common.RegisterConfig((*ServerConfig)(nil), func(ctx context.Context, config interface{}) (interface{}, error) {
 		return NewServer(ctx, config.(*ServerConfig))
 	}))
+}
+
+// newHybridControlSender returns the function a hybrid session answers over:
+// registration results, and the target's replies until a raw tuple has
+// identified itself. UDPWriter takes the source address from each buffer, so a
+// reply reaches the client attributed to the target it came from, exactly as an
+// ordinary Hysteria UDP session would deliver it.
+//
+// One sender serves the control loop and every flow's reader goroutine at once,
+// while UDPWriter serializes each message through a single buffer of its own.
+// The lock is what keeps two replies from overwriting each other halfway out.
+func newHybridControlSender(writer io.Writer, addr string) func([]byte, net.Destination) error {
+	udpWriter := &UDPWriter{writer: writer, addr: addr}
+	var mutex sync.Mutex
+	return func(payload []byte, from net.Destination) error {
+		pb := buf.New()
+		if _, err := pb.Write(payload); err != nil {
+			pb.Release()
+			return err
+		}
+		source := from
+		pb.UDP = &source
+		mutex.Lock()
+		defer mutex.Unlock()
+		return udpWriter.WriteMultiBuffer(buf.MultiBuffer{pb})
+	}
+}
+
+// dispatchedTarget is one hybrid flow's target side, carried through Xray's
+// dispatcher so it is routed, logged and accounted like any other UDP session.
+type dispatchedTarget struct {
+	link   *transport.Link
+	cancel context.CancelFunc
+
+	mutex  sync.Mutex
+	closed bool
+
+	// queue holds what one read off the link returned but the flow has not
+	// taken yet. It is touched only by ReadPacket, which the flow calls from a
+	// single goroutine.
+	queue buf.MultiBuffer
+}
+
+func newDispatchedTarget(ctx context.Context, dispatcher routing.Dispatcher, destination net.Destination) (hysteria.HybridTargetLink, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	link, err := dispatcher.Dispatch(ctx, destination)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	return &dispatchedTarget{link: link, cancel: cancel}, nil
+}
+
+func (d *dispatchedTarget) WritePacket(payload []byte) error {
+	pb := buf.New()
+	if _, err := pb.Write(payload); err != nil {
+		pb.Release()
+		return err
+	}
+	d.mutex.Lock()
+	defer d.mutex.Unlock()
+	if d.closed {
+		pb.Release()
+		return io.ErrClosedPipe
+	}
+	return d.link.Writer.WriteMultiBuffer(buf.MultiBuffer{pb})
+}
+
+func (d *dispatchedTarget) ReadPacket() ([]byte, error) {
+	for len(d.queue) == 0 {
+		mb, err := d.link.Reader.ReadMultiBuffer()
+		if err != nil {
+			return nil, err
+		}
+		d.queue = mb
+	}
+	pb := d.queue[0]
+	d.queue = d.queue[1:]
+	payload := append([]byte(nil), pb.Bytes()...)
+	pb.Release()
+	return payload, nil
+}
+
+func (d *dispatchedTarget) Close() error {
+	d.mutex.Lock()
+	if d.closed {
+		d.mutex.Unlock()
+		return nil
+	}
+	d.closed = true
+	d.mutex.Unlock()
+	// Interrupting the reader is what unblocks the flow's reader goroutine; it
+	// owns the queue, so releasing that here would race with it.
+	common.Interrupt(d.link.Reader)
+	common.Close(d.link.Writer)
+	d.cancel()
+	return nil
 }

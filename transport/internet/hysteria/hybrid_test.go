@@ -34,9 +34,19 @@ func shortHeaderPacket(dcid []byte, payload ...byte) []byte {
 	return append(packet, payload...)
 }
 
+// The loopback these tests run on is IPv6 where the host has it and IPv4
+// otherwise, so a machine without IPv6 runs them rather than failing at listen.
+var loopbackNetwork, loopbackHost = func() (string, netip.Addr) {
+	if conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback}); err == nil {
+		_ = conn.Close()
+		return "udp6", netip.IPv6Loopback()
+	}
+	return "udp4", netip.AddrFrom4([4]byte{127, 0, 0, 1})
+}()
+
 func listenLoopback(t *testing.T) *net.UDPConn {
 	t.Helper()
-	conn, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	conn, err := net.ListenUDP(loopbackNetwork, &net.UDPAddr{IP: net.IP(loopbackHost.AsSlice())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -50,7 +60,7 @@ func listenLoopback(t *testing.T) *net.UDPConn {
 func newBoundableFlow(t *testing.T, session *hybridSession, target *net.UDPConn) *hybridFlow {
 	t.Helper()
 	targetAddr := target.LocalAddr().(*net.UDPAddr)
-	conn, err := net.DialUDP("udp6", nil, targetAddr)
+	conn, err := net.DialUDP(loopbackNetwork, nil, targetAddr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +70,8 @@ func newBoundableFlow(t *testing.T, session *hybridSession, target *net.UDPConn)
 		session:  session,
 		id:       id,
 		target:   targetAddr.AddrPort(),
-		conn:     conn,
+		link:     newHybridUDPLink(conn),
+		ready:    true,
 		lastSeen: time.Now(),
 	}
 	session.mu.Lock()
@@ -111,7 +122,7 @@ func TestHybridPacketConnRequiresExactRegistration(t *testing.T) {
 		}
 	}()
 
-	session := newTestSession(manager, netip.IPv6Loopback())
+	session := newTestSession(manager, loopbackHost)
 	flow := newBoundableFlow(t, session, target)
 	dcid := []byte("connection-id-01")
 	manager.claimCID(flow, string(dcid))
@@ -183,7 +194,7 @@ func TestHybridBindRejectsForeignAddress(t *testing.T) {
 	manager.claimCID(flow, string(dcid))
 
 	foreign := netip.MustParseAddrPort("[2001:db8::2]:40000")
-	if bound := manager.bind(foreign, shortHeaderPacket(dcid)); bound != nil {
+	if bound, _ := manager.classify(foreign, shortHeaderPacket(dcid)); bound != nil {
 		t.Fatal("a connection id replayed from another address was accepted")
 	}
 	manager.mu.RLock()
@@ -203,16 +214,16 @@ func TestHybridBindIgnoresLongHeader(t *testing.T) {
 	defer manager.close()
 
 	target := listenLoopback(t)
-	session := newTestSession(manager, netip.IPv6Loopback())
+	session := newTestSession(manager, loopbackHost)
 	flow := newBoundableFlow(t, session, target)
 	dcid := []byte("connection-id-03")
 	manager.claimCID(flow, string(dcid))
 
-	client := netip.AddrPortFrom(netip.IPv6Loopback(), 40001)
-	if bound := manager.bind(client, longHeaderPacket(dcid, nil)); bound != nil {
+	client := netip.AddrPortFrom(loopbackHost, 40001)
+	if bound, _ := manager.classify(client, longHeaderPacket(dcid, nil)); bound != nil {
 		t.Fatal("a long header bound a flow")
 	}
-	if bound := manager.bind(client, shortHeaderPacket(dcid)); bound == nil {
+	if bound, _ := manager.classify(client, shortHeaderPacket(dcid)); bound == nil {
 		t.Fatal("a 1-RTT packet naming the flow did not bind it")
 	}
 }
@@ -225,16 +236,16 @@ func TestHybridShortHeaderMatchIsExact(t *testing.T) {
 	defer manager.close()
 
 	target := listenLoopback(t)
-	session := newTestSession(manager, netip.IPv6Loopback())
+	session := newTestSession(manager, loopbackHost)
 	flow := newBoundableFlow(t, session, target)
 	manager.claimCID(flow, "connection-id-04")
 
-	client := netip.AddrPortFrom(netip.IPv6Loopback(), 40002)
-	if bound := manager.bind(client, shortHeaderPacket([]byte("connection-id-XX"))); bound != nil {
+	client := netip.AddrPortFrom(loopbackHost, 40002)
+	if bound, _ := manager.classify(client, shortHeaderPacket([]byte("connection-id-XX"))); bound != nil {
 		t.Fatal("an unclaimed connection id bound a flow")
 	}
 	// The same bytes truncated to a length no flow uses must not match either.
-	if bound := manager.bind(client, shortHeaderPacket([]byte("connection-id"))); bound != nil {
+	if bound, _ := manager.classify(client, shortHeaderPacket([]byte("connection-id"))); bound != nil {
 		t.Fatal("a prefix of a claimed connection id bound a flow")
 	}
 }
@@ -249,7 +260,7 @@ func TestHybridControlRejectsUnsafeTargets(t *testing.T) {
 	message = append(message, netip.IPv6Loopback().AsSlice()...)
 	message = append(message, 1, 187) // 443
 	message = append(message, 0x2a)
-	if err := session.handle(message, nil); err == nil {
+	if err := session.handle(message, nil, nil); err == nil {
 		t.Fatal("loopback target was accepted")
 	}
 }

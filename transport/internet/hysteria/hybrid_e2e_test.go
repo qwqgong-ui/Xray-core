@@ -3,7 +3,6 @@ package hysteria
 import (
 	"bytes"
 	"net"
-	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -63,7 +62,7 @@ func TestHybridRepliesMoveFromTunnelToRawOnBind(t *testing.T) {
 
 	target := listenLoopback(t)
 	tunnel := &recordingTunnel{}
-	session := newTestSession(manager, netip.IPv6Loopback())
+	session := newTestSession(manager, loopbackHost)
 	flow := newBoundableFlow(t, session, target)
 	// The sender belongs to the flow: one tunnel carries many UDP links, and a
 	// flow answers on the one its registration arrived over.
@@ -76,7 +75,7 @@ func TestHybridRepliesMoveFromTunnelToRawOnBind(t *testing.T) {
 	// nowhere raw to go and must ride the tunnel, attributed to the target.
 	scid := []byte("server-chosen-cid")
 	early := longHeaderPacket(nil, scid, 'e', 'a', 'r', 'l', 'y')
-	if _, err := target.WriteToUDP(early, flow.conn.LocalAddr().(*net.UDPAddr)); err != nil {
+	if _, err := target.WriteToUDP(early, flow.link.(*hybridUDPLink).LocalAddr().(*net.UDPAddr)); err != nil {
 		t.Fatal(err)
 	}
 	replies := tunnel.await(t, 1)

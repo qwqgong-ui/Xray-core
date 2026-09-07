@@ -33,14 +33,72 @@ const (
 	hybridAckOK     = byte(0)
 	hybridAckFailed = byte(1)
 
-	hybridFlowTTL = 2 * time.Minute
+	// A flow that is still on the tunnel is cheap to lose: the client notices
+	// its registration went stale and makes a new one. A bound flow is not --
+	// it is carrying a live connection on the raw path, and reclaiming it
+	// black-holes that connection until QUIC gives up -- so it is held far
+	// longer than an application's idle gap between requests.
+	hybridFlowTTL      = 2 * time.Minute
+	hybridBoundFlowTTL = 30 * time.Minute
 
 	// hybridMaxFlowCIDs bounds the connection IDs one flow may claim. A flow
 	// needs one in the normal case (the SCID the target chose, which its 1-RTT
 	// packets are addressed to); the rest of the budget absorbs Retry and early
 	// rotation.
 	hybridMaxFlowCIDs = 8
+
+	// hybridMaxSessionFlows bounds the flows one authenticated session may hold
+	// open at a time. Each costs a socket and a goroutine, and a client with a
+	// browser's worth of QUIC connections needs a fraction of this.
+	hybridMaxSessionFlows = 64
+
+	// hybridMaxPendingBytes bounds what one flow buffers while its target is
+	// being resolved and dialled. Overflow is dropped rather than queued: these
+	// are QUIC packets, and QUIC retransmits.
+	hybridMaxPendingBytes = 64 * 1024
+
+	// hybridHandshakeTTL is how long an unknown tuple that sent an Initial may
+	// keep talking to the QUIC stack without having completed anything.
+	hybridHandshakeTTL = 10 * time.Second
+	// hybridMigrationTTL is how long a tuple stays authorized after a packet of
+	// an authenticated connection arrived from it. It is renewed on use, so a
+	// migrated connection keeps working for as long as it is live.
+	hybridMigrationTTL = 60 * time.Second
+	// hybridMaxPassing bounds the authorization table. Entries are cheap and
+	// short-lived, but a flood of spoofed-source Initials must not be able to
+	// grow it without limit.
+	hybridMaxPassing = 65536
+
+	// hybridMaxHY2CIDs bounds the connection IDs remembered for this server's
+	// own QUIC connections.
+	hybridMaxHY2CIDs = 65536
+	// hybridHY2CIDGrace is how long those connection IDs outlive the connection
+	// they belong to. A live connection keeps its own; this only reclaims the
+	// ones left by a handshake that never completed.
+	hybridHY2CIDGrace = 2 * time.Minute
 )
+
+// HybridTargetLink is one hybrid flow's connection to its target. The proxy
+// layer supplies an implementation backed by Xray's dispatcher, so a hybrid
+// flow is routed, logged and accounted exactly like an ordinary Hysteria UDP
+// session; the raw path changes how the client's packets arrive, not what the
+// server is allowed to do with them.
+type HybridTargetLink interface {
+	// WritePacket sends one datagram to the target. It may be called from
+	// several goroutines at once: the control loop and the raw receive path
+	// both feed the same flow.
+	WritePacket(payload []byte) error
+	// ReadPacket returns the next datagram from the target. It is called from
+	// the flow's single reader goroutine, and the slice it returns stays valid
+	// only until the next call.
+	ReadPacket() ([]byte, error)
+	Close() error
+}
+
+// HybridDialer opens the target side of a flow. It is an alias rather than a
+// defined type so the proxy layer can satisfy the method set structurally,
+// without importing anything from this package.
+type HybridDialer = func(destination xnet.Destination) (HybridTargetLink, error)
 
 // hybridManager owns the raw half of authenticated hybrid QUIC flows. Until an
 // authenticated Hysteria session registers an exact IPv6 address and UDP port,
@@ -61,14 +119,36 @@ type hybridManager struct {
 	// way and simply never binds: its flow stays on the tunnel for its whole
 	// life, which is slower but correct.
 	byCID map[string]*hybridFlow
-	// cidLengths counts the claimed connection IDs of each length. A 1-RTT
-	// packet does not encode its DCID length, so a raw packet from an unknown
-	// tuple can only be matched by trying the lengths this server has actually
-	// seen -- in practice one or two.
-	cidLengths  map[int]int
-	candidates  map[netip.AddrPort]time.Time
+	// hy2CIDs holds the connection IDs this server's own QUIC stack handed out,
+	// read off the long-header packets it writes. A 1-RTT packet from a tuple
+	// nobody knows is what an ordinary NAT rebinding looks like, and matching
+	// its destination ID here is the only way to tell that apart from a stray
+	// datagram without keys. quic-go validates the new path itself, so the
+	// packet only has to be allowed to reach it.
+	hy2CIDs map[string]hybridHY2CID
+	// cidLengths counts the claimed connection IDs of each length, across both
+	// tables. A 1-RTT packet does not encode its DCID length, so a raw packet
+	// from an unknown tuple can only be matched by trying the lengths this
+	// server has actually seen -- in practice one or two.
+	cidLengths map[int]int
+	// passing authorizes tuples that have shown they belong to a QUIC
+	// connection this server is willing to talk to, without one entry per
+	// packet of bookkeeping.
+	passing     map[netip.AddrPort]hybridPass
 	passUnknown bool
 	closed      chan struct{}
+}
+
+// hybridPass is one tuple's authorization to reach the QUIC stack: the short
+// window an unknown Initial buys, or the renewed one a connection that proved
+// itself by connection ID keeps.
+type hybridPass struct {
+	expiry time.Time
+}
+
+type hybridHY2CID struct {
+	host netip.AddrPort
+	seen time.Time
 }
 
 type hybridSession struct {
@@ -82,10 +162,19 @@ type hybridSession struct {
 type hybridFlow struct {
 	session *hybridSession
 	id      [16]byte
-	target  netip.AddrPort
-	conn    *net.UDPConn
+	// request is the destination as the client asked for it, kept so a repeat
+	// of the same id can be told from a new flow reusing it.
+	request string
 
 	mu sync.Mutex
+	// target and link are filled once the destination has been resolved and
+	// dialled, which happens off the control loop. Until then the flow buffers.
+	target   netip.AddrPort
+	link     HybridTargetLink
+	ready    bool
+	acked    bool
+	pending  [][]byte
+	pendingN int
 	// client is the raw tuple as this server observed it, zero until a raw
 	// packet has been matched to this flow by connection ID. Until then the
 	// target's replies go back through the tunnel, which is also what keeps the
@@ -115,8 +204,9 @@ func newHybridManager(conn net.PacketConn) *hybridManager {
 		sessions:   make(map[*hybridSession]struct{}),
 		hy2:        make(map[netip.AddrPort]int),
 		byCID:      make(map[string]*hybridFlow),
+		hy2CIDs:    make(map[string]hybridHY2CID),
 		cidLengths: make(map[int]int),
-		candidates: make(map[netip.AddrPort]time.Time),
+		passing:    make(map[netip.AddrPort]hybridPass),
 		closed:     make(chan struct{}),
 	}
 	go m.clean()
@@ -137,14 +227,16 @@ func (c *hybridPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 		if !ok {
 			return n, source, nil
 		}
-		c.manager.mu.RLock()
-		flow := c.manager.flows[client]
-		c.manager.mu.RUnlock()
-		if flow == nil {
-			flow = c.manager.bind(client, p[:n])
+		// The common case -- a packet of an established flow, or of a QUIC
+		// connection already known to belong here -- is answered under a read
+		// lock. Only a packet neither table recognizes reaches classify, which
+		// is the one place on this path that takes the write lock per packet.
+		flow, pass, decided := c.manager.lookup(client, p[:n])
+		if !decided {
+			flow, pass = c.manager.classify(client, p[:n])
 		}
 		if flow == nil {
-			if c.manager.allowQUIC(client, p[:n]) {
+			if pass {
 				return n, source, nil
 			}
 			// Unknown non-Initial traffic is dropped before quic-go. It never
@@ -157,6 +249,170 @@ func (c *hybridPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	}
 }
 
+// WriteTo watches what this server's own QUIC stack sends so a connection can
+// still be recognized after its tuple changes. Only long-header packets carry a
+// connection ID in the clear, and they are a handful per connection, so the
+// check costs a comparison on everything else.
+func (c *hybridPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	if len(p) > 0 && p[0]&0xc0 == 0xc0 {
+		c.manager.observeHY2(p, addr)
+	}
+	return c.PacketConn.WriteTo(p, addr)
+}
+
+// lookup answers under a read lock for a packet whose tuple or connection ID is
+// already known. It reports the flow the packet belongs to, whether it may go on
+// to quic-go, and whether it decided at all.
+func (m *hybridManager) lookup(client netip.AddrPort, packet []byte) (*hybridFlow, bool, bool) {
+	now := time.Now()
+	m.mu.RLock()
+	if flow := m.flows[client]; flow != nil {
+		m.mu.RUnlock()
+		return flow, false, true
+	}
+	if m.passUnknown || m.hy2[client] > 0 {
+		m.mu.RUnlock()
+		return nil, true, true
+	}
+	// A 1-RTT packet naming a registered flow claims the tuple ahead of any
+	// authorization window, so the match comes before passing is honoured. It
+	// costs a lookup or two, and only a match goes on to take the write lock.
+	migrated := false
+	if isShortHeader(packet) {
+		flow, hy2 := m.matchShortHeaderLocked(packet)
+		if flow != nil {
+			m.mu.RUnlock()
+			return nil, false, false
+		}
+		migrated = hy2
+	}
+	entry, authorized := m.passing[client]
+	m.mu.RUnlock()
+
+	if migrated {
+		// An authenticated connection whose tuple changed. Authorizing the
+		// tuple as well as the connection ID is what keeps it working once
+		// quic-go rotates to an ID issued under encryption, which this side
+		// never sees. Renewing only once the window is half spent keeps the
+		// write lock off the hot path.
+		if !authorized || entry.expiry.Sub(now) < hybridMigrationTTL/2 {
+			m.mu.Lock()
+			m.allowLocked(client, now, hybridMigrationTTL)
+			m.mu.Unlock()
+		}
+		return nil, true, true
+	}
+	if authorized && entry.expiry.After(now) {
+		return nil, true, true
+	}
+	return nil, false, false
+}
+
+// classify decides what to do with a packet from a tuple lookup did not know.
+// It reports the flow the packet belongs to, or whether it may continue to
+// quic-go.
+func (m *hybridManager) classify(client netip.AddrPort, packet []byte) (*hybridFlow, bool) {
+	now := time.Now()
+	m.mu.Lock()
+	// Re-checked under the write lock: lookup ran without one, and an
+	// authorization may have appeared since.
+	if m.passUnknown || m.hy2[client] > 0 {
+		m.mu.Unlock()
+		return nil, true
+	}
+
+	// A registered flow claims a tuple ahead of any authorization window. The
+	// raw path uses a socket of its own that never speaks QUIC to this server,
+	// so the two cannot legitimately be the same tuple -- but if they ever are,
+	// relaying to the target the flow named beats guessing.
+	if isShortHeader(packet) {
+		flow, hy2 := m.matchShortHeaderLocked(packet)
+		switch {
+		case hy2:
+			// An authenticated connection whose tuple changed: a NAT rebinding,
+			// or a client that moved networks. Dropping it here would break a
+			// migration quic-go handles natively, and quic-go still has to
+			// decrypt the packet and validate the path before it accepts one.
+			m.allowLocked(client, now, hybridMigrationTTL)
+			m.mu.Unlock()
+			return nil, true
+		// The observed address must belong to the session that registered the
+		// flow. Connection IDs travel in cleartext on the raw path, so an
+		// on-path observer can read one and replay it from its own tuple;
+		// without this check that would hand the target's traffic to whoever
+		// sent the packet. NAT rewrites the port rather than the address, so
+		// requiring the address still leaves IPv4 clients working.
+		case flow != nil && m.flows[client] == nil && flow.session.remote == client.Addr():
+			m.mu.Unlock()
+			return m.bind(flow, client), false
+		}
+	}
+
+	if entry, ok := m.passing[client]; ok && entry.expiry.After(now) {
+		m.mu.Unlock()
+		return nil, true
+	}
+	if !isClientQUICInitial(packet) {
+		delete(m.passing, client)
+		m.mu.Unlock()
+		return nil, false
+	}
+	m.allowLocked(client, now, hybridHandshakeTTL)
+	m.mu.Unlock()
+	return nil, true
+}
+
+// allowLocked authorizes a tuple to reach the QUIC stack. The table is swept on
+// a timer, but a flood of spoofed sources can fill it between sweeps, so it is
+// also swept here once it reaches its bound.
+func (m *hybridManager) allowLocked(client netip.AddrPort, now time.Time, ttl time.Duration) {
+	if _, exists := m.passing[client]; !exists && len(m.passing) >= hybridMaxPassing {
+		for other, entry := range m.passing {
+			if !entry.expiry.After(now) {
+				delete(m.passing, other)
+			}
+		}
+		if len(m.passing) >= hybridMaxPassing {
+			return
+		}
+	}
+	m.passing[client] = hybridPass{expiry: now.Add(ttl)}
+}
+
+// observeHY2 remembers a connection ID this server chose for one of its own
+// QUIC connections, so a 1-RTT packet addressed to it is recognized after the
+// client's tuple changes.
+func (m *hybridManager) observeHY2(packet []byte, addr net.Addr) {
+	_, scid, ok := longHeaderConnectionIDs(packet)
+	if !ok || scid == "" {
+		return
+	}
+	host, ok := udpAddrPort(addr)
+	if !ok {
+		return
+	}
+	now := time.Now()
+	m.mu.Lock()
+	if m.passUnknown {
+		// A UDP mask owns recognition of new wire packets, so what reaches this
+		// writer is already encoded and its bytes are not a QUIC header. The
+		// table is never consulted in that mode either, so there is nothing to
+		// learn and nothing to pollute it with.
+		m.mu.Unlock()
+		return
+	}
+	if entry, exists := m.hy2CIDs[scid]; exists {
+		entry.seen = now
+		m.hy2CIDs[scid] = entry
+	} else if len(m.hy2CIDs) < hybridMaxHY2CIDs && m.byCID[scid] == nil {
+		// A hybrid flow's own connection ID is never shadowed: the raw relay
+		// table decides first, and an ID cannot belong to both.
+		m.hy2CIDs[scid] = hybridHY2CID{host: host, seen: now}
+		m.cidLengths[len(scid)]++
+	}
+	m.mu.Unlock()
+}
+
 // bind attaches an as-yet-unseen raw tuple to the flow the packet's connection
 // ID belongs to, and reports that flow.
 //
@@ -166,29 +422,7 @@ func (c *hybridPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 // connection IDs this flow has claimed -- the target's own SCID, learned from
 // the handshake reply that was relayed through the tunnel, is what the client's
 // first 1-RTT packet is addressed to.
-//
-// The observed address must belong to the session that registered the flow.
-// Connection IDs travel in cleartext on the raw path, so an on-path observer can
-// read one and replay it from its own tuple; without this check that would hand
-// the target's traffic to whoever sent the packet. NAT rewrites the port rather
-// than the address, so requiring the address still leaves IPv4 clients working.
-func (m *hybridManager) bind(client netip.AddrPort, packet []byte) *hybridFlow {
-	if !isShortHeader(packet) {
-		return nil
-	}
-
-	m.mu.Lock()
-	flow := m.matchShortHeaderLocked(packet)
-	if flow == nil || m.hy2[client] > 0 || m.flows[client] != nil {
-		m.mu.Unlock()
-		return nil
-	}
-	if flow.session.remote != client.Addr() {
-		m.mu.Unlock()
-		return nil
-	}
-	m.mu.Unlock()
-
+func (m *hybridManager) bind(flow *hybridFlow, client netip.AddrPort) *hybridFlow {
 	flow.mu.Lock()
 	if flow.closed {
 		flow.mu.Unlock()
@@ -215,18 +449,28 @@ func (m *hybridManager) bind(client netip.AddrPort, packet []byte) *hybridFlow {
 	// The only point at which the raw path starts carrying this flow. Without
 	// it there is no way to tell a relay that is working from one that
 	// registered and then quietly fell back to the tunnel for everything.
-	xerrors.LogDebug(context.Background(), "hybrid QUIC bound ", client, " -> ", flow.target)
+	xerrors.LogDebug(context.Background(), "hybrid QUIC bound ", client, " -> ", flow.targetAddr())
 	return flow
 }
 
 // claimCID lets a flow be addressed by one more connection ID. A CID already
-// claimed by a different flow is left alone rather than stolen: two flows
-// answering to the same ID cannot both be right, and dropping the packet is
-// better than relaying it to the wrong target.
+// claimed by a different flow, or by one of this server's own connections, is
+// left alone rather than stolen: two owners for one ID cannot both be right,
+// and dropping the packet is better than relaying it to the wrong target.
 func (m *hybridManager) claimCID(flow *hybridFlow, cid string) {
 	if cid == "" {
 		return
 	}
+	m.mu.RLock()
+	_, isHY2 := m.hy2CIDs[cid]
+	owner := m.byCID[cid]
+	m.mu.RUnlock()
+	if isHY2 || (owner != nil && owner != flow) {
+		// Somebody else answers to this ID. It is not recorded on the flow
+		// either: the budget is for IDs the flow can actually be reached by.
+		return
+	}
+
 	flow.mu.Lock()
 	if flow.closed || len(flow.cids) >= hybridMaxFlowCIDs {
 		flow.mu.Unlock()
@@ -242,7 +486,7 @@ func (m *hybridManager) claimCID(flow *hybridFlow, cid string) {
 	flow.mu.Unlock()
 
 	m.mu.Lock()
-	if m.byCID[cid] == nil {
+	if _, taken := m.hy2CIDs[cid]; !taken && m.byCID[cid] == nil {
 		m.byCID[cid] = flow
 		m.cidLengths[len(cid)]++
 	}
@@ -255,21 +499,26 @@ func isShortHeader(packet []byte) bool {
 	return len(packet) > 1 && packet[0]&0xc0 == 0x40
 }
 
-// matchShortHeaderLocked finds the flow a 1-RTT packet belongs to by trying its
+// matchShortHeaderLocked finds what a 1-RTT packet belongs to by trying its
 // leading bytes against the connection IDs that have been claimed, longest
-// first. Only lengths some flow actually uses are tried, so this is a lookup or
-// two rather than a scan, and a longer ID is preferred so a short one can never
-// shadow it.
-func (m *hybridManager) matchShortHeaderLocked(packet []byte) *hybridFlow {
+// first. Only lengths some connection actually uses are tried, so this is a
+// lookup or two rather than a scan, and a longer ID is preferred so a short one
+// can never shadow it. It reports either a hybrid flow or that the packet
+// belongs to one of this server's own QUIC connections.
+func (m *hybridManager) matchShortHeaderLocked(packet []byte) (*hybridFlow, bool) {
 	for length := 20; length >= 1; length-- {
 		if m.cidLengths[length] == 0 || len(packet) < 1+length {
 			continue
 		}
-		if flow := m.byCID[string(packet[1:1+length])]; flow != nil {
-			return flow
+		cid := string(packet[1 : 1+length])
+		if flow := m.byCID[cid]; flow != nil {
+			return flow, false
+		}
+		if _, ok := m.hy2CIDs[cid]; ok {
+			return nil, true
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // longHeaderConnectionIDs reads the two connection IDs out of a QUIC long
@@ -293,24 +542,6 @@ func longHeaderConnectionIDs(packet []byte) (destination, source string, ok bool
 	return string(packet[6:destinationEnd]), string(packet[sourceStart:sourceEnd]), true
 }
 
-func (m *hybridManager) allowQUIC(client netip.AddrPort, packet []byte) bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.passUnknown || m.hy2[client] > 0 {
-		return true
-	}
-	now := time.Now()
-	if expiry := m.candidates[client]; expiry.After(now) {
-		return true
-	}
-	if !isServerQUICInitial(packet) {
-		delete(m.candidates, client)
-		return false
-	}
-	m.candidates[client] = now.Add(10 * time.Second)
-	return true
-}
-
 func (m *hybridManager) establishHY2(remote net.Addr) func() {
 	client, ok := udpAddrPort(remote)
 	if !ok {
@@ -318,7 +549,7 @@ func (m *hybridManager) establishHY2(remote net.Addr) func() {
 	}
 	m.mu.Lock()
 	m.hy2[client]++
-	delete(m.candidates, client)
+	delete(m.passing, client)
 	m.mu.Unlock()
 	return func() {
 		m.mu.Lock()
@@ -331,7 +562,9 @@ func (m *hybridManager) establishHY2(remote net.Addr) func() {
 	}
 }
 
-func isServerQUICInitial(packet []byte) bool {
+// isClientQUICInitial reports whether this is the Initial a client opens a QUIC
+// connection with, which is the only packet an unknown tuple may arrive with.
+func isClientQUICInitial(packet []byte) bool {
 	if len(packet) < 5 || packet[0]&0xc0 != 0xc0 {
 		return false
 	}
@@ -353,7 +586,14 @@ func (m *hybridManager) newSession(remote net.Addr) *hybridSession {
 	// self-reported, so a client behind IPv4 NAT is no longer a problem: NAT
 	// rewrites the port, and the destination of the raw socket never changes,
 	// so even a symmetric NAT keeps one stable mapping.
-	if !ok || !isPublicTarget(addrPort.Addr()) {
+	if !ok {
+		return nil
+	}
+	if !isPublicTarget(addrPort.Addr()) {
+		// Worth saying out loud: a server behind NAT or a load balancer sees
+		// private client addresses here, and hybrid QUIC silently does nothing
+		// for every one of them.
+		xerrors.LogDebug(context.Background(), "hybrid QUIC is unavailable for the non-public client address ", addrPort.Addr())
 		return nil
 	}
 	s := &hybridSession{manager: m, remote: addrPort.Addr(), flows: make(map[[16]byte]*hybridFlow)}
@@ -363,7 +603,7 @@ func (m *hybridManager) newSession(remote net.Addr) *hybridSession {
 	return s
 }
 
-func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) error) error {
+func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) error, dial HybridDialer) error {
 	if s == nil {
 		return errors.New("hybrid QUIC is unavailable for this session")
 	}
@@ -378,7 +618,7 @@ func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) 
 		return err
 	}
 
-	flow, err := s.register(id, target, send)
+	flow, ready, err := s.register(id, target, send, dial)
 	if err != nil {
 		ackHybrid(send, id, hybridAckFailed, netip.AddrPort{})
 		return err
@@ -390,9 +630,15 @@ func (s *hybridSession) handle(data []byte, send func([]byte, xnet.Destination) 
 	// could match by accident.
 	if err = flow.writeTarget(payload); err != nil {
 		ackHybrid(send, id, hybridAckFailed, netip.AddrPort{})
+		flow.close()
 		return err
 	}
-	ackHybrid(send, id, hybridAckOK, flow.target)
+	if ready {
+		// A repeat of a registration whose flow is already up. The goroutine
+		// that would have acknowledged it finished long ago, so this answers on
+		// the spot; a flow still coming up is acknowledged by that goroutine.
+		ackHybrid(send, id, hybridAckOK, flow.targetAddr())
+	}
 	return nil
 }
 
@@ -541,59 +787,147 @@ func resolveHybridTarget(destination xnet.Destination) (netip.AddrPort, error) {
 	return netip.AddrPortFrom(resolved, uint16(destination.Port)), nil
 }
 
-// register creates the flow and its socket to the target. It deliberately does
-// not touch the manager's tuple table: the raw tuple is not known yet and is
-// filled in by bind once a raw packet has identified itself by connection ID.
-func (s *hybridSession) register(id [16]byte, destination xnet.Destination, send func([]byte, xnet.Destination) error) (*hybridFlow, error) {
+// register creates the flow and hands the rest to a goroutine. Resolving a name
+// and opening the target side both block, and the control loop they used to run
+// on is shared by every flow of this link -- one slow lookup held up the
+// handshake of every other connection. The flow buffers what arrives meanwhile.
+//
+// It deliberately does not touch the manager's tuple table: the raw tuple is not
+// known yet and is filled in by bind once a raw packet has identified itself by
+// connection ID.
+func (s *hybridSession) register(id [16]byte, destination xnet.Destination, send func([]byte, xnet.Destination) error, dial HybridDialer) (*hybridFlow, bool, error) {
+	// A literal target is screened here rather than in the background, so an
+	// unroutable one is refused while the client is still listening for the
+	// answer to this registration.
+	if !destination.Address.Family().IsDomain() {
+		if _, err := resolveHybridTarget(destination); err != nil {
+			return nil, false, err
+		}
+	}
+	request := destination.String()
+
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return nil, net.ErrClosed
+		return nil, false, net.ErrClosed
 	}
 	if existing := s.flows[id]; existing != nil {
 		s.mu.Unlock()
-		if existing.target.Port() != uint16(destination.Port) {
-			return nil, errors.New("hybrid QUIC flow id collision")
+		if existing.request != request {
+			return nil, false, errors.New("hybrid QUIC flow id collision")
 		}
 		// A re-registration arrives on whichever link is live now; the one the
 		// flow was created on may already be gone.
 		existing.mu.Lock()
 		existing.send = send
+		ready := existing.ready
 		existing.mu.Unlock()
-		return existing, nil
+		return existing, ready, nil
 	}
+	if len(s.flows) >= hybridMaxSessionFlows {
+		s.mu.Unlock()
+		return nil, false, errors.New("hybrid QUIC flow limit reached for this session")
+	}
+	flow := &hybridFlow{session: s, id: id, request: request, lastSeen: time.Now(), send: send}
+	s.flows[id] = flow
 	s.mu.Unlock()
 
+	go flow.start(destination, dial)
+	return flow, false, nil
+}
+
+// start resolves the target, opens the link to it and releases whatever the
+// flow buffered while that was happening.
+func (f *hybridFlow) start(destination xnet.Destination, dial HybridDialer) {
 	target, err := resolveHybridTarget(destination)
+	var link HybridTargetLink
+	if err == nil {
+		link, err = dialHybridTarget(target, dial)
+	}
 	if err != nil {
-		return nil, err
+		f.mu.Lock()
+		send := f.send
+		f.mu.Unlock()
+		xerrors.LogDebugInner(context.Background(), err, "hybrid QUIC registration failed for ", destination)
+		ackHybrid(send, f.id, hybridAckFailed, netip.AddrPort{})
+		f.close()
+		return
+	}
+
+	f.mu.Lock()
+	if f.closed {
+		f.mu.Unlock()
+		_ = link.Close()
+		return
+	}
+	f.target = target
+	f.link = link
+	f.ready = true
+	pending := f.pending
+	f.pending, f.pendingN = nil, 0
+	send := f.send
+	f.mu.Unlock()
+
+	go f.readTarget()
+	ackHybrid(send, f.id, hybridAckOK, target)
+	for _, payload := range pending {
+		if err = link.WritePacket(payload); err != nil {
+			f.close()
+			return
+		}
+	}
+}
+
+// dialHybridTarget opens the target side of a flow. The dispatcher-backed
+// dialer is what puts hybrid traffic under the same routing, logging and
+// accounting as any other UDP session; the direct socket is only what is left
+// when no dialer was supplied, as in a test.
+func dialHybridTarget(target netip.AddrPort, dial HybridDialer) (HybridTargetLink, error) {
+	if dial != nil {
+		return dial(xnet.UDPDestination(xnet.IPAddress(target.Addr().AsSlice()), xnet.Port(target.Port())))
 	}
 	network := "udp4"
 	if target.Addr().Is6() {
 		network = "udp6"
 	}
-	targetConn, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(target))
+	conn, err := net.DialUDP(network, nil, net.UDPAddrFromAddrPort(target))
 	if err != nil {
 		return nil, err
 	}
+	return newHybridUDPLink(conn), nil
+}
 
-	s.mu.Lock()
-	if s.closed {
-		s.mu.Unlock()
-		_ = targetConn.Close()
-		return nil, net.ErrClosed
-	}
-	if existing := s.flows[id]; existing != nil {
-		s.mu.Unlock()
-		_ = targetConn.Close()
-		return existing, nil
-	}
-	flow := &hybridFlow{session: s, id: id, target: target, conn: targetConn, lastSeen: time.Now(), send: send}
-	s.flows[id] = flow
-	s.mu.Unlock()
+// hybridUDPLink is a plain connected UDP socket to the target.
+type hybridUDPLink struct {
+	conn   *net.UDPConn
+	buffer []byte
+}
 
-	go flow.readTarget()
-	return flow, nil
+func newHybridUDPLink(conn *net.UDPConn) *hybridUDPLink {
+	return &hybridUDPLink{conn: conn, buffer: make([]byte, 64*1024)}
+}
+
+func (l *hybridUDPLink) WritePacket(payload []byte) error {
+	_, err := l.conn.Write(payload)
+	return err
+}
+
+func (l *hybridUDPLink) ReadPacket() ([]byte, error) {
+	n, err := l.conn.Read(l.buffer)
+	if err != nil {
+		return nil, err
+	}
+	return l.buffer[:n], nil
+}
+
+func (l *hybridUDPLink) Close() error { return l.conn.Close() }
+
+func (l *hybridUDPLink) LocalAddr() net.Addr { return l.conn.LocalAddr() }
+
+func (f *hybridFlow) targetAddr() netip.AddrPort {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.target
 }
 
 func (f *hybridFlow) writeTarget(payload []byte) error {
@@ -603,16 +937,33 @@ func (f *hybridFlow) writeTarget(payload []byte) error {
 		return net.ErrClosed
 	}
 	f.lastSeen = time.Now()
+	if !f.ready {
+		// The target is still being resolved and dialled. Holding these is what
+		// keeps that work off the control loop without costing the flow its
+		// handshake; past the bound they are dropped, and QUIC retransmits.
+		if f.pendingN+len(payload) <= hybridMaxPendingBytes {
+			f.pending = append(f.pending, append([]byte(nil), payload...))
+			f.pendingN += len(payload)
+		}
+		f.mu.Unlock()
+		return nil
+	}
+	link := f.link
 	f.mu.Unlock()
-	_, err := f.conn.Write(payload)
-	return err
+	return link.WritePacket(payload)
 }
 
 func (f *hybridFlow) readTarget() {
-	buffer := make([]byte, 64*1024)
+	f.mu.Lock()
+	link := f.link
+	f.mu.Unlock()
+	if link == nil {
+		return
+	}
 	for {
-		n, err := f.conn.Read(buffer)
+		payload, err := link.ReadPacket()
 		if err != nil {
+			f.close()
 			return
 		}
 		f.mu.Lock()
@@ -620,6 +971,7 @@ func (f *hybridFlow) readTarget() {
 		closed := f.closed
 		client := f.client
 		bound := f.bound
+		target := f.target
 		f.mu.Unlock()
 		if closed {
 			return
@@ -629,11 +981,11 @@ func (f *hybridFlow) readTarget() {
 		// will address this flow, so it has to be claimable before that packet
 		// can arrive. It can only arrive after this reply reaches the client,
 		// which is why claiming it here is always in time.
-		if _, scid, ok := longHeaderConnectionIDs(buffer[:n]); ok {
+		if _, scid, ok := longHeaderConnectionIDs(payload); ok {
 			f.session.manager.claimCID(f, scid)
 		}
 
-		if !bound || !isShortHeader(buffer[:n]) {
+		if !bound || !isShortHeader(payload) {
 			// Two reasons to answer over the tunnel. Nothing may have
 			// identified a raw tuple for this flow yet, and sending to a
 			// guessed one would be sending to a stranger -- this is also what
@@ -653,14 +1005,14 @@ func (f *hybridFlow) readTarget() {
 				f.close()
 				return
 			}
-			from := xnet.UDPDestination(xnet.IPAddress(f.target.Addr().AsSlice()), xnet.Port(f.target.Port()))
-			if err = send(buffer[:n], from); err != nil {
+			from := xnet.UDPDestination(xnet.IPAddress(target.Addr().AsSlice()), xnet.Port(target.Port()))
+			if err = send(payload, from); err != nil {
 				f.close()
 				return
 			}
 			continue
 		}
-		if _, err = f.session.manager.conn.WriteTo(buffer[:n], net.UDPAddrFromAddrPort(client)); err != nil {
+		if _, err = f.session.manager.conn.WriteTo(payload, net.UDPAddrFromAddrPort(client)); err != nil {
 			f.close()
 			return
 		}
@@ -676,9 +1028,13 @@ func (f *hybridFlow) close() {
 	f.closed = true
 	client := f.client
 	cids := f.cids
+	link := f.link
 	f.cids = nil
+	f.pending, f.pendingN = nil, 0
 	f.mu.Unlock()
-	_ = f.conn.Close()
+	if link != nil {
+		_ = link.Close()
+	}
 	m := f.session.manager
 	m.mu.Lock()
 	if m.flows[client] == f {
@@ -687,11 +1043,7 @@ func (f *hybridFlow) close() {
 	for _, cid := range cids {
 		if m.byCID[cid] == f {
 			delete(m.byCID, cid)
-			if m.cidLengths[len(cid)] <= 1 {
-				delete(m.cidLengths, len(cid))
-			} else {
-				m.cidLengths[len(cid)]--
-			}
+			m.releaseCIDLengthLocked(len(cid))
 		}
 	}
 	m.mu.Unlock()
@@ -700,6 +1052,14 @@ func (f *hybridFlow) close() {
 		delete(f.session.flows, f.id)
 	}
 	f.session.mu.Unlock()
+}
+
+func (m *hybridManager) releaseCIDLengthLocked(length int) {
+	if m.cidLengths[length] <= 1 {
+		delete(m.cidLengths, length)
+		return
+	}
+	m.cidLengths[length]--
 }
 
 func (s *hybridSession) close() {
@@ -731,30 +1091,56 @@ func (m *hybridManager) clean() {
 	for {
 		select {
 		case <-ticker.C:
-			m.mu.RLock()
-			flows := make([]*hybridFlow, 0, len(m.flows))
-			for _, flow := range m.flows {
-				flows = append(flows, flow)
-			}
-			m.mu.RUnlock()
-			now := time.Now()
-			m.mu.Lock()
-			for client, expiry := range m.candidates {
-				if !expiry.After(now) {
-					delete(m.candidates, client)
-				}
-			}
-			m.mu.Unlock()
-			for _, flow := range flows {
-				flow.mu.Lock()
-				expired := now.Sub(flow.lastSeen) > hybridFlowTTL
-				flow.mu.Unlock()
-				if expired {
-					flow.close()
-				}
-			}
+			m.sweep(time.Now())
 		case <-m.closed:
 			return
+		}
+	}
+}
+
+func (m *hybridManager) sweep(now time.Time) {
+	m.mu.Lock()
+	for client, entry := range m.passing {
+		if !entry.expiry.After(now) {
+			delete(m.passing, client)
+		}
+	}
+	for cid, entry := range m.hy2CIDs {
+		// A live connection keeps its own connection IDs however long it runs;
+		// this reclaims the ones a handshake that never completed left behind.
+		if m.hy2[entry.host] == 0 && now.Sub(entry.seen) > hybridHY2CIDGrace {
+			delete(m.hy2CIDs, cid)
+			m.releaseCIDLengthLocked(len(cid))
+		}
+	}
+	sessions := make([]*hybridSession, 0, len(m.sessions))
+	for session := range m.sessions {
+		sessions = append(sessions, session)
+	}
+	m.mu.Unlock()
+
+	// Every flow of every session, not just the ones a raw tuple bound. A flow
+	// that never leaves the tunnel is only ever in its session's table, so
+	// sweeping the manager's tuple table alone held its socket and its
+	// goroutine open for the whole life of the tunnel.
+	for _, session := range sessions {
+		session.mu.Lock()
+		flows := make([]*hybridFlow, 0, len(session.flows))
+		for _, flow := range session.flows {
+			flows = append(flows, flow)
+		}
+		session.mu.Unlock()
+		for _, flow := range flows {
+			flow.mu.Lock()
+			ttl := hybridFlowTTL
+			if flow.bound {
+				ttl = hybridBoundFlowTTL
+			}
+			expired := now.Sub(flow.lastSeen) > ttl
+			flow.mu.Unlock()
+			if expired {
+				flow.close()
+			}
 		}
 	}
 }
@@ -792,13 +1178,15 @@ func isPublicTarget(addr netip.Addr) bool {
 }
 
 // HandleHybridQUIC is exposed through a tiny interface so the proxy layer can
-// consume the reserved authenticated destination without a package cycle.
-func (c *InterConn) HandleHybridQUIC(destination string, data []byte, send func([]byte, xnet.Destination) error) (bool, error) {
+// consume the reserved authenticated destination without a package cycle. The
+// dialer it passes is what carries a flow's target side through Xray's
+// dispatcher instead of a bare socket.
+func (c *InterConn) HandleHybridQUIC(destination string, data []byte, send func([]byte, xnet.Destination) error, dial HybridDialer) (bool, error) {
 	if destination != hybridControlHost {
 		return false, nil
 	}
 	if c.hybridSession == nil {
 		return true, errors.New("hybrid QUIC is unavailable for this session")
 	}
-	return true, c.hybridSession.handle(data, send)
+	return true, c.hybridSession.handle(data, send, dial)
 }
