@@ -388,7 +388,16 @@ func (c EnvConfig) Override(o EnvConfig) {
 	}
 }
 
+type HybridQUICConfig struct {
+	Listen                 string   `json:"listen"`
+	Advertise              string   `json:"advertise"`
+	ShareHysteria          bool     `json:"shareHysteria"`
+	ForwardOutbounds       []string `json:"forwardOutbounds"`
+	TrustedForwardInbounds []string `json:"trustedForwardInbounds"`
+}
+
 type Config struct {
+	HybridQUIC *HybridQUICConfig `json:"hybridQUIC"`
 	// Deprecated: Global transport config is no longer used
 	// left for returning error
 	Transport map[string]json.RawMessage `json:"transport"`
@@ -435,6 +444,9 @@ func (c *Config) findOutboundTag(tag string) int {
 
 // Override method accepts another Config overrides the current attribute
 func (c *Config) Override(o *Config, fn string) {
+	if o.HybridQUIC != nil {
+		c.HybridQUIC = o.HybridQUIC
+	}
 	// only process the non-deprecated members
 
 	if o.LogConfig != nil {
@@ -540,9 +552,20 @@ func (c *Config) Build() (*core.Config, error) {
 		return nil, errors.New("failed to post-process configuration file").Base(err)
 	}
 
+	dispatcherConfig := &dispatcher.Config{}
+	if c.HybridQUIC != nil {
+		dispatcherConfig.HybridListen = c.HybridQUIC.Listen
+		dispatcherConfig.HybridAdvertise = c.HybridQUIC.Advertise
+		dispatcherConfig.HybridShareHysteria = c.HybridQUIC.ShareHysteria
+		dispatcherConfig.HybridForwardOutbounds = c.HybridQUIC.ForwardOutbounds
+		dispatcherConfig.HybridTrustedInbounds = c.HybridQUIC.TrustedForwardInbounds
+		if (c.HybridQUIC.Listen == "") != (c.HybridQUIC.Advertise == "") {
+			return nil, errors.New("hybridQUIC requires both listen and advertise")
+		}
+	}
 	config := &core.Config{
 		App: []*serial.TypedMessage{
-			serial.ToTypedMessage(&dispatcher.Config{}),
+			serial.ToTypedMessage(dispatcherConfig),
 			serial.ToTypedMessage(&proxyman.InboundConfig{}),
 			serial.ToTypedMessage(&proxyman.OutboundConfig{}),
 		},

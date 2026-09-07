@@ -115,53 +115,6 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		b.Resize(0, int32(n))
 		b.UDP = addr
 
-		if hybrid, ok := iConn.(interface {
-			HandleHybridQUIC(string, []byte, func([]byte, net.Destination) error) (bool, error)
-		}); ok {
-			// The relay answers over this same UDP link: registration results,
-			// and the target's replies until a raw tuple has identified itself.
-			// UDPWriter takes the source address from each buffer, so a reply
-			// reaches the client attributed to the target it came from, exactly
-			// as an ordinary Hysteria UDP session would deliver it.
-			controlWriter := &UDPWriter{writer: conn, addr: addr.NetAddr()}
-			send := func(payload []byte, from net.Destination) error {
-				pb := buf.New()
-				if _, writeErr := pb.Write(payload); writeErr != nil {
-					pb.Release()
-					return writeErr
-				}
-				source := from
-				pb.UDP = &source
-				return controlWriter.WriteMultiBuffer(buf.MultiBuffer{pb})
-			}
-			handled, handleErr := hybrid.HandleHybridQUIC(addr.NetAddr(), b.Bytes(), send)
-			if handled {
-				b.Release()
-				if handleErr != nil {
-					return handleErr
-				}
-				// UDPReader reassembles HY2 fragments before copying into this
-				// buffer. Hybrid control messages contain the original QUIC
-				// datagram plus a 42-byte registration header, so a buffer sized
-				// to one HY2 frame (1200 bytes) silently discards normal 1200-byte
-				// QUIC Initials after the first message.
-				control := make([]byte, 64*1024)
-				for {
-					n, nextAddr, readErr := reader.ReadFrom(control)
-					if readErr != nil {
-						return readErr
-					}
-					handled, handleErr = hybrid.HandleHybridQUIC(nextAddr.NetAddr(), control[:n], send)
-					if !handled {
-						return errors.New("hybrid QUIC control session changed destination")
-					}
-					if handleErr != nil {
-						return handleErr
-					}
-				}
-			}
-		}
-
 		reader.firstBuf = b
 
 		writer := &UDPWriter{
