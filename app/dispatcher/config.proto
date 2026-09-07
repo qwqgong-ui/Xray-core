@@ -12,4 +12,9 @@ message SessionConfig {
 
 message Config {
   SessionConfig settings = 1;
+  string hybrid_listen = 2;
+  string hybrid_advertise = 3;
+  bool hybrid_share_hysteria = 4;
+  repeated string hybrid_forward_outbounds = 5;
+  repeated string hybrid_trusted_inbounds = 6;
 }

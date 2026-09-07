@@ -18,6 +18,7 @@ import (
 	"github.com/apernet/quic-go/quicvarint"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/hybrid"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/proxy/hysteria/account"
@@ -36,11 +37,9 @@ type httpHandler struct {
 	quicParams  *internet.QuicParams
 	addConn     internet.ConnHandler
 	conn        *quic.Conn
-	hybrid      *hybridManager
 
-	auth          bool
-	user          *protocol.MemoryUser
-	hybridSession *hybridSession
+	auth bool
+	user *protocol.MemoryUser
 }
 
 func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
@@ -70,9 +69,6 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 		if user != nil || ok {
 			h.auth = true
 			h.user = user
-			if h.hybrid != nil {
-				h.hybridSession = h.hybrid.newSession(h.conn.RemoteAddr())
-			}
 
 			conn := h.conn
 			quicParams := h.quicParams
@@ -100,7 +96,6 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 					addConn:        h.addConn,
 					udpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
 					user:           h.user,
-					hybridSession:  h.hybridSession,
 				}
 				go udpSM.clean()
 				go udpSM.run()
@@ -153,7 +148,6 @@ type Listener struct {
 	masqHandler http.Handler
 	quicParams  *internet.QuicParams
 	addConn     internet.ConnHandler
-	hybrid      *hybridManager
 
 	pktConn  net.PacketConn
 	tr       *quic.Transport
@@ -161,8 +155,6 @@ type Listener struct {
 }
 
 func (l *Listener) handleClient(conn *quic.Conn) {
-	releaseHY2 := l.hybrid.establishHY2(conn.RemoteAddr())
-	defer releaseHY2()
 	handler := &httpHandler{
 		validator:   l.validator,
 		config:      l.config,
@@ -170,13 +162,7 @@ func (l *Listener) handleClient(conn *quic.Conn) {
 		quicParams:  l.quicParams,
 		addConn:     l.addConn,
 		conn:        conn,
-		hybrid:      l.hybrid,
 	}
-	defer func() {
-		if handler.hybridSession != nil {
-			handler.hybridSession.close()
-		}
-	}()
 	h3s := http3.Server{
 		Handler:          handler,
 		StreamDispatcher: handler.StreamDispatcher,
@@ -204,9 +190,6 @@ func (l *Listener) Addr() net.Addr {
 }
 
 func (l *Listener) Close() error {
-	if l.hybrid != nil {
-		l.hybrid.close()
-	}
 	return errors.Combine(l.listener.Close(), l.tr.Close(), l.pktConn.Close())
 }
 
@@ -339,21 +322,16 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	if err != nil {
 		return nil, err
 	}
-	// Demultiplex before any UDP mask. Registered raw packets must stay raw,
-	// while every unregistered packet continues through the existing mask and
-	// QUIC stack unchanged.
-	hybrid := newHybridManager(pktConn)
-	pktConn = hybrid.wrap()
+	sharedConn, err := hybrid.WrapShared(pktConn)
+	if err != nil {
+		pktConn.Close()
+		return nil, err
+	}
+	pktConn = sharedConn
 
 	if streamSettings.UdpmaskManager != nil {
-		// The mask owns recognition of new wire packets; raw authorization is
-		// still checked first, while all other packets must reach the decoder.
-		hybrid.mu.Lock()
-		hybrid.passUnknown = true
-		hybrid.mu.Unlock()
 		newConn, err := streamSettings.UdpmaskManager.WrapPacketConnServer(pktConn)
 		if err != nil {
-			hybrid.close()
 			pktConn.Close()
 			return nil, errors.New("mask err").Base(err)
 		}
@@ -370,7 +348,6 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 
 	listener, err := tr.Listen(tlsConfig.GetTLSConfig(tls.WithNextProto("h3")), quicConfig)
 	if err != nil {
-		hybrid.close()
 		_ = tr.Close()
 		_ = pktConn.Close()
 		return nil, err
@@ -382,7 +359,6 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		masqHandler: masqHandler,
 		quicParams:  quicParams,
 		addConn:     handler,
-		hybrid:      hybrid,
 
 		pktConn:  pktConn,
 		tr:       tr,

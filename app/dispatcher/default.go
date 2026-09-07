@@ -2,6 +2,8 @@ package dispatcher
 
 import (
 	"context"
+	gonet "net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -9,6 +11,7 @@ import (
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/common/hybrid"
 	"github.com/xtls/xray-core/common/log"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/protocol"
@@ -93,11 +96,17 @@ func (r *cachedReader) Interrupt() {
 
 // DefaultDispatcher is a default implementation of Dispatcher.
 type DefaultDispatcher struct {
-	ohm    outbound.Manager
-	router routing.Router
-	policy policy.Manager
-	stats  stats.Manager
-	fdns   dns.FakeDNSEngine
+	hybrid        *hybrid.Server
+	hybridListen  netip.AddrPort
+	hybridSocket  gonet.PacketConn
+	hybridShared  bool
+	hybridForward map[string]bool
+	hybridTrusted map[string]bool
+	ohm           outbound.Manager
+	router        routing.Router
+	policy        policy.Manager
+	stats         stats.Manager
+	fdns          dns.FakeDNSEngine
 }
 
 func init() {
@@ -121,7 +130,7 @@ func (d *DefaultDispatcher) Init(config *Config, om outbound.Manager, router rou
 	d.router = router
 	d.policy = pm
 	d.stats = sm
-	return nil
+	return d.initHybrid(config)
 }
 
 // Type implements common.HasType.
@@ -130,12 +139,10 @@ func (*DefaultDispatcher) Type() interface{} {
 }
 
 // Start implements common.Runnable.
-func (*DefaultDispatcher) Start() error {
-	return nil
-}
+func (d *DefaultDispatcher) Start() error { return d.startHybrid() }
 
 // Close implements common.Closable.
-func (*DefaultDispatcher) Close() error { return nil }
+func (d *DefaultDispatcher) Close() error { return d.closeHybrid() }
 
 func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
 	opt := pipe.OptionsFromContext(ctx)
@@ -268,6 +275,9 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	if !destination.IsValid() {
 		panic("Dispatcher: Invalid destination.")
 	}
+	if isHybridDestination(destination) {
+		return d.dispatchHybrid(ctx, destination), nil
+	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
 		outbounds = []*session.Outbound{{}}
@@ -332,6 +342,10 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.Destination, outbound *transport.Link) error {
 	if !destination.IsValid() {
 		return errors.New("Dispatcher: Invalid destination.")
+	}
+	if isHybridDestination(destination) {
+		d.serveHybrid(ctx, destination, outbound)
+		return nil
 	}
 	outbounds := session.OutboundsFromContext(ctx)
 	if len(outbounds) == 0 {
