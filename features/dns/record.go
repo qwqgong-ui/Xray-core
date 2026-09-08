@@ -2,6 +2,7 @@ package dns
 
 import (
 	"context"
+	"github.com/xtls/xray-core/common/net"
 
 	"github.com/xtls/xray-core/common/errors"
 )
@@ -22,6 +23,8 @@ type RecordResponse struct {
 	// chain is preserved, so the caller sees the answer exactly as it was
 	// given rather than a filtered view of it.
 	Records []RawRecord
+	// Additional holds real address records in a complete domain bundle.
+	Additional []RawRecord
 }
 
 // RecordClient is an optional capability of a Client: resolving one record
@@ -43,3 +46,13 @@ type RecordClient interface {
 // ErrRecordQueryUnsupported is returned when the configured DNS cannot answer
 // record queries.
 var ErrRecordQueryUnsupported = errors.New("configured DNS cannot answer record queries")
+
+// DomainClient resolves addresses and HTTPS metadata as one expiring result.
+type DomainClient interface {
+	QueryDomain(context.Context, string) (*RecordResponse, error)
+}
+
+// DomainCacheClient exposes only already resolved, unexpired addresses.
+type DomainCacheClient interface {
+	LookupDomainCache(string, IPOption) ([]net.IP, uint32, bool)
+}

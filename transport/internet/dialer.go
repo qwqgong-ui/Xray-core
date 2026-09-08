@@ -125,6 +125,29 @@ func QueryRecordDNS(ctx context.Context, domain string, qtype uint16) (*dns.Reco
 	return client.QueryRecord(ctx, domain, qtype)
 }
 
+// QueryDomainDNS uses the same instance that resolves outbound FQDNs.
+func QueryDomainDNS(ctx context.Context, domain string) (*dns.RecordResponse, error) {
+	client, ok := dnsClient.(dns.DomainClient)
+	if !ok {
+		return nil, dns.ErrRecordQueryUnsupported
+	}
+	return client.QueryDomain(ctx, domain)
+}
+
+// LookupDomainCache never starts DNS work. It lets AsIs reuse a bundle while
+// leaving routing and freedom's final destination rules in control.
+func LookupDomainCache(domain string, localAddr net.Address) []net.IP {
+	client, ok := dnsClient.(dns.DomainCacheClient)
+	if !ok {
+		return nil
+	}
+	ips, _, _ := client.LookupDomainCache(domain, dns.IPOption{
+		IPv4Enable: localAddr == nil || localAddr.Family().IsIPv4(),
+		IPv6Enable: localAddr == nil || localAddr.Family().IsIPv6(),
+	})
+	return ips
+}
+
 func redirect(ctx context.Context, dst net.Destination, obt string, h outbound.Handler) net.Conn {
 	errors.LogInfo(ctx, "redirecting request "+dst.String()+" to "+obt)
 	outbounds := session.OutboundsFromContext(ctx)

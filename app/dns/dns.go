@@ -20,6 +20,7 @@ import (
 
 // DNS is a DNS rely server.
 type DNS struct {
+	domains domainCache
 	sync.Mutex
 	disableFallback        bool
 	disableFallbackIfMatch bool
@@ -254,6 +255,13 @@ func (s *DNS) LookupIP(domain string, option dns.IPOption) ([]net.IP, uint32, er
 			return nil, 0, err
 		}
 		return ips, 10, nil // Hosts ttl is 10
+	}
+
+	// Only a complete, unexpired bundle can shortcut the ordinary lookup.
+	if !option.FakeEnable {
+		if ips, ttl, ok := s.domains.lookup(domain, option); ok {
+			return ips, ttl, nil
+		}
 	}
 
 	// Name servers lookup

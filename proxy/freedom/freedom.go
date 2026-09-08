@@ -287,6 +287,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 	firstResolve := true
 	err := retry.ExponentialBackoff(5, 100).On(func() error {
 		dialDest := destination
+		if !h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
+			if ips := internet.LookupDomainCache(dialDest.Address.Domain(), outGateway); len(ips) > 0 {
+				dialDest.Address = net.IPAddress(ips[dice.Roll(len(ips))])
+			}
+		}
 		if h.config.DomainStrategy.HasStrategy() && dialDest.Address.Family().IsDomain() {
 			strategy := h.config.DomainStrategy
 			if destination.Network == net.Network_UDP && origTargetAddr != nil && outGateway == nil {
@@ -613,6 +618,12 @@ func (w *PacketWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 								continue
 							}
 						} else {
+							ip = net.IPAddress(ips[dice.Roll(len(ips))])
+							ShouldUseSystemResolver = false
+						}
+					}
+					if ShouldUseSystemResolver {
+						if ips := internet.LookupDomainCache(b.UDP.Address.Domain(), w.LocalAddr); len(ips) > 0 {
 							ip = net.IPAddress(ips[dice.Roll(len(ips))])
 							ShouldUseSystemResolver = false
 						}

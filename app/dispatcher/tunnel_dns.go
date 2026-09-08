@@ -13,6 +13,7 @@ import (
 	"github.com/xtls/xray-core/transport/internet"
 
 	mdns "github.com/miekg/dns"
+	dnsfeature "github.com/xtls/xray-core/features/dns"
 )
 
 const (
@@ -167,7 +168,21 @@ func answerTunnelDNS(ctx context.Context, query []byte) ([]byte, error) {
 		return response.Pack()
 	}
 
-	answer, err := internet.QueryRecordDNS(ctx, question.Name, question.Qtype)
+	var answer *dnsfeature.RecordResponse
+	var err error
+	bundle := false
+	if opt := request.IsEdns0(); opt != nil && question.Qtype == mdns.TypeHTTPS {
+		for _, option := range opt.Option {
+			if local, ok := option.(*mdns.EDNS0_LOCAL); ok && local.Code == 65001 && string(local.Data) == "\x01" {
+				bundle = true
+			}
+		}
+	}
+	if bundle {
+		answer, err = internet.QueryDomainDNS(ctx, question.Name)
+	} else {
+		answer, err = internet.QueryRecordDNS(ctx, question.Name, question.Qtype)
+	}
 	if err != nil {
 		errors.LogInfoInner(ctx, err, "tunnel DNS: ", question.Name, " could not be resolved")
 		response.Rcode = mdns.RcodeServerFailure
@@ -183,6 +198,17 @@ func answerTunnelDNS(ctx context.Context, query []byte) ([]byte, error) {
 			continue
 		}
 		response.Answer = append(response.Answer, rr)
+	}
+	if bundle {
+		for _, raw := range answer.Additional {
+			rr, _, err := mdns.UnpackRR(raw, 0)
+			if err != nil {
+				return nil, err
+			}
+			response.Extra = append(response.Extra, rr)
+		}
+		response.SetEdns0(1232, false)
+		response.IsEdns0().Option = append(response.IsEdns0().Option, &mdns.EDNS0_LOCAL{Code: 65001, Data: []byte{1}})
 	}
 	return response.Pack()
 }

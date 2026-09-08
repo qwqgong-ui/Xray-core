@@ -33,6 +33,11 @@ func (s *DNS) QueryRecord(ctx context.Context, domain string, qtype uint16) (*dn
 		return nil, errors.New("record query has an empty domain")
 	}
 
+	if qtype == mdns.TypeHTTPS {
+		if answer := s.domains.get(domain); answer != nil {
+			return answer, nil
+		}
+	}
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, recordQueryTimeout)
@@ -55,7 +60,12 @@ func (s *DNS) QueryRecord(ctx context.Context, domain string, qtype uint16) (*dn
 			continue
 		}
 		anyServer = true
-		response, err := server.QueryRecord(ctx, domain, qtype)
+		// A resolver lookup is an internal connection. Inheriting the user's
+		// inbound Conn/CanSpliceCopy can splice upstream DNS bytes directly
+		// into the tunnel, bypassing its response framing and message ID.
+		queryCtx := session.ContextWithInbound(ctx, &session.Inbound{Tag: client.tag})
+		queryCtx = session.ContextWithOutbounds(queryCtx, nil)
+		response, err := server.QueryRecord(queryCtx, domain, qtype)
 		if err != nil {
 			errs = append(errs, err)
 			continue
