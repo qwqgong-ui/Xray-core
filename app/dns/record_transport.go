@@ -31,7 +31,7 @@ func (s *TCPNameServer) QueryRecord(ctx context.Context, domain string, qtype ui
 			return nil, errors.New("failed to dial name server").Base(err)
 		}
 		defer conn.Close()
-		return exchangeOverStream(conn, query)
+		return exchangeRecordStream(ctx, conn, query)
 	}, domain, qtype)
 }
 
@@ -44,6 +44,8 @@ func (s *QUICNameServer) QueryRecord(ctx context.Context, domain string, qtype u
 			return nil, errors.New("failed to open QUIC stream").Base(err)
 		}
 		defer stream.Close()
+		stop := context.AfterFunc(ctx, func() { stream.CancelRead(0); stream.CancelWrite(0) })
+		defer stop()
 
 		onWire, id := zeroQUICMessageID(query)
 		response, err := exchangeOverStream(stream, onWire)
@@ -75,7 +77,7 @@ func (s *ClassicNameServer) QueryRecord(ctx context.Context, domain string, qtyp
 			cnc.ConnectionOutputMulti(link.Reader),
 		)
 		defer conn.Close()
-		return exchangeOverStream(conn, query)
+		return exchangeRecordStream(ctx, conn, query)
 	}, domain, qtype)
 }
 
@@ -135,4 +137,16 @@ func exchangeOverStream(conn interface {
 		return nil, errors.New("failed to read record response").Base(err)
 	}
 	return append([]byte(nil), body.Bytes()...), nil
+}
+
+// A bounded record lookup must interrupt the underlying stream, including
+// dispatch-backed connections whose dial path detaches the caller's context.
+func exchangeRecordStream(ctx context.Context, conn net.Conn, query []byte) ([]byte, error) {
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	response, err := exchangeOverStream(conn, query)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return response, err
 }

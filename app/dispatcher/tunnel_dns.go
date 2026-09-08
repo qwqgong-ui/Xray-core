@@ -178,8 +178,13 @@ func answerTunnelDNS(ctx context.Context, query []byte) ([]byte, error) {
 			}
 		}
 	}
-	if bundle {
+	if bundle || question.Qtype == mdns.TypeHTTPS {
 		answer, err = internet.QueryDomainDNS(ctx, question.Name)
+		// Ordinary clients may still use a DNS implementation without bundles,
+		// or retrieve service records when an address lookup is unavailable.
+		if err != nil && !bundle {
+			answer, err = internet.QueryRecordDNS(ctx, question.Name, question.Qtype)
+		}
 	} else {
 		answer, err = internet.QueryRecordDNS(ctx, question.Name, question.Qtype)
 	}
