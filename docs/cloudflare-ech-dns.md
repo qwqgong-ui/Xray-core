@@ -1,5 +1,7 @@
 # Cloudflare ECH supplementation in tunnel DNS
 
+[返回下游功能目录](features.md) · [中文功能说明](features/cloudflare-ech.md)
+
 When the remote DNS lookup returns only real addresses in Cloudflare's official
 proxy ranges, Xray can fill a missing ECH parameter in the HTTPS (TYPE65) answer.
 This is DNS metadata synthesis; it does not rewrite forwarded TLS handshakes or

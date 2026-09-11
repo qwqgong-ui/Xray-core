@@ -1,5 +1,17 @@
 # Project X
 
+## SingleUser 下游功能
+
+本分支在上游 Xray-core 基础上保留的定制功能、使用条件与限制统一记录在 docs：
+
+- [下游功能目录](docs/features.md)：DNS bundle、Cloudflare ECH、Hybrid QUIC、XHTTP 批处理、VLESS MultiBuffer、freedom 零拷贝及 QUIC BBR 调整。
+- [Hybrid QUIC 协议与多跳配置](docs/hybrid-quic.md)。
+- [Cloudflare ECH 补充专题](docs/cloudflare-ech-dns.md)。
+- [本分支构建与依赖补丁](docs/features/build-and-patches.md)：构建、测试前需应用 quic-go 补丁并加载 GOFLAGS。
+
+Xray 自身修改已合入源码；`patches/xray/` 保留历史补丁，正常构建无需重复应用。
+以下保留上游项目介绍与资料。
+
 [Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).
 
 [README](https://github.com/XTLS/Xray-core#readme) is open, so feel free to submit your project [here](https://github.com/XTLS/Xray-core/pulls).
@@ -209,6 +221,8 @@ This distribution contains unmodified official precompiled and pre-signed Wintun
 - Notes: Wintun is an optional runtime-loaded component only used for TUN inbound functionality on supported Windows platforms.
 
 ## One-line Compilation
+
+> SingleUser 请先按[本分支构建说明](docs/features/build-and-patches.md)应用依赖补丁、导出 GOFLAGS，并根据目标 CPU 设置 GOAMD64。以下上游命令不能替代这些准备步骤。
 
 ### Windows (PowerShell)
 

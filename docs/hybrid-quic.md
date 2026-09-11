@@ -1,5 +1,7 @@
 # Hybrid QUIC over proxy streams
 
+[返回下游功能目录](features.md) · [中文功能说明](features/hybrid-quic.md)
+
 Hybrid QUIC uses one ordinary, domain-preserving proxy stream per UDP target.
 The stream opens `hybrid-quic.invalid:443`, carries the real destination and QUIC
 handshake, remains available for fallback, and owns the flow's lifetime. Raw
