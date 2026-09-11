@@ -1,0 +1,67 @@
+diff --git a/mtu_discoverer.go b/mtu_discoverer.go
+index 19d7e72..446a68b 100644
+--- a/mtu_discoverer.go
++++ b/mtu_discoverer.go
+@@ -158,7 +158,12 @@ func (f *mtuFinder) ShouldSendProbe(now monotime.Time) bool {
+ 	if f.inFlight != protocol.InvalidByteCount || f.done() {
+ 		return false
+ 	}
+-	return !now.Before(f.lastProbeTime.Add(mtuProbeDelay * f.rttStats.SmoothedRTT()))
++	delay := mtuProbeDelay * f.rttStats.SmoothedRTT()
++	// Accelerate discovery until the path has confirmed a 1400-byte MTU.
++	if f.min < 1400 {
++		delay = 2 * f.rttStats.SmoothedRTT()
++	}
++	return !now.Before(f.lastProbeTime.Add(delay))
+ }
+ 
+ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+diff --git a/mtu_discoverer_test.go b/mtu_discoverer_test.go
+index c2fc990..309ac82 100644
+--- a/mtu_discoverer_test.go
++++ b/mtu_discoverer_test.go
+@@ -15,11 +15,32 @@ import (
+ 	"github.com/stretchr/testify/require"
+ )
+ 
++func TestMTUDiscovererFastTiming(t *testing.T) {
++	const rtt = 100 * time.Millisecond
++	rttStats := utils.NewRTTStats()
++	rttStats.UpdateRTT(rtt, 0)
++	d := newMTUDiscoverer(rttStats, 1399, 1600, nil)
++	now := monotime.Now()
++	d.Start(now)
++	require.False(t, d.ShouldSendProbe(now.Add(2*rtt-time.Nanosecond)))
++	require.True(t, d.ShouldSendProbe(now.Add(2*rtt)))
++	ping, _ := d.GetPing(now.Add(2*rtt))
++	require.False(t, d.ShouldSendProbe(now.Add(4*rtt)))
++	ping.Handler.OnLost(ping.Frame)
++	require.Equal(t, protocol.ByteCount(1399), d.CurrentSize())
++	require.True(t, d.ShouldSendProbe(now.Add(4*rtt)))
++	ping, _ = d.GetPing(now.Add(4*rtt))
++	ping.Handler.OnAcked(ping.Frame)
++	require.GreaterOrEqual(t, d.CurrentSize(), protocol.ByteCount(1400))
++	require.False(t, d.ShouldSendProbe(now.Add(9*rtt-time.Nanosecond)))
++	require.True(t, d.ShouldSendProbe(now.Add(9*rtt)))
++}
++
+ func TestMTUDiscovererTiming(t *testing.T) {
+ 	const rtt = 100 * time.Millisecond
+ 	rttStats := utils.NewRTTStats()
+ 	rttStats.UpdateRTT(rtt, 0)
+-	d := newMTUDiscoverer(rttStats, 1000, 2000, nil)
++	d := newMTUDiscoverer(rttStats, 1400, 2000, nil)
+ 
+ 	now := monotime.Now()
+ 	require.False(t, d.ShouldSendProbe(now))
+@@ -236,7 +257,7 @@ func testMTUDiscovererReset(t *testing.T, ackLastProbe bool) {
+ 
+ 	// the MTU should not have changed
+ 	require.Equal(t, d.CurrentSize(), newStartMTU)
+-	// the next probe should be sent after 5 RTTs
+-	require.False(t, d.ShouldSendProbe(now.Add(5*rtt).Add(-time.Microsecond)))
+-	require.True(t, d.ShouldSendProbe(now.Add(5*rtt)))
++	// The reset path starts below 1400, so the next probe is sent after 2 RTTs.
++	require.False(t, d.ShouldSendProbe(now.Add(2*rtt).Add(-time.Microsecond)))
++	require.True(t, d.ShouldSendProbe(now.Add(2*rtt)))
+ }

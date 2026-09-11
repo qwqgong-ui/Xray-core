@@ -146,8 +146,8 @@ func configForProfile(profile Profile) profileConfig {
 	case ProfileAggressive:
 		return profileConfig{
 			highGain:                     3.0,
-			highCwndGain:                 2.25,
-			congestionWindowGainConstant: 2.5,
+			highCwndGain:                 2.5,
+			congestionWindowGainConstant: 3.0,
 			numStartupRtts:               4,
 			bytesLostMultiplier:          2,
 			enableAckAggregationStartup:  true,
