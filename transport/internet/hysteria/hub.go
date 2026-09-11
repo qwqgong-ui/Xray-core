@@ -232,8 +232,8 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 				transport.TLSClientConfig.InsecureSkipVerify = true
 			}
 		case "", "unix":
-			u = &url.URL{Scheme: "http", Host: "localhost"}
 			path := u.Path
+			u = &url.URL{Scheme: "http", Host: "localhost"}
 			dialer := &net.Dialer{Timeout: 30 * time.Second}
 			transport = transport.Clone()
 			transport.Proxy = nil
@@ -282,7 +282,6 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 	if quicParams == nil {
 		quicParams = &internet.QuicParams{
 			BbrProfile: string(bbr.ProfileStandard),
-			UdpHop:     &internet.UdpHop{},
 		}
 	}
 
