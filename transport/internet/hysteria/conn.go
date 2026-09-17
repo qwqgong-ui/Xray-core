@@ -82,6 +82,17 @@ type InterConn struct {
 	write func(p []byte) error
 	close func()
 	user  *protocol.MemoryUser
+
+	// reorder is nil unless the session manager restores datagram order.
+	reorderMutex sync.Mutex
+	reorder      *udpReorder
+}
+
+func (c *InterConn) enqueue(d []byte) {
+	select {
+	case c.ch <- d:
+	default:
+	}
 }
 
 func (i *InterConn) User() *protocol.MemoryUser {
@@ -158,13 +169,75 @@ type udpSessionManager struct {
 	addConn        internet.ConnHandler
 	udpIdleTimeout time.Duration
 	user           *protocol.MemoryUser
+	// reorderUDP restores the sender's datagram order in sessions the peer
+	// opens.
+	reorderUDP bool
 }
 
 func (m *udpSessionManager) close(udpConn *InterConn) {
 	if !udpConn.closed {
 		udpConn.closed = true
+		if r := udpConn.reorder; r != nil {
+			udpConn.reorderMutex.Lock()
+			if r.timer != nil {
+				r.timer.Stop()
+				r.timer = nil
+			}
+			r.pending = nil
+			udpConn.reorderMutex.Unlock()
+		}
 		close(udpConn.ch)
 		delete(m.m, udpConn.id)
+	}
+}
+
+// deliver queues a datagram on its session. The caller holds m's lock.
+func (m *udpSessionManager) deliver(udpConn *InterConn, d []byte) {
+	r := udpConn.reorder
+	id, ok := datagramPacketID(d)
+	if r == nil || !ok {
+		udpConn.enqueue(d)
+		return
+	}
+
+	udpConn.reorderMutex.Lock()
+	defer udpConn.reorderMutex.Unlock()
+
+	for _, b := range r.push(id, d) {
+		udpConn.enqueue(b)
+	}
+	switch {
+	case len(r.pending) == 0 && r.timer != nil:
+		r.timer.Stop()
+		r.timer = nil
+	case len(r.pending) > 0 && r.timer == nil:
+		r.gen++
+		gen := r.gen
+		r.timer = time.AfterFunc(udpReorderHold, func() {
+			m.flushReorder(udpConn, gen)
+		})
+	}
+}
+
+// flushReorder gives up on the gaps that pending datagrams are waiting for.
+func (m *udpSessionManager) flushReorder(udpConn *InterConn, gen uint64) {
+	m.RLock()
+	defer m.RUnlock()
+	if udpConn.closed {
+		return
+	}
+
+	udpConn.reorderMutex.Lock()
+	defer udpConn.reorderMutex.Unlock()
+
+	r := udpConn.reorder
+	if r.gen != gen || r.timer == nil {
+		// Stopped or replaced after this timer fired.
+		return
+	}
+	r.timer = nil
+	for _, b := range r.flush() {
+		udpConn.enqueue(b)
 	}
 }
 
@@ -251,10 +324,7 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 	m.RLock()
 	udpConn, ok := m.m[id]
 	if ok {
-		select {
-		case udpConn.ch <- d:
-		default:
-		}
+		m.deliver(udpConn, d)
 		m.RUnlock()
 		return
 	}
@@ -284,12 +354,12 @@ func (m *udpSessionManager) feed(id uint32, d []byte) {
 			m.Unlock()
 		}
 		udpConn.user = m.user
+		if m.reorderUDP {
+			udpConn.reorder = &udpReorder{}
+		}
 		m.m[id] = udpConn
 		m.addConn(udpConn)
 	}
 
-	select {
-	case udpConn.ch <- d:
-	default:
-	}
+	m.deliver(udpConn, d)
 }

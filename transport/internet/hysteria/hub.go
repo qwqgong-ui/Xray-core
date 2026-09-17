@@ -96,6 +96,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 					addConn:        h.addConn,
 					udpIdleTimeout: time.Duration(h.config.UdpIdleTimeout) * time.Second,
 					user:           h.user,
+					reorderUDP:     true,
 				}
 				go udpSM.clean()
 				go udpSM.run()
