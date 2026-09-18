@@ -1,0 +1,317 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 17 Sep 2026 23:40:00 +0900
+Subject: [PATCH] quic: decimate ACKs once path MTU discovery has settled
+
+On a bulk transfer roughly one packet in three is a bare ACK, which is pure overhead on a link metered by packets per second rather than bandwidth. RFC 9000 section 13.2.1 only recommends acking every second ack-eliciting packet, and acking less often stays within the max_ack_delay we advertise, so a peer's loss detection and PTO — which already budget for that delay — see nothing new. Walk the threshold from 2 up to 4 once path MTU discovery reports itself finished and the path stays quiet, and drop straight back to 2 on a missing packet, a reordering report, an ECN-CE mark, or discovery restarting. The gate matters: while discovery is still probing, its PING probes are the ack-eliciting packets whose ACK advances the search. This is receiver-local, so a peer without it simply keeps its own cadence.
+---
+diff --git a/connection.go b/connection.go
+index 0a71b0b..2deffc6 100644
+--- a/connection.go
++++ b/connection.go
+@@ -2170,6 +2170,13 @@ func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encryption
+ 			c.maxPayloadSizeEstimate.Store(uint32(maxPayloadSize))
+ 			c.sentPacketHandler.SetMaxDatagramSize(mtu)
+ 		}
++		// Ack decimation waits for the packet size to stop moving: until then
++		// the probes it would delay are what move it. Asserted on the concrete
++		// finder rather than added to the mtuDiscoverer interface, so a
++		// discoverer that cannot report this simply never unlocks decimation.
++		if f, ok := c.mtuDiscoverer.(*mtuFinder); ok {
++			c.receivedPacketHandler.SetPathSettled(f.done())
++		}
+ 	}
+ 	return c.cryptoStreamHandler.SetLargest1RTTAcked(frame.LargestAcked())
+ }
+diff --git a/internal/ackhandler/ack_decimation_test.go b/internal/ackhandler/ack_decimation_test.go
+new file mode 100644
+index 0000000..0da1e6e
+--- /dev/null
++++ b/internal/ackhandler/ack_decimation_test.go
+@@ -0,0 +1,139 @@
++package ackhandler
++
++import (
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++
++	"github.com/stretchr/testify/require"
++)
++
++// feedQuiet delivers n in-order ack-eliciting packets starting at pn, draining
++// any ACK each one queues, and reports how many ACKs were produced.
++func feedQuiet(t *testing.T, tr *appDataReceivedPacketTracker, pn protocol.PacketNumber, n int) (acks int, next protocol.PacketNumber) {
++	t.Helper()
++	for i := 0; i < n; i++ {
++		require.NoError(t, tr.ReceivedPacket(pn, protocol.ECNNon, monotime.Now(), true))
++		if tr.GetAckFrame(monotime.Now(), true) != nil {
++			acks++
++		}
++		pn++
++	}
++	return acks, pn
++}
++
++// Until path MTU discovery reports itself finished, nothing changes: a peer
++// without the patch, and a patched peer whose path is still being probed, both
++// keep the RFC 9000 every-second-packet cadence.
++func TestAckDecimationStaysOffUntilPathSettles(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++
++	const packets = 10 * packetsPerAckThresholdStep
++	acks, _ := feedQuiet(t, tr, 1, packets)
++	require.Equal(t, packets/packetsBeforeAck, acks)
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++}
++
++// Once the path has settled, the threshold walks up one step at a time and
++// stops at maxPacketsBeforeAck.
++func TestAckDecimationWalksUpAndStops(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++
++	pn := protocol.PacketNumber(1)
++	for want := packetsBeforeAck + 1; want <= maxPacketsBeforeAck; want++ {
++		_, pn = feedQuiet(t, tr, pn, packetsPerAckThresholdStep)
++		require.Equal(t, want, tr.ackThreshold)
++	}
++
++	// Far past the last step, it holds at the ceiling.
++	_, pn = feedQuiet(t, tr, pn, 10*packetsPerAckThresholdStep)
++	require.Equal(t, maxPacketsBeforeAck, tr.ackThreshold)
++
++	// And that is the cadence actually used on the wire.
++	const packets = 4 * packetsPerAckThresholdStep
++	acks, _ := feedQuiet(t, tr, pn, packets)
++	require.Equal(t, packets/maxPacketsBeforeAck, acks)
++}
++
++// A packet the last ACK reported missing means the path is no longer quiet, so
++// the cadence drops straight back to every second packet.
++func TestAckDecimationResetsOnMissingPacket(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++
++	_, pn := feedQuiet(t, tr, 10, packetsPerAckThresholdStep)
++	require.Greater(t, tr.ackThreshold, packetsBeforeAck)
++
++	// Skip one, ack the gap, then let the skipped packet arrive late.
++	skipped := pn
++	_, pn = feedQuiet(t, tr, pn+1, maxPacketsBeforeAck)
++	require.NoError(t, tr.ReceivedPacket(skipped, protocol.ECNNon, monotime.Now(), true))
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++
++	// It has to earn the higher threshold again.
++	_, pn = feedQuiet(t, tr, pn, packetsPerAckThresholdStep-1)
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++}
++
++// Congestion signalled by the network resets it too.
++func TestAckDecimationResetsOnECNCE(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++
++	_, pn := feedQuiet(t, tr, 1, packetsPerAckThresholdStep)
++	require.Greater(t, tr.ackThreshold, packetsBeforeAck)
++
++	require.NoError(t, tr.ReceivedPacket(pn, protocol.ECNCE, monotime.Now(), true))
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++}
++
++// Path MTU discovery restarting — a new path, or a probe failing back down —
++// takes the earned threshold with it.
++func TestAckDecimationResetsWhenPathUnsettles(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++
++	_, pn := feedQuiet(t, tr, 1, packetsPerAckThresholdStep)
++	require.Greater(t, tr.ackThreshold, packetsBeforeAck)
++
++	tr.SetPathSettled(false)
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++
++	// Still pinned to the default however long it stays quiet.
++	_, _ = feedQuiet(t, tr, pn, 2*packetsPerAckThresholdStep)
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++}
++
++// Decimation must never delay an ACK past the max_ack_delay we advertised:
++// that bound is what every peer's loss detection and PTO already budget for,
++// and is why acking less often is safe against an unpatched sender.
++func TestAckDecimationKeepsMaxAckDelay(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++	_, pn := feedQuiet(t, tr, 1, packetsPerAckThresholdStep*(maxPacketsBeforeAck-packetsBeforeAck))
++	require.Equal(t, maxPacketsBeforeAck, tr.ackThreshold)
++
++	// Land on an ACK boundary so the packet counter is back at zero.
++	for tr.GetAckFrame(monotime.Now(), true) == nil {
++		require.NoError(t, tr.ReceivedPacket(pn, protocol.ECNNon, monotime.Now(), true))
++		pn++
++	}
++
++	// Short of the threshold no ACK is queued, but the alarm stays armed at
++	// max_ack_delay from the most recent packet.
++	now := monotime.Now()
++	for i := 0; i < maxPacketsBeforeAck-1; i++ {
++		now = now.Add(time.Millisecond)
++		require.NoError(t, tr.ReceivedPacket(pn, protocol.ECNNon, now, true))
++		require.Nil(t, tr.GetAckFrame(now, true))
++		require.Equal(t, now.Add(protocol.MaxAckDelay), tr.GetAlarmTimeout())
++		pn++
++	}
++
++	// The alarm fires on time and produces the ACK.
++	require.NotNil(t, tr.GetAckFrame(now.Add(protocol.MaxAckDelay), true))
++}
+diff --git a/internal/ackhandler/received_packet_handler.go b/internal/ackhandler/received_packet_handler.go
+index 57ebb5a..e6b88c2 100644
+--- a/internal/ackhandler/received_packet_handler.go
++++ b/internal/ackhandler/received_packet_handler.go
+@@ -62,6 +62,12 @@ func (h *ReceivedPacketHandler) IgnorePacketsBelow(pn protocol.PacketNumber) {
+ 	h.appDataPackets.IgnoreBelow(pn)
+ }
+ 
++// SetPathSettled reports whether path MTU discovery has finished, which gates
++// ack decimation in the Application Data packet number space.
++func (h *ReceivedPacketHandler) SetPathSettled(settled bool) {
++	h.appDataPackets.SetPathSettled(settled)
++}
++
+ func (h *ReceivedPacketHandler) DropPackets(encLevel protocol.EncryptionLevel) {
+ 	//nolint:exhaustive // 1-RTT packet number space is never dropped.
+ 	switch encLevel {
+diff --git a/internal/ackhandler/received_packet_tracker.go b/internal/ackhandler/received_packet_tracker.go
+index 54c047b..1033ef8 100644
+--- a/internal/ackhandler/received_packet_tracker.go
++++ b/internal/ackhandler/received_packet_tracker.go
+@@ -78,6 +78,28 @@ func (h *receivedPacketTracker) IsPotentiallyDuplicate(pn protocol.PacketNumber)
+ // number of ack-eliciting packets received before sending an ACK
+ const packetsBeforeAck = 2
+ 
++// Ack decimation. RFC 9000 section 13.2.1 only says a receiver SHOULD ack every
++// second ack-eliciting packet, and acking less often costs nothing in
++// correctness: an ACK still arrives within the max_ack_delay we advertised, so
++// a peer's loss detection and PTO — both of which already budget for
++// max_ack_delay — see nothing new. What it buys is packets. On a bulk transfer
++// roughly one packet in three is a bare ACK, and on a link metered by packets
++// per second rather than bandwidth those are pure overhead.
++//
++// The cost is feedback granularity, so decimation waits for a path that has
++// stopped changing: path MTU discovery finished, and quiet packets since. While
++// discovery is still probing, its PING probes are exactly the ack-eliciting
++// packets whose ACK advances the search, so delaying those would slow the climb
++// we are decimating on behalf of.
++const (
++	// the largest threshold decimation will walk up to
++	maxPacketsBeforeAck = 4
++	// consecutive undisturbed ack-eliciting packets before raising the
++	// threshold by one, so a brief quiet spell in an otherwise lossy flow does
++	// not earn it
++	packetsPerAckThresholdStep = 100
++)
++
+ // The appDataReceivedPacketTracker tracks packets received in the Application Data packet number space.
+ // It waits until at least 2 packets were received before queueing an ACK, or until the max_ack_delay was reached.
+ type appDataReceivedPacketTracker struct {
+@@ -94,6 +116,11 @@ type appDataReceivedPacketTracker struct {
+ 	ackElicitingPacketsReceivedSinceLastAck int
+ 	ackAlarm                                monotime.Time
+ 
++	// ack decimation state
++	pathSettled           bool // path MTU discovery has finished
++	ackThreshold          int  // current threshold, never below packetsBeforeAck
++	quietPacketsSinceStep int
++
+ 	logger utils.Logger
+ }
+ 
+@@ -101,11 +128,47 @@ func newAppDataReceivedPacketTracker(logger utils.Logger) *appDataReceivedPacket
+ 	h := &appDataReceivedPacketTracker{
+ 		receivedPacketTracker: *newReceivedPacketTracker(),
+ 		maxAckDelay:           protocol.MaxAckDelay,
++		ackThreshold:          packetsBeforeAck,
+ 		logger:                logger,
+ 	}
+ 	return h
+ }
+ 
++// SetPathSettled reports whether path MTU discovery has finished. Decimation is
++// only allowed while it has; a reset of discovery (a new path, or a probe
++// failing back down) takes the threshold with it.
++func (h *appDataReceivedPacketTracker) SetPathSettled(settled bool) {
++	if h.pathSettled == settled {
++		return
++	}
++	h.pathSettled = settled
++	if !settled {
++		h.resetAckThreshold()
++	}
++}
++
++func (h *appDataReceivedPacketTracker) resetAckThreshold() {
++	h.ackThreshold = packetsBeforeAck
++	h.quietPacketsSinceStep = 0
++}
++
++// recordQuietPacket counts an ack-eliciting packet that arrived with nothing
++// wrong, and steps the threshold up once enough of them have.
++func (h *appDataReceivedPacketTracker) recordQuietPacket() {
++	if !h.pathSettled || h.ackThreshold >= maxPacketsBeforeAck {
++		return
++	}
++	h.quietPacketsSinceStep++
++	if h.quietPacketsSinceStep < packetsPerAckThresholdStep {
++		return
++	}
++	h.ackThreshold++
++	h.quietPacketsSinceStep = 0
++	if h.logger.Debug() {
++		h.logger.Debugf("\tRaising the ACK threshold to %d packets.", h.ackThreshold)
++	}
++}
++
+ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn protocol.ECN, rcvTime monotime.Time, ackEliciting bool) error {
+ 	if err := h.receivedPacketTracker.ReceivedPacket(pn, ecn, ackEliciting); err != nil {
+ 		return err
+@@ -119,6 +182,14 @@ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber,
+ 	}
+ 	h.ackElicitingPacketsReceivedSinceLastAck++
+ 	isMissing := h.isMissing(pn)
++	if isMissing || ecn == protocol.ECNCE {
++		// The path is no longer quiet. Go back to acking every second packet
++		// until it has been quiet again for a while. shouldQueueACK resets the
++		// threshold for reordering too, but it only runs while no ACK is queued.
++		h.resetAckThreshold()
++	} else {
++		h.recordQuietPacket()
++	}
+ 	if !h.ackQueued && h.shouldQueueACK(pn, ecn, isMissing) {
+ 		h.ackQueued = true
+ 		h.ackAlarm = 0 // cancel the ack alarm
+@@ -183,10 +254,10 @@ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber,
+ 		return true
+ 	}
+ 
+-	// send an ACK every 2 ack-eliciting packets
+-	if h.ackElicitingPacketsReceivedSinceLastAck >= packetsBeforeAck {
++	// send an ACK every ackThreshold ack-eliciting packets
++	if h.ackElicitingPacketsReceivedSinceLastAck >= h.ackThreshold {
+ 		if h.logger.Debug() {
+-			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, packetsBeforeAck)
++			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, h.ackThreshold)
+ 		}
+ 		return true
+ 	}
+@@ -194,6 +265,7 @@ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber,
+ 	// queue an ACK if there are new missing packets to report
+ 	if h.hasNewMissingPackets() {
+ 		h.logger.Debugf("\tQueuing ACK because there's a new missing packet to report.")
++		h.resetAckThreshold()
+ 		return true
+ 	}
+ 
