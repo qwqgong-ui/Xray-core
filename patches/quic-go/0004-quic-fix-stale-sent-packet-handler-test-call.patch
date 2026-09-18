@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 17 Sep 2026 23:40:00 +0900
+Subject: [PATCH] quic: fix stale NewSentPacketHandler call in the ECN test
+
+NewSentPacketHandler grew a shortPacketNumbers argument upstream, which left ecn_feedback_test.go from patch 0001 uncompilable and took the whole internal/ackhandler test binary with it.
+---
+diff --git a/internal/ackhandler/ecn_feedback_test.go b/internal/ackhandler/ecn_feedback_test.go
+index 35dbc3d..9ed045e 100644
+--- a/internal/ackhandler/ecn_feedback_test.go
++++ b/internal/ackhandler/ecn_feedback_test.go
+@@ -92,6 +92,7 @@ func TestSentPacketHandlerForwardsValidatedACKECNDeltas(t *testing.T) {
+ 		true,
+ 		nil,
+ 		protocol.PerspectiveClient,
++		false,
+ 		nil,
+ 		utils.DefaultLogger,
+ 	).(*sentPacketHandler)
+@@ -131,6 +132,7 @@ func TestPathMigrationRevalidatesECNAndKeepsAwareController(t *testing.T) {
+ 		true,
+ 		nil,
+ 		protocol.PerspectiveClient,
++		false,
+ 		nil,
+ 		utils.DefaultLogger,
+ 	).(*sentPacketHandler)
