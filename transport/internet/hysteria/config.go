@@ -21,9 +21,25 @@ const (
 	CommonHeaderPadding       = "Hysteria-Padding"
 	StatusAuthOK              = 233
 	FrameTypeTCPRequest       = 0x401
-	MaxDatagramFrameSize      = 1200
-	udpMessageChanSize        = 1024
-	idleCleanupInterval       = 1 * time.Second
+	// MaxDatagramFrameSize is the max_datagram_frame_size we advertise, the
+	// value we assume for peers that omit the parameter, and the size of the
+	// buffer UDPReader.ReadFrom reads into. Official hysteria v2.8.2 pins it at
+	// 1200, which caps every relayed UDP datagram at 1197 bytes however large
+	// the path MTU turns out to be: on a 1441-byte path each full-size inner
+	// datagram then splits in two, doubling the packet rate for the same bytes.
+	// 1452 is the largest QUIC packet quic-go will ever build, so a DATAGRAM
+	// frame cannot exceed it either; advertising it hands the bound back to
+	// path MTU discovery instead of a constant.
+	//
+	// Raising it is one-way compatible for what we receive: a peer only sends
+	// larger datagrams once we advertise that we accept them. What we send is
+	// bounded by the peer's own advertised value, except for peers that omit it
+	// and fall to AssumePeerMaxDatagramFrameSize below — Xray clients do, from
+	// the OmitMaxDatagramFrameSize date in dialer.go. Those peers must carry
+	// this constant too, or they will silently truncate us in ReadFrom.
+	MaxDatagramFrameSize = 1452
+	udpMessageChanSize   = 1024
+	idleCleanupInterval  = 1 * time.Second
 )
 
 const (
