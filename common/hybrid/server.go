@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+// rawStale is how long a binding survives without a raw packet from the
+// client. Past it the flow answers on the stream and a NAT that remapped the
+// client may bind a new tuple. It is well past the client's own silence
+// timeout, so it never races the client's own fallback.
+const rawStale = 60 * time.Second
+
 type Target interface {
 	WritePacket([]byte) error
 	ReadPacket() ([]byte, error)
@@ -34,7 +40,9 @@ type flow struct {
 	target    Target
 	peer      netip.Addr
 	tuple     netip.AddrPort
+	lastRaw   time.Time
 	disabled  bool
+	paused    bool
 	cids      []string
 	writeMu   sync.Mutex
 	closeOnce sync.Once
@@ -79,6 +87,7 @@ func (s *Server) HandleRaw(p []byte, addr net.Addr) bool {
 		return false
 	}
 	a = netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
+	now := time.Now()
 	s.mu.Lock()
 	f := s.tuples[a]
 	if f == nil {
@@ -92,9 +101,15 @@ func (s *Server) HandleRaw(p []byte, addr net.Addr) bool {
 				f = candidate
 			}
 		}
-		if f == nil || f.disabled || f.peer != a.Addr() || (f.tuple.IsValid() && f.tuple != a) {
+		// A bound tuple only gives way once it has gone quiet for rawStale:
+		// that is a NAT that remapped the client, not a second live path
+		// claiming the same flow.
+		if f == nil || f.disabled || f.peer != a.Addr() || (f.tuple.IsValid() && f.tuple != a && now.Sub(f.lastRaw) < rawStale) {
 			s.mu.Unlock()
 			return false
+		}
+		if s.tuples[f.tuple] == f {
+			delete(s.tuples, f.tuple)
 		}
 		f.tuple = a
 		s.tuples[a] = f
@@ -103,6 +118,10 @@ func (s *Server) HandleRaw(p []byte, addr net.Addr) bool {
 		s.mu.Unlock()
 		return false
 	}
+	// Raw from the client proves the path and lifts a pause: a client that
+	// fell back to the stream resumes raw by sending on it again.
+	f.paused = false
+	f.lastRaw = now
 	target := f.target
 	s.mu.Unlock()
 	// A blocked destination must not stall the shared listener. The target
@@ -136,6 +155,16 @@ func (s *Server) claim(f *flow, cid string) {
 	}
 	s.cids[cid] = f
 	f.cids = append(f.cids, cid)
+}
+
+// pause stops sending raw downstream without giving the flow up. The binding
+// and the claimed CIDs stay, so the client's next raw packet resumes it; a
+// client that never sends raw again leaves the flow on the stream for good.
+func (f *flow) pause() {
+	s := f.server
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f.paused = true
 }
 func (f *flow) disable() {
 	s := f.server
@@ -226,7 +255,7 @@ func (s *Server) Serve(ctx context.Context, stream io.ReadWriteCloser, peer neti
 			continue
 		}
 		if len(p) == 0 {
-			f.disable()
+			f.pause()
 			continue
 		}
 		if dcid, _, ok := LongCIDs(p); ok {
@@ -249,7 +278,7 @@ func (f *flow) readTarget() {
 		}
 		s := f.server
 		s.mu.Lock()
-		raw := !f.disabled && f.tuple.IsValid() && Short(p)
+		raw := !f.disabled && !f.paused && f.tuple.IsValid() && time.Since(f.lastRaw) < rawStale && Short(p)
 		tuple := f.tuple
 		conn := s.conn
 		s.mu.Unlock()

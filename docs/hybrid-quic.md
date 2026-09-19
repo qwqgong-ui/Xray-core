@@ -116,24 +116,35 @@ Once accepted, a flow never changes its target connection.
 Subsequent frames have a big-endian uint16 prefix:
 
 - 1..65507: that many bytes of one unchanged datagram.
-- 0: permanently disable raw in both directions for this stream.
+- 0: from the client, stop sending raw downstream; from the server, raw is
+  permanently dead on its side.
 - 65535: keepalive, sent every 30 seconds while the stream exists.
 - Other lengths: invalid; close the stream.
 
 All non-short-header packets stay on the stream, including Retry and Version
 Negotiation. Short packets initially use the stream, plus one raw probe at most
-every 250 ms. No raw reply within three seconds permanently disables raw. A raw
-write/read failure, or 15 seconds without a raw reply after activation, also
-permanently disables it. The watchdog runs independently of new application
-writes. An idle flow can therefore lose raw acceleration after 15 seconds;
-it continues on the stream. The server notifies the client on raw socket failure.
+every 250 ms. No raw reply within three seconds, or 15 seconds without a raw
+reply after activation, returns the flow to the stream. The watchdog runs
+independently of new application writes, so an idle flow loses raw acceleration
+after 15 seconds. A raw write/read failure gives raw up for the life of the
+flow. The server notifies the client on raw socket failure.
 
-A disable frame deletes raw tuple/CID claims; late raw replies cannot reactivate
-the client, and late raw requests cannot rebind the server. Packets already in
-flight may be lost; application QUIC retransmits. There is no automatic recovery
-or re-registration. Stream EOF/cancellation closes the target and removes all
-bindings, including flows that never used raw. Keepalives prevent intermediate
-proxy idle timers from reclaiming a stream carrying raw traffic.
+Returning to the stream is not the end of raw. A flow that was carrying nothing
+when raw went quiet keeps its binding and probes again on its next packet; one
+that was busy sends the zero-length frame first, then probes again after 30
+seconds, doubling to at most 10 minutes and giving raw up after eight attempts.
+A raw packet that arrives in the meantime resumes the flow with no probe at all.
+The client's zero-length frame keeps the tuple and the CID claims, so the
+client's next raw packet resumes raw in both directions; only a raw failure on
+either side, or a client that has given up, is permanent. Packets already in
+flight may be lost; application QUIC retransmits.
+
+A binding that has seen no raw packet for 60 seconds stops carrying downstream
+traffic and may be taken over by the same client from a different port, which is
+how a flow survives a NAT remapping it across an idle period. Stream
+EOF/cancellation closes the target and removes all bindings, including flows
+that never used raw. Keepalives prevent intermediate proxy idle timers from
+reclaiming a stream carrying raw traffic.
 
 Zero-length or ambiguous CIDs cannot bind. CID ownership and the original source
 IP constrain raw demultiplexing; the relay does not decrypt or authenticate QUIC
