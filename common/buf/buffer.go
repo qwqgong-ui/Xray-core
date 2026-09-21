@@ -156,6 +156,19 @@ func (b *Buffer) Extend(n int32) []byte {
 	return ext
 }
 
+// ExtendFilled increases the buffer size by n bytes that the caller has
+// already written past the content, typically with one datagram read into
+// BytesTo(Size) of an empty buffer. Unlike Extend it does not zero them first,
+// so a packet read costs no clearing of the space the packet did not use.
+// It panics if result size is larger than size of this buffer.
+func (b *Buffer) ExtendFilled(n int32) {
+	end := b.end + n
+	if n < 0 || end > int32(len(b.v)) {
+		panic("extending out of bound")
+	}
+	b.end = end
+}
+
 // BytesRange returns a slice of this buffer with given from and to boundary.
 func (b *Buffer) BytesRange(from, to int32) []byte {
 	if from < 0 {

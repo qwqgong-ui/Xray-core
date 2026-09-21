@@ -286,13 +286,13 @@ func (r *UDPReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
 		return mb, nil
 	}
 	b := buf.New()
-	b.Resize(0, buf.Size)
-	n, addr, err := r.ReadFrom(b.Bytes())
+	// Resizing to buf.Size first would zero the whole buffer per datagram.
+	n, addr, err := r.ReadFrom(b.BytesTo(buf.Size))
 	if err != nil {
 		b.Release()
 		return nil, err
 	}
-	b.Resize(0, int32(n))
+	b.ExtendFilled(int32(n))
 	b.UDP = addr
 	return buf.MultiBuffer{b}, nil
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/xtls/xray-core/transport"
 	"github.com/xtls/xray-core/transport/internet"
 	"github.com/xtls/xray-core/transport/internet/stat"
+	"golang.org/x/net/ipv4"
 )
 
 var (
@@ -479,7 +480,7 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 			isOverridden = true
 		}
 
-		return &PacketReader{
+		r := &PacketReader{
 			PacketConnWrapper: c,
 			Counter:           counter,
 			Handler:           h,
@@ -488,9 +489,18 @@ func NewPacketReader(conn net.Conn, h *Handler, defaultRule *FinalRule, UDPOverr
 			InitUnchangedAddr: DialDest.Address,
 			InitChangedAddr:   net.DestinationFromAddr(conn.RemoteAddr()).Address,
 		}
+		if uc, ok := c.PacketConn.(*net.UDPConn); ok {
+			r.batch = ipv4.NewPacketConn(uc)
+		}
+		return r
 	}
 	return &buf.PacketReader{Reader: conn}
 }
+
+// packetBatch bounds the datagrams one ReadMultiBuffer takes. A busy flow
+// queues several between two wakeups of its reader, and recvmmsg hands them
+// over in one system call instead of one call each.
+const packetBatch = 16
 
 type PacketReader struct {
 	*internet.PacketConnWrapper
@@ -500,41 +510,98 @@ type PacketReader struct {
 	IsOverridden      bool
 	InitUnchangedAddr net.Address
 	InitChangedAddr   net.Address
+
+	batch *ipv4.PacketConn // recvmmsg on the same socket; nil unless it is a plain UDP socket
+	msgs  []ipv4.Message
+	bufs  [packetBatch]*buf.Buffer // read targets not yet handed out
 }
 
 func (r *PacketReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	if r.batch != nil {
+		return r.readBatch()
+	}
 	b := buf.New()
-	b.Resize(0, buf.Size)
 	for {
-		n, d, err := r.PacketConnWrapper.ReadFrom(b.Bytes())
+		// Read straight into the pooled buffer: Resize or Extend to buf.Size
+		// would first zero all of it, once per datagram.
+		n, d, err := r.PacketConnWrapper.ReadFrom(b.BytesTo(buf.Size))
 		if err != nil {
 			b.Release()
 			return nil, err
 		}
-		udpAddr := d.(*net.UDPAddr)
-		sourceAddr := net.IPAddress(udpAddr.IP)
-		if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
-			continue
+		if r.accept(b, n, d) {
+			return buf.MultiBuffer{b}, nil
 		}
-		b.Resize(0, int32(n))
-
-		// if udp dest addr is changed, we are unable to get the correct src addr
-		// so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
-		if !r.IsOverridden {
-			if r.InitChangedAddr == sourceAddr {
-				sourceAddr = r.InitUnchangedAddr
-			}
-			b.UDP = &net.Destination{
-				Address: sourceAddr,
-				Port:    net.Port(udpAddr.Port),
-				Network: net.Network_UDP,
-			}
-		}
-		if r.Counter != nil {
-			r.Counter.Add(int64(n))
-		}
-		return buf.MultiBuffer{b}, nil
 	}
+}
+
+// readBatch waits for a datagram like a single read does, then returns every
+// one the socket holds at that moment, up to packetBatch.
+func (r *PacketReader) readBatch() (buf.MultiBuffer, error) {
+	if r.msgs == nil {
+		r.msgs = make([]ipv4.Message, packetBatch)
+		for i := range r.msgs {
+			r.msgs[i].Buffers = make([][]byte, 1)
+		}
+	}
+	for {
+		for i := range r.msgs {
+			if r.bufs[i] == nil {
+				r.bufs[i] = buf.New()
+			}
+			r.msgs[i].Buffers[0] = r.bufs[i].BytesTo(buf.Size)
+		}
+		n, err := r.batch.ReadBatch(r.msgs, 0)
+		if err != nil {
+			for i, b := range r.bufs {
+				b.Release()
+				r.bufs[i] = nil
+			}
+			return nil, err
+		}
+		mb := make(buf.MultiBuffer, 0, n)
+		for i := range n {
+			if r.accept(r.bufs[i], r.msgs[i].N, r.msgs[i].Addr) {
+				mb = append(mb, r.bufs[i])
+				r.bufs[i] = nil
+			}
+		}
+		if len(mb) > 0 {
+			return mb, nil
+		}
+	}
+}
+
+// accept completes b with the n bytes a datagram from d wrote past its end.
+// It reports false, leaving b empty for the next read, for a datagram that a
+// final rule blocks.
+func (r *PacketReader) accept(b *buf.Buffer, n int, d net.Addr) bool {
+	udpAddr, ok := d.(*net.UDPAddr)
+	if !ok {
+		return false
+	}
+	sourceAddr := net.IPAddress(udpAddr.IP)
+	if rule := r.Handler.matchFinalRule(net.Network_UDP, sourceAddr, net.Port(udpAddr.Port), r.DefaultRule); rule != nil && rule.action == RuleAction_Block {
+		return false
+	}
+	b.ExtendFilled(int32(n))
+
+	// if udp dest addr is changed, we are unable to get the correct src addr
+	// so we don't attach src info to udp packet, break cone behavior, assuming the dial dest is the expected scr addr
+	if !r.IsOverridden {
+		if r.InitChangedAddr == sourceAddr {
+			sourceAddr = r.InitUnchangedAddr
+		}
+		b.UDP = &net.Destination{
+			Address: sourceAddr,
+			Port:    net.Port(udpAddr.Port),
+			Network: net.Network_UDP,
+		}
+	}
+	if r.Counter != nil {
+		r.Counter.Add(int64(n))
+	}
+	return true
 }
 
 // DialDest means the dial target used in the dialer when creating conn

@@ -106,13 +106,12 @@ func (s *Server) Process(ctx context.Context, network net.Network, conn stat.Con
 		}
 
 		b := buf.New()
-		b.Resize(0, buf.Size)
-		n, addr, err := reader.ReadFrom(b.Bytes())
+		n, addr, err := reader.ReadFrom(b.BytesTo(buf.Size))
 		if err != nil {
 			b.Release()
 			return err
 		}
-		b.Resize(0, int32(n))
+		b.ExtendFilled(int32(n))
 		b.UDP = addr
 
 		reader.firstBuf = b
