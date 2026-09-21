@@ -4,7 +4,8 @@ import (
 	"context"
 	go_errors "errors"
 	"io"
-	"math/rand"
+	"math"
+	"sync/atomic"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common"
@@ -177,7 +178,20 @@ func init() {
 type UDPWriter struct {
 	writer io.Writer
 	addr   string
-	buf    [buf.Size]byte
+	// packetID numbers this session's messages so the peer can tell the order
+	// it sent them in. A path that reorders back-to-back packets is otherwise
+	// indistinguishable from loss to whatever the datagrams carry: QUIC knows
+	// the order its own packets went out in, but RFC 9221 datagrams are
+	// delivered as they arrive and that order is never restored.
+	//
+	// Counted the way sing-quic does: modulo 65535 starting at 1, so 0xFFFF is
+	// never sent. Fragments of one message share its ID, as the protocol needs.
+	packetID atomic.Uint32
+	buf      [buf.Size]byte
+}
+
+func (w *UDPWriter) nextPacketID() uint16 {
+	return uint16(w.packetID.Add(1) % math.MaxUint16)
 }
 
 func (w *UDPWriter) SendMessage(msg *UDPMessage) error {
@@ -198,7 +212,7 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 
 		msg := &UDPMessage{
 			SessionID: 0,
-			PacketID:  0,
+			PacketID:  w.nextPacketID(),
 			FragID:    0,
 			FragCount: 1,
 			Addr:      addr,
@@ -208,7 +222,6 @@ func (w *UDPWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
 		err := w.SendMessage(msg)
 		var errTooLarge *quic.DatagramTooLargeError
 		if go_errors.As(err, &errTooLarge) {
-			msg.PacketID = uint16(rand.Intn(0xFFFF)) + 1
 			fMsgs := FragUDPMessage(msg, int(errTooLarge.MaxDatagramPayloadSize))
 			for _, fMsg := range fMsgs {
 				err := w.SendMessage(&fMsg)

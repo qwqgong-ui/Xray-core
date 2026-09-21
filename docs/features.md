@@ -23,7 +23,7 @@ freedom 解析流程调整、Go 1.27 等变化不作为本分支原创功能列�
 - [XHTTP 上行已就绪数据批处理（Ready MultiBuffer Uplink）](features/xhttp-uplink.md)
 - [VLESS 加密层保留批次（Encrypted MultiBuffer Writes）](features/vless-multibuffer.md)
 - [Linux freedom TCP 零拷贝写入（MSG_ZEROCOPY）](features/freedom-zerocopy.md)
-- [HY2 服务端 UDP 乱序恢复（UDP Reorder）](features/hy2-udp-reorder.md)
+- [HY2 UDP 乱序恢复与数据报编号（UDP Reorder）](features/hy2-udp-reorder.md)
 
 ## QUIC 拥塞控制与构建
 
