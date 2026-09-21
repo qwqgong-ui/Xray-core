@@ -30,7 +30,7 @@ raw 仅面向公网 UDP 443 目标。客户端应保持隧道源 IP 与 raw 源 
 ## 实现入口
 
 - [dispatcher 配置、路由与多跳处理](../../app/dispatcher/hybrid.go)
-- [终端 raw 中继](../../common/hybrid/server.go)、[协议帧](../../common/hybrid/wire.go)
+- [终端 raw 中继](../../common/hybrid/server.go)、[raw 批量发送](../../common/hybrid/raw.go)、[协议帧](../../common/hybrid/wire.go)
 - [HY2 socket 共享](../../common/hybrid/shared.go)、[配置解析](../../infra/conf/xray.go)
 
 本页依据当前实现说明能力，不将历史 HQV3 测试数据视为当前 HQS1 多跳部署验证。

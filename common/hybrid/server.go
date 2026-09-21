@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -18,7 +19,10 @@ const rawStale = 60 * time.Second
 
 type Target interface {
 	WritePacket([]byte) error
-	ReadPacket() ([]byte, error)
+	// ReadPackets waits for the target's next datagram and returns it with
+	// every other one already queued, in order. The slices stay valid until
+	// the next call.
+	ReadPackets() ([][]byte, error)
 	Close() error
 }
 type Dial func(context.Context, string) (Target, netip.AddrPort, error)
@@ -33,6 +37,7 @@ type Server struct {
 	cids       map[string]*flow
 	tuples     map[netip.AddrPort]*flow
 	closed     bool
+	gso        atomic.Bool // the raw socket takes UDP_SEGMENT
 }
 type flow struct {
 	server    *Server
@@ -62,6 +67,7 @@ func (s *Server) Attach(conn net.PacketConn) error {
 		return errors.New("hybrid: raw socket already attached")
 	}
 	s.conn = conn
+	s.gso.Store(gsoSupported(conn))
 	return nil
 }
 func (s *Server) ReadRaw(conn net.PacketConn) {
@@ -82,9 +88,14 @@ func (s *Server) HandleRaw(p []byte, addr net.Addr) bool {
 	if !Short(p) {
 		return false
 	}
-	a, err := netip.ParseAddrPort(addr.String())
-	if err != nil {
-		return false
+	var a netip.AddrPort
+	if u, ok := addr.(*net.UDPAddr); ok {
+		a = u.AddrPort()
+	} else {
+		var err error
+		if a, err = netip.ParseAddrPort(addr.String()); err != nil {
+			return false
+		}
 	}
 	a = netip.AddrPortFrom(a.Addr().Unmap(), a.Port())
 	now := time.Now()
@@ -268,31 +279,45 @@ func (s *Server) Serve(ctx context.Context, stream io.ReadWriteCloser, peer neti
 }
 func (f *flow) readTarget() {
 	defer f.close()
+	s := f.server
 	for {
-		p, err := f.target.ReadPacket()
+		ps, err := f.target.ReadPackets()
 		if err != nil {
 			return
 		}
-		if _, scid, ok := LongCIDs(p); ok {
-			f.server.claim(f, scid)
-		}
-		s := f.server
-		s.mu.Lock()
-		raw := !f.disabled && !f.paused && f.tuple.IsValid() && time.Since(f.lastRaw) < rawStale && Short(p)
-		tuple := f.tuple
-		conn := s.conn
-		s.mu.Unlock()
-		if raw && conn != nil {
-			if _, err = conn.WriteTo(p, net.UDPAddrFromAddrPort(tuple)); err == nil {
-				continue
+		for _, p := range ps {
+			if _, scid, ok := LongCIDs(p); ok {
+				s.claim(f, scid)
 			}
-			f.disable()
-			if f.send(nil) != nil {
+		}
+		// One look at the binding serves the whole batch.
+		s.mu.Lock()
+		conn := s.conn
+		raw := conn != nil && !f.disabled && !f.paused && f.tuple.IsValid() && time.Since(f.lastRaw) < rawStale
+		tuple := f.tuple
+		s.mu.Unlock()
+		for len(ps) > 0 {
+			// The short-header packets at the front go out raw together.
+			n := 0
+			for raw && n < len(ps) && Short(ps[n]) {
+				n++
+			}
+			if n > 0 {
+				sent, err := s.writeRaw(conn, tuple, ps[:n])
+				ps = ps[sent:]
+				if err == nil {
+					continue
+				}
+				raw = false
+				f.disable()
+				if f.send(nil) != nil {
+					return
+				}
+			}
+			if f.send(ps[0]) != nil {
 				return
 			}
-		}
-		if f.send(p) != nil {
-			return
+			ps = ps[1:]
 		}
 	}
 }

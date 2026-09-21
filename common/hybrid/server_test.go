@@ -26,10 +26,18 @@ func (t *fakeTarget) WritePacket(p []byte) error {
 	}
 }
 
-func (t *fakeTarget) ReadPacket() ([]byte, error) {
+func (t *fakeTarget) ReadPackets() ([][]byte, error) {
 	select {
 	case p := <-t.down:
-		return p, nil
+		ps := [][]byte{p}
+		for {
+			select {
+			case p := <-t.down:
+				ps = append(ps, p)
+			default:
+				return ps, nil
+			}
+		}
 	case <-t.done:
 		return nil, io.EOF
 	}

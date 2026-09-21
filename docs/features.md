@@ -24,6 +24,7 @@ freedom 解析流程调整、Go 1.27 等变化不作为本分支原创功能列�
 - [VLESS 加密层保留批次（Encrypted MultiBuffer Writes）](features/vless-multibuffer.md)
 - [Linux freedom TCP 零拷贝写入（MSG_ZEROCOPY）](features/freedom-zerocopy.md)
 - [HY2 UDP 乱序恢复与数据报编号（UDP Reorder）](features/hy2-udp-reorder.md)
+- [UDP 中继批量收发（UDP Relay Batching）](features/udp-relay-batching.md)
 
 ## QUIC 拥塞控制与构建
 

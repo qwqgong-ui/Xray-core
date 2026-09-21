@@ -227,18 +227,19 @@ func (d *DefaultDispatcher) dialHybrid(ctx context.Context, address string, hand
 	ob.Tag = handler.Tag()
 	link, out := d.getLink(ctx)
 	go handler.Dispatch(ctx, out)
-	t := &hybridTarget{link: link, cancel: cancel, queue: make(chan []byte, 64), done: make(chan struct{})}
+	t := &hybridTarget{link: link, cancel: cancel, queue: make(chan *buf.Buffer, 64), done: make(chan struct{})}
 	go t.writeLoop()
 	return t, resolved, nil
 }
 
 type hybridTarget struct {
-	link    *transport.Link
-	cancel  context.CancelFunc
-	queue   chan []byte
-	done    chan struct{}
-	once    sync.Once
-	pending [][]byte
+	link   *transport.Link
+	cancel context.CancelFunc
+	queue  chan *buf.Buffer
+	done   chan struct{}
+	once   sync.Once
+	held   buf.MultiBuffer // behind the slices ReadPackets returned last
+	out    [][]byte
 }
 
 func (t *hybridTarget) WritePacket(p []byte) error {
@@ -247,11 +248,22 @@ func (t *hybridTarget) WritePacket(p []byte) error {
 		return io.ErrClosedPipe
 	default:
 	}
+	// p belongs to the shared socket's reader: copy it once, into a pooled
+	// buffer that the pipe and the outbound can then pass along as is.
+	var b *buf.Buffer
+	if len(p) <= buf.Size {
+		b = buf.New()
+	} else {
+		b = buf.NewWithSize(int32(len(p)))
+	}
+	b.Write(p)
 	select {
-	case t.queue <- append([]byte(nil), p...):
+	case t.queue <- b:
 	case <-t.done:
+		b.Release()
 		return io.ErrClosedPipe
 	default: /* bounded UDP queue; QUIC retransmits */
+		b.Release()
 	}
 	return nil
 }
@@ -259,33 +271,56 @@ func (t *hybridTarget) writeLoop() {
 	for {
 		select {
 		case <-t.done:
-			return
-		case p := <-t.queue:
-			b := buf.NewWithSize(int32(len(p)))
-			b.Write(p)
-			if t.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b}) != nil {
+			for {
+				select {
+				case b := <-t.queue:
+					b.Release()
+				default:
+					return
+				}
+			}
+		case b := <-t.queue:
+			// Everything already queued goes down the pipe at once, waking
+			// the outbound once for the lot.
+			mb := buf.MultiBuffer{b}
+		more:
+			for len(mb) < cap(t.queue) {
+				select {
+				case b := <-t.queue:
+					mb = append(mb, b)
+				default:
+					break more
+				}
+			}
+			if t.link.Writer.WriteMultiBuffer(mb) != nil {
 				t.Close()
 				return
 			}
 		}
 	}
 }
-func (t *hybridTarget) ReadPacket() ([]byte, error) {
-	for len(t.pending) == 0 {
+func (t *hybridTarget) ReadPackets() ([][]byte, error) {
+	t.held = buf.ReleaseMulti(t.held)
+	for {
 		mb, err := t.link.Reader.ReadMultiBuffer()
 		if err != nil {
 			buf.ReleaseMulti(mb)
 			return nil, err
 		}
+		t.held = mb
+		t.out = t.out[:0]
 		for _, b := range mb {
-			t.pending = append(t.pending, append([]byte(nil), b.Bytes()...))
+			// An empty datagram is no QUIC packet, and framed on the stream
+			// it would read as the raw stop signal.
+			if !b.IsEmpty() {
+				t.out = append(t.out, b.Bytes())
+			}
 		}
-		buf.ReleaseMulti(mb)
+		if len(t.out) > 0 {
+			return t.out, nil
+		}
+		t.held = buf.ReleaseMulti(t.held)
 	}
-	p := t.pending[0]
-	t.pending[0] = nil
-	t.pending = t.pending[1:]
-	return p, nil
 }
 func (t *hybridTarget) Close() error {
 	t.once.Do(func() {
