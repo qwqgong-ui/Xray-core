@@ -28,7 +28,7 @@ const (
 	minBps = 65536 // 64 KB/s
 
 	invalidPacketNumber            = -1
-	initialCongestionWindowPackets = 32
+	initialCongestionWindowPackets = 60
 	minCongestionWindowPackets     = 4
 
 	// Constants based on TCP defaults.
