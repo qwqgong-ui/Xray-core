@@ -113,11 +113,15 @@ func TestDatagram(t *testing.T) {
 		var buf [1500]byte
 		err := conn.SendDatagram(buf[:])
 		var qErr *quic.DatagramTooLargeError
-		if !errors.As(err, &qErr) || qErr.MaxDatagramPayloadSize != 1197 {
-			t.Error(err)
+		if !errors.As(err, &qErr) {
+			t.Fatalf("expected datagram size error, got %v", err)
 		}
-		if server := <-recv; server != 1243 {
-			t.Error(server)
+		// The path MTU sets the usable size, up to our advertised frame limit.
+		if size := qErr.MaxDatagramPayloadSize; size < 1197 || size > MaxDatagramFrameSize-3 {
+			t.Errorf("client datagram payload size: %d", size)
+		}
+		if server := <-recv; server < 1197 || server > MaxDatagramFrameSize-3 {
+			t.Errorf("server datagram payload size: %d", server)
 		}
 	})
 
@@ -153,11 +157,14 @@ func TestDatagram(t *testing.T) {
 		var buf [1500]byte
 		err := conn.SendDatagram(buf[:])
 		var qErr *quic.DatagramTooLargeError
-		if !errors.As(err, &qErr) || qErr.MaxDatagramPayloadSize != 1197 {
-			t.Error(err)
+		if !errors.As(err, &qErr) {
+			t.Fatalf("expected datagram size error, got %v", err)
 		}
-		if server := <-recv; server != 1197 {
-			t.Error(server)
+		if size := qErr.MaxDatagramPayloadSize; size < 1197 || size > MaxDatagramFrameSize-3 {
+			t.Errorf("client datagram payload size: %d", size)
+		}
+		if server := <-recv; server < 1197 || server > MaxDatagramFrameSize-3 {
+			t.Errorf("server datagram payload size: %d", server)
 		}
 	})
 
