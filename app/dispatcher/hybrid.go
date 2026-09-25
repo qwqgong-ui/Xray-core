@@ -45,7 +45,17 @@ func (d *DefaultDispatcher) initHybrid(config *Config) error {
 	if err != nil || advertised.Port() != 443 || !hybrid.Public(advertised.Addr()) {
 		return errors.New("hybrid: advertise must be a public IP on UDP 443")
 	}
-	d.hybrid = hybrid.NewServer(advertised)
+	var advertisedIPv6 netip.AddrPort
+	if config.HybridAdvertiseIpv6 != "" {
+		advertisedIPv6, err = netip.ParseAddrPort(config.HybridAdvertiseIpv6)
+		if err != nil || advertisedIPv6.Port() != 443 || !advertisedIPv6.Addr().Is6() || !hybrid.Public(advertisedIPv6.Addr()) {
+			return errors.New("hybrid: advertiseIPv6 must be a public IPv6 on UDP 443")
+		}
+		if !advertised.Addr().Is4() || !listen.Addr().Is6() {
+			return errors.New("hybrid: advertiseIPv6 requires IPv4 advertise and IPv6 listen")
+		}
+	}
+	d.hybrid = hybrid.NewServer(advertised, advertisedIPv6)
 	d.hybridListen = netip.AddrPortFrom(listen.Addr().Unmap(), listen.Port())
 	d.hybridShared = config.HybridShareHysteria
 	// Register at initialization: inbound transports may listen before Start.

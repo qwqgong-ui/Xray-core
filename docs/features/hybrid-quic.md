@@ -11,13 +11,14 @@
 ```json
 {
   "hybridQUIC": {
-    "listen": "0.0.0.0:443",
-    "advertise": "YOUR_PUBLIC_IP:443"
+    "listen": "[::]:443",
+    "advertise": "YOUR_PUBLIC_IPV4:443",
+    "advertiseIPv6": "[YOUR_PUBLIC_IPV6]:443"
   }
 }
 ```
 
-这是添加到既有配置中的片段，需替换公网地址，并保留普通入站与出站配置。`listen` 必须是 IP:443，`advertise` 必须是可达的公网 IP:443。使用 HY2 的同一 UDP socket 时，可设置 `shareHysteria: true`，监听地址须完全对应。
+这是添加到既有配置中的片段，需替换公网地址，并保留普通入站与出站配置。`listen` 必须是 IP:443；`advertise` 是公网 IPv4:443，`advertiseIPv6` 是可选的公网 IPv6:443。双栈入站按客户端来源地址族返回对应端点；未配置匹配地址族时，该流只走可靠流，不会宣告无法绑定的 raw 端点。仅使用 IPv4 或 IPv6 的单栈配置可省略 `advertiseIPv6`。使用 HY2 的同一 UDP socket 时，可设置 `shareHysteria: true`，监听地址须完全对应。
 
 ## 多跳与回退
 

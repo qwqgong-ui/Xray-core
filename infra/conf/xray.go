@@ -398,6 +398,7 @@ func (c EnvConfig) Override(o EnvConfig) {
 type HybridQUICConfig struct {
 	Listen                 string   `json:"listen"`
 	Advertise              string   `json:"advertise"`
+	AdvertiseIPv6          string   `json:"advertiseIPv6"`
 	ShareHysteria          bool     `json:"shareHysteria"`
 	ForwardOutbounds       []string `json:"forwardOutbounds"`
 	TrustedForwardInbounds []string `json:"trustedForwardInbounds"`
@@ -563,11 +564,15 @@ func (c *Config) Build() (*core.Config, error) {
 	if c.HybridQUIC != nil {
 		dispatcherConfig.HybridListen = c.HybridQUIC.Listen
 		dispatcherConfig.HybridAdvertise = c.HybridQUIC.Advertise
+		dispatcherConfig.HybridAdvertiseIpv6 = c.HybridQUIC.AdvertiseIPv6
 		dispatcherConfig.HybridShareHysteria = c.HybridQUIC.ShareHysteria
 		dispatcherConfig.HybridForwardOutbounds = c.HybridQUIC.ForwardOutbounds
 		dispatcherConfig.HybridTrustedInbounds = c.HybridQUIC.TrustedForwardInbounds
 		if (c.HybridQUIC.Listen == "") != (c.HybridQUIC.Advertise == "") {
 			return nil, errors.New("hybridQUIC requires both listen and advertise")
+		}
+		if c.HybridQUIC.AdvertiseIPv6 != "" && c.HybridQUIC.Advertise == "" {
+			return nil, errors.New("hybridQUIC advertiseIPv6 requires advertise")
 		}
 	}
 	config := &core.Config{

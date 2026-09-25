@@ -10,6 +10,29 @@ import (
 	"time"
 )
 
+func TestAdvertisedForPeerFamily(t *testing.T) {
+	ipv4 := netip.MustParseAddrPort("198.51.100.10:443")
+	ipv6 := netip.MustParseAddrPort("[2001:db8::10]:443")
+	s := NewServer(ipv4, ipv6)
+	for _, tc := range []struct {
+		peer string
+		want netip.AddrPort
+	}{
+		{peer: "192.0.2.20", want: ipv4},
+		{peer: "2001:db8::20", want: ipv6},
+	} {
+		if got := s.advertisedFor(netip.MustParseAddr(tc.peer)); got != tc.want {
+			t.Errorf("peer %s: endpoint %s, want %s", tc.peer, got, tc.want)
+		}
+	}
+	if got := NewServer(ipv4).advertisedFor(netip.MustParseAddr("2001:db8::20")); got.IsValid() {
+		t.Fatalf("IPv6 client was offered an IPv4-only raw endpoint: %s", got)
+	}
+	if got := NewServer(ipv6).advertisedFor(netip.MustParseAddr("192.0.2.20")); got.IsValid() {
+		t.Fatalf("IPv4 client was offered an IPv6-only raw endpoint: %s", got)
+	}
+}
+
 type fakeTarget struct {
 	up   chan []byte
 	down chan []byte

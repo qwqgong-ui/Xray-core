@@ -20,17 +20,22 @@ Add this top-level configuration alongside ordinary inbounds and outbounds:
 ```json
 {
   "hybridQUIC": {
-    "listen": "0.0.0.0:443",
-    "advertise": "YOUR_PUBLIC_IP:443"
+    "listen": "[::]:443",
+    "advertise": "YOUR_PUBLIC_IPV4:443",
+    "advertiseIPv6": "[YOUR_PUBLIC_IPV6]:443"
   }
 }
 ```
 
-`listen` and `advertise` must be literal IP addresses on port 443. `advertise`
-must be the reachable address of this exact terminal server, including any NAT
-mapping. A wildcard listen address cannot be advertised. IPv4 and IPv6 work;
-a terminal advertises one raw endpoint. The target IP is resolved by this Xray's
-DNS, independently of the raw endpoint's address family.
+`listen` and the advertised endpoints must be literal IP addresses on port 443.
+Each advertised address must reach this exact terminal server, including any NAT
+mapping. A wildcard listen address cannot be advertised. For a dual-stack HY2
+listener, `advertise` is the IPv4 endpoint and `advertiseIPv6` is the IPv6
+endpoint. Xray returns the endpoint matching the original client's address
+family; without one, it keeps that flow on the reliable stream instead of
+advertising an unusable raw path. Single-stack configurations can omit
+`advertiseIPv6`. The target IP is resolved by this Xray's DNS independently of
+the raw endpoint's address family.
 
 If HY2 already owns UDP 443 on this instance, set `shareHysteria: true` and make
 `listen` match that HY2 inbound's bind address exactly. Hybrid then reuses that

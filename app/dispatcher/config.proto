@@ -17,4 +17,5 @@ message Config {
   bool hybrid_share_hysteria = 4;
   repeated string hybrid_forward_outbounds = 5;
   repeated string hybrid_trusted_inbounds = 6;
+  string hybrid_advertise_ipv6 = 7;
 }

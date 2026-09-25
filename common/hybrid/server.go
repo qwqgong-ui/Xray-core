@@ -30,14 +30,15 @@ type Dial func(context.Context, string) (Target, netip.AddrPort, error)
 // Server belongs to one dispatcher. Its flows belong to streams, never a HY2
 // session. The lock also serializes CID claims, binding and permanent disable.
 type Server struct {
-	mu         sync.Mutex
-	conn       net.PacketConn
-	advertised netip.AddrPort
-	flows      map[*flow]struct{}
-	cids       map[string]*flow
-	tuples     map[netip.AddrPort]*flow
-	closed     bool
-	gso        atomic.Bool // the raw socket takes UDP_SEGMENT
+	mu             sync.Mutex
+	conn           net.PacketConn
+	advertised     netip.AddrPort
+	advertisedIPv6 netip.AddrPort
+	flows          map[*flow]struct{}
+	cids           map[string]*flow
+	tuples         map[netip.AddrPort]*flow
+	closed         bool
+	gso            atomic.Bool // the raw socket takes UDP_SEGMENT
 }
 type flow struct {
 	server    *Server
@@ -54,8 +55,28 @@ type flow struct {
 	cancel    context.CancelFunc
 }
 
-func NewServer(advertised netip.AddrPort) *Server {
-	return &Server{advertised: advertised, flows: make(map[*flow]struct{}), cids: make(map[string]*flow), tuples: make(map[netip.AddrPort]*flow)}
+func NewServer(advertised netip.AddrPort, alternate ...netip.AddrPort) *Server {
+	s := &Server{advertised: advertised, flows: make(map[*flow]struct{}), cids: make(map[string]*flow), tuples: make(map[netip.AddrPort]*flow)}
+	if len(alternate) > 0 {
+		s.advertisedIPv6 = alternate[0]
+	}
+	return s
+}
+
+// A raw source must have the same address family as the stream's original
+// client address. Returning no endpoint keeps mismatched flows on the stream.
+func (s *Server) advertisedFor(peer netip.Addr) netip.AddrPort {
+	peer = peer.Unmap()
+	if !peer.IsValid() {
+		return netip.AddrPort{}
+	}
+	if peer.Is6() && s.advertisedIPv6.IsValid() {
+		return s.advertisedIPv6
+	}
+	if peer.Is6() == s.advertised.Addr().Is6() {
+		return s.advertised
+	}
+	return netip.AddrPort{}
 }
 func (s *Server) Attach(conn net.PacketConn) error {
 	s.mu.Lock()
@@ -247,8 +268,8 @@ func (s *Server) Serve(ctx context.Context, stream io.ReadWriteCloser, peer neti
 	if err = WriteAddress(stream, resolved.String()); err != nil {
 		return err
 	}
-	relay := s.advertised
-	if conn == nil || !peer.IsValid() {
+	relay := s.advertisedFor(peer)
+	if conn == nil || !relay.IsValid() {
 		relay = netip.MustParseAddrPort("0.0.0.0:443")
 		f.disable()
 	}
