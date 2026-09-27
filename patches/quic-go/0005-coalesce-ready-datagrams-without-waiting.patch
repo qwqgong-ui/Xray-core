@@ -1,0 +1,318 @@
+diff --git a/datagram_queue.go b/datagram_queue.go
+index 16b2d5d..88f7365 100644
+--- a/datagram_queue.go
++++ b/datagram_queue.go
+@@ -50,7 +50,16 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
+ 	for {
+ 		if h.sendQueue.Len() < maxDatagramSendQueueLen {
+ 			h.sendQueue.PushBack(f)
++			hasSpace := h.sendQueue.Len() < maxDatagramSendQueueLen
+ 			h.sendMx.Unlock()
++			// Batched Pop calls can coalesce their notifications. Pass the
++			// wakeup on while space remains so other blocked senders progress.
++			if hasSpace {
++				select {
++				case h.sent <- struct{}{}:
++				default:
++				}
++			}
+ 			h.hasData()
+ 			return nil
+ 		}
+diff --git a/datagram_queue_batch_test.go b/datagram_queue_batch_test.go
+new file mode 100644
+index 0000000..37659e1
+--- /dev/null
++++ b/datagram_queue_batch_test.go
+@@ -0,0 +1,33 @@
++package quic
++
++import (
++	"testing"
++
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/apernet/quic-go/internal/wire"
++	"github.com/stretchr/testify/require"
++	"testing/synctest"
++)
++
++func TestDatagramBatchPopWakesBlockedSenders(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		q := newDatagramQueue(func() {}, utils.DefaultLogger)
++		for i := 0; i < maxDatagramSendQueueLen; i++ {
++			require.NoError(t, q.Add(&wire.DatagramFrame{DataLenPresent: true, Data: []byte{0}}))
++		}
++		results := make(chan error, 4)
++		for i := 0; i < 4; i++ {
++			go func() { results <- q.Add(&wire.DatagramFrame{DataLenPresent: true, Data: []byte{1}}) }()
++		}
++		synctest.Wait()
++		require.Empty(t, results)
++		for i := 0; i < 4; i++ {
++			q.Pop()
++		}
++		synctest.Wait()
++		require.Len(t, results, 4)
++		for i := 0; i < 4; i++ {
++			require.NoError(t, <-results)
++		}
++	})
++}
+diff --git a/packet_packer.go b/packet_packer.go
+index 739071b..5e4c2c2 100644
+--- a/packet_packer.go
++++ b/packet_packer.go
+@@ -733,12 +733,14 @@ func (p *packetPacker) composeNextPacket(
+ 		}
+ 	}
+ 
++	datagramCount := 0
+ 	if p.datagramQueue != nil {
+ 		if f := p.datagramQueue.Peek(); f != nil {
+ 			size := f.Length(v)
+ 			if size <= maxPayloadSize-pl.length { // DATAGRAM frame fits
+ 				pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
+ 				pl.length += size
++				datagramCount = 1
+ 				p.datagramQueue.Pop()
+ 				p.peekTimes = 0
+ 			} else if pl.ack == nil {
+@@ -760,10 +762,6 @@ func (p *packetPacker) composeNextPacket(
+ 		}
+ 	}
+ 
+-	if pl.ack != nil && !hasData && !hasRetransmission {
+-		return pl
+-	}
+-
+ 	if hasRetransmission {
+ 		for {
+ 			remainingLen := maxPayloadSize - pl.length
+@@ -799,6 +797,22 @@ func (p *packetPacker) composeNextPacket(
+ 			}
+ 		}
+ 	}
++	// Only use spare space after the usual ACK, retransmission and STREAM
++	// scheduling. Never wait for another datagram or discard a queued frame
++	// merely because it doesn't fit the remainder of this packet. Bound the
++	// batch so a single lost packet doesn't lose an entire datagram burst.
++	const maxDatagramsPerPacket = 4
++	for datagramCount > 0 && datagramCount < maxDatagramsPerPacket {
++		f := p.datagramQueue.Peek()
++		if f == nil || f.Length(v) > maxPayloadSize-pl.length {
++			break
++		}
++		pl.frames = append(pl.frames, ackhandler.Frame{Frame: f})
++		pl.length += f.Length(v)
++		p.datagramQueue.Pop()
++		p.peekTimes = 0
++		datagramCount++
++	}
+ 	return pl
+ }
+ 
+@@ -1067,7 +1081,17 @@ func (p *packetPacker) appendPacketPayload(raw []byte, pl payload, paddingLen pr
+ 	// Randomize the order of the control frames.
+ 	// This makes sure that the receiver doesn't rely on the order in which frames are packed.
+ 	if len(pl.frames) > 1 {
+-		p.rand.Shuffle(len(pl.frames), func(i, j int) { pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i] })
++		p.rand.Shuffle(len(pl.frames), func(i, j int) {
++			// Keep unreliable application datagrams in queue order. Shuffling
++			// a batch would introduce reordering even on a lossless path.
++			if _, ok := pl.frames[i].Frame.(*wire.DatagramFrame); ok {
++				return
++			}
++			if _, ok := pl.frames[j].Frame.(*wire.DatagramFrame); ok {
++				return
++			}
++			pl.frames[i], pl.frames[j] = pl.frames[j], pl.frames[i]
++		})
+ 	}
+ 	for _, f := range pl.frames {
+ 		var err error
+diff --git a/packet_packer_datagram_batch_test.go b/packet_packer_datagram_batch_test.go
+new file mode 100644
+index 0000000..99ff6eb
+--- /dev/null
++++ b/packet_packer_datagram_batch_test.go
+@@ -0,0 +1,180 @@
++package quic
++
++import (
++	"bytes"
++	"testing"
++
++	"github.com/apernet/quic-go/internal/ackhandler"
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/wire"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++)
++
++func queueBatchDatagrams(t *testing.T, tp *testPacketPacker, sizes ...int) []*wire.DatagramFrame {
++	t.Helper()
++	frames := make([]*wire.DatagramFrame, len(sizes))
++	for i, size := range sizes {
++		frames[i] = &wire.DatagramFrame{DataLenPresent: true, Data: bytes.Repeat([]byte{byte(i)}, size)}
++		require.NoError(t, tp.datagramQueue.Add(frames[i]))
++	}
++	return frames
++}
++
++func TestDatagramBatchReadyOnly(t *testing.T) {
++	for _, version := range []protocol.Version{protocol.Version1, protocol.Version2} {
++		for _, tc := range []struct {
++			name   string
++			sizes  []int
++			budget protocol.ByteCount
++			want   int
++		}{
++			{name: "empty", budget: 1200},
++			{name: "single-is-not-held", sizes: []int{37}, budget: 1200, want: 1},
++			{name: "mixed-boundaries", sizes: []int{0, 1, 63, 64}, budget: 1200, want: 4},
++			{name: "bounded-burst", sizes: []int{40, 40, 40, 40, 40, 40}, budget: 1200, want: 4},
++			{name: "exact-fit", sizes: []int{40, 40}, budget: 84, want: 2},
++			{name: "keep-next-frame", sizes: []int{40, 40}, budget: 83, want: 1},
++		} {
++			t.Run(version.String()+"/"+tc.name, func(t *testing.T) {
++				for _, withAck := range []bool{false, true} {
++					tp := newTestPacketPacker(t, gomock.NewController(t), protocol.PerspectiveServer)
++					frames := queueBatchDatagrams(t, tp, tc.sizes...)
++					tp.framer.EXPECT().HasData().Return(false)
++					budget := tc.budget
++					if withAck {
++						ack := &wire.AckFrame{AckRanges: []wire.AckRange{{Smallest: 1, Largest: 1}}}
++						tp.ackFramer.EXPECT().GetAckFrame(protocol.Encryption1RTT, gomock.Any(), true).Return(ack)
++						budget += ack.Length(version)
++					}
++					pl := tp.packer.composeNextPacket(budget, false, withAck, monotime.Now(), version)
++					require.Len(t, pl.frames, tc.want)
++					require.LessOrEqual(t, pl.length, budget)
++					if tc.want < len(frames) {
++						require.Same(t, frames[tc.want], tp.datagramQueue.Peek())
++					} else {
++						require.Nil(t, tp.datagramQueue.Peek())
++					}
++
++					// Decode with the unchanged RFC 9221 parser: every original
++					// datagram (including an empty one) must retain its boundary.
++					var datagramLength protocol.ByteCount
++					for _, f := range pl.frames {
++						require.Nil(t, f.Handler, "DATAGRAMs must not become retransmittable")
++						datagramLength += f.Frame.Length(version)
++					}
++					encoded, err := tp.packer.appendPacketPayload(nil, payload{frames: pl.frames, length: datagramLength}, 0, version)
++					require.NoError(t, err)
++					parser := wire.NewFrameParser(true, false, false)
++					for i := 0; i < tc.want; i++ {
++						ft, n, err := parser.ParseType(encoded, protocol.Encryption1RTT)
++						require.NoError(t, err)
++						encoded = encoded[n:]
++						f, n, err := parser.ParseDatagramFrame(ft, encoded, version)
++						require.NoError(t, err)
++						require.Equal(t, frames[i].Data, f.Data)
++						encoded = encoded[n:]
++					}
++					require.Empty(t, encoded)
++				}
++			})
++		}
++	}
++}
++
++func TestDatagramBatchPreservesStreamAndControlSpace(t *testing.T) {
++	tp := newTestPacketPacker(t, gomock.NewController(t), protocol.PerspectiveServer)
++	frames := queueBatchDatagrams(t, tp, 40, 40)
++	stream := &wire.StreamFrame{StreamID: 4, DataLenPresent: true, Data: bytes.Repeat([]byte{1}, 100)}
++	control := &wire.PingFrame{}
++	tp.framer.EXPECT().HasData().Return(true)
++	expectAppendFrames(tp.framer, []ackhandler.Frame{{Frame: control}}, []ackhandler.StreamFrame{{Frame: stream}})
++	budget := frames[0].Length(protocol.Version1) + stream.Length(protocol.Version1) + control.Length(protocol.Version1)
++	pl := tp.packer.composeNextPacket(budget, false, false, monotime.Now(), protocol.Version1)
++	require.Equal(t, budget, pl.length)
++	require.Len(t, pl.streamFrames, 1)
++	require.Same(t, stream, pl.streamFrames[0].Frame)
++	require.Len(t, pl.frames, 2)
++	require.Same(t, frames[1], tp.datagramQueue.Peek())
++}
++
++func TestDatagramBatchPreservesRetransmissionSpace(t *testing.T) {
++	tp := newTestPacketPacker(t, gomock.NewController(t), protocol.PerspectiveServer)
++	frames := queueBatchDatagrams(t, tp, 40, 200)
++	retransmission := &wire.MaxDataFrame{MaximumData: 12345}
++	tp.retransmissionQueue.addAppData(retransmission)
++	tp.framer.EXPECT().HasData().Return(false)
++	budget := frames[0].Length(protocol.Version1) + protocol.MinStreamFrameSize
++	pl := tp.packer.composeNextPacket(budget, false, false, monotime.Now(), protocol.Version1)
++	require.Len(t, pl.frames, 2)
++	require.Same(t, retransmission, pl.frames[1].Frame)
++	require.NotNil(t, pl.frames[1].Handler)
++	require.Same(t, frames[1], tp.datagramQueue.Peek())
++}
++
++func TestDatagramBatchDoesNotConsumeACKOnlyQueue(t *testing.T) {
++	tp := newTestPacketPacker(t, gomock.NewController(t), protocol.PerspectiveServer)
++	frames := queueBatchDatagrams(t, tp, 40, 40)
++	tp.ackFramer.EXPECT().GetAckFrame(protocol.Encryption1RTT, gomock.Any(), true).Return(nil)
++	pl := tp.packer.composeNextPacket(1200, true, true, monotime.Now(), protocol.Version1)
++	require.Empty(t, pl.frames)
++	require.Same(t, frames[0], tp.datagramQueue.Peek())
++}
++
++func TestDatagramBatchDeferralDoesNotCountAsOversize(t *testing.T) {
++	tp := newTestPacketPacker(t, gomock.NewController(t), protocol.PerspectiveServer)
++	frames := queueBatchDatagrams(t, tp, 40, 40)
++	tp.packer.peekTimes = DatagramFrameMaxPeekTimes
++	tp.framer.EXPECT().HasData().Return(false).Times(2)
++	pl := tp.packer.composeNextPacket(83, false, false, monotime.Now(), protocol.Version1)
++	require.Len(t, pl.frames, 1)
++	require.Same(t, frames[1], tp.datagramQueue.Peek())
++	pl = tp.packer.composeNextPacket(83, false, false, monotime.Now(), protocol.Version1)
++	require.Len(t, pl.frames, 1)
++	require.Same(t, frames[1], pl.frames[0].Frame)
++	require.Nil(t, tp.datagramQueue.Peek())
++}
++
++func TestDatagramBatchSerializesBeforeLengthlessStream(t *testing.T) {
++	for i := 0; i < 64; i++ {
++		tp := newTestPacketPacker(t, gomock.NewController(t), protocol.PerspectiveServer)
++		frames := queueBatchDatagrams(t, tp, 40, 50, 60)
++		tp.framer.EXPECT().HasData().Return(true)
++		stream := &wire.StreamFrame{StreamID: 4, Data: []byte("stream data"), DataLenPresent: false}
++		expectAppendFrames(tp.framer, []ackhandler.Frame{{Frame: &wire.PingFrame{}}}, []ackhandler.StreamFrame{{Frame: stream}})
++		pl := tp.packer.composeNextPacket(1200, false, false, monotime.Now(), protocol.Version2)
++		encoded, err := tp.packer.appendPacketPayload(nil, pl, 0, protocol.Version2)
++		require.NoError(t, err)
++		parser := wire.NewFrameParser(true, false, false)
++		var datagrams int
++		var streams int
++		for len(encoded) > 0 {
++			ft, n, err := parser.ParseType(encoded, protocol.Encryption1RTT)
++			require.NoError(t, err)
++			encoded = encoded[n:]
++			switch {
++			case ft.IsDatagramFrameType():
++				f, size, err := parser.ParseDatagramFrame(ft, encoded, protocol.Version2)
++				require.NoError(t, err)
++				require.Less(t, datagrams, len(frames))
++				require.Equal(t, frames[datagrams].Data, f.Data)
++				datagrams++
++				encoded = encoded[size:]
++			case ft.IsStreamFrameType():
++				f, size, err := parser.ParseStreamFrame(ft, encoded, protocol.Version2)
++				require.NoError(t, err)
++				require.Equal(t, stream.Data, f.Data)
++				streams++
++				encoded = encoded[size:]
++			default:
++				_, size, err := parser.ParseLessCommonFrame(ft, encoded, protocol.Version2)
++				require.NoError(t, err)
++				encoded = encoded[size:]
++			}
++		}
++		require.Equal(t, 3, datagrams)
++		require.Equal(t, 1, streams)
++	}
++}
