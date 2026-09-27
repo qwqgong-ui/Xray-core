@@ -3,7 +3,7 @@ From: qwqgong-ui <noreply@qwqgong-ui.local>
 Date: Thu, 17 Sep 2026 23:40:00 +0900
 Subject: [PATCH] quic: decimate ACKs once path MTU discovery has settled
 
-On a bulk transfer roughly one packet in three is a bare ACK, which is pure overhead on a link metered by packets per second rather than bandwidth. RFC 9000 section 13.2.1 only recommends acking every second ack-eliciting packet, and acking less often stays within the max_ack_delay we advertise, so a peer's loss detection and PTO — which already budget for that delay — see nothing new. Walk the threshold from 2 up to 4 once path MTU discovery reports itself finished and the path stays quiet, and drop straight back to 2 on a missing packet, a reordering report, an ECN-CE mark, or discovery restarting. The gate matters: while discovery is still probing, its PING probes are the ack-eliciting packets whose ACK advances the search. This is receiver-local, so a peer without it simply keeps its own cadence.
+On a bulk transfer roughly one packet in three is a bare ACK, which is pure overhead on a link metered by packets per second rather than bandwidth. RFC 9000 section 13.2.1 only recommends acking every second ack-eliciting packet, and acking less often stays within the max_ack_delay we advertise, so a peer's loss detection and PTO — which already budget for that delay — see nothing new. Walk the threshold from 2 up to 8 once path MTU discovery reports itself finished and the path stays quiet, and drop straight back to 2 on a missing packet, a reordering report, an ECN-CE mark, or discovery restarting. The gate matters: while discovery is still probing, its PING probes are the ack-eliciting packets whose ACK advances the search. This is receiver-local, so a peer without it simply keeps its own cadence.
 ---
 diff --git a/connection.go b/connection.go
 index 0a71b0b..2deffc6 100644
@@ -85,7 +85,7 @@ index 0000000..0da1e6e
 +	require.Equal(t, maxPacketsBeforeAck, tr.ackThreshold)
 +
 +	// And that is the cadence actually used on the wire.
-+	const packets = 4 * packetsPerAckThresholdStep
++	const packets = maxPacketsBeforeAck * packetsPerAckThresholdStep
 +	acks, _ := feedQuiet(t, tr, pn, packets)
 +	require.Equal(t, packets/maxPacketsBeforeAck, acks)
 +}
@@ -208,7 +208,7 @@ index 54c047b..1033ef8 100644
 +// we are decimating on behalf of.
 +const (
 +	// the largest threshold decimation will walk up to
-+	maxPacketsBeforeAck = 4
++	maxPacketsBeforeAck = 8
 +	// consecutive undisturbed ack-eliciting packets before raising the
 +	// threshold by one, so a brief quiet spell in an otherwise lossy flow does
 +	// not earn it
