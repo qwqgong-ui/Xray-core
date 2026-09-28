@@ -41,18 +41,27 @@ type Server struct {
 	gso            atomic.Bool // the raw socket takes UDP_SEGMENT
 }
 type flow struct {
-	server    *Server
-	stream    io.ReadWriteCloser
-	target    Target
-	peer      netip.Addr
-	tuple     netip.AddrPort
-	lastRaw   time.Time
-	disabled  bool
-	paused    bool
-	cids      []string
-	writeMu   sync.Mutex
-	closeOnce sync.Once
-	cancel    context.CancelFunc
+	server          *Server
+	stream          io.ReadWriteCloser
+	target          Target
+	peer            netip.Addr
+	tuple           netip.AddrPort
+	lastRaw         time.Time
+	disabled        bool
+	paused          bool
+	cids            []string
+	writeMu         sync.Mutex
+	closeOnce       sync.Once
+	cancel          context.CancelFunc
+	lease           bool
+	leaseSeq        uint64
+	leaseUntil      time.Time
+	leaseProbeUntil time.Time
+	leaseDigest     [32]byte
+	leaseAcks       chan leaseControl
+	leaseProofs     [8][32]byte
+	leaseProofCount int
+	leaseUpReady    bool
 }
 
 func NewServer(advertised netip.AddrPort, alternate ...netip.AddrPort) *Server {
@@ -122,9 +131,35 @@ func (s *Server) HandleRaw(p []byte, addr net.Addr) bool {
 	now := time.Now()
 	s.mu.Lock()
 	f := s.tuples[a]
+	if f != nil && f.lease && !now.Before(f.leaseUntil) {
+		delete(s.tuples, a)
+		f = nil
+	}
+	if f != nil && f.lease {
+		if f.disabled || !now.Before(f.leaseUntil) {
+			s.mu.Unlock()
+			return false
+		}
+		if f.paused && !f.leaseUpReady {
+			s.mu.Unlock()
+			return true
+		}
+		target := f.target
+		s.mu.Unlock()
+		if err := target.WritePacket(p); err != nil {
+			f.close()
+		}
+		return true
+	}
+	if f == nil {
+		if s.bindLeaseLocked(p, a, now) {
+			s.mu.Unlock()
+			return true
+		}
+	}
 	if f == nil {
 		for cid, candidate := range s.cids {
-			if len(p) > len(cid) && string(p[1:1+len(cid)]) == cid {
+			if !candidate.lease && len(p) > len(cid) && string(p[1:1+len(cid)]) == cid {
 				// Different-length prefix collisions must never select an arbitrary flow.
 				if f != nil && f != candidate {
 					s.mu.Unlock()
@@ -197,6 +232,7 @@ func (f *flow) pause() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	f.paused = true
+	f.leaseUpReady = false
 }
 func (f *flow) disable() {
 	s := f.server
@@ -232,9 +268,13 @@ func (f *flow) close() {
 		}
 	})
 }
-func (s *Server) Serve(ctx context.Context, stream io.ReadWriteCloser, peer netip.Addr, address string, dial Dial) error {
+func (s *Server) Serve(ctx context.Context, stream io.ReadWriteCloser, peer netip.Addr, address string, dial Dial, lease ...bool) error {
 	ctx, cancel := context.WithCancel(ctx)
 	f := &flow{server: s, stream: stream, peer: peer.Unmap(), cancel: cancel}
+	f.lease = len(lease) > 0 && lease[0]
+	if f.lease {
+		f.leaseAcks = make(chan leaseControl, 1)
+	}
 	s.mu.Lock()
 	if s.closed || len(s.flows) >= 1024 {
 		s.mu.Unlock()
@@ -277,11 +317,23 @@ func (s *Server) Serve(ctx context.Context, stream io.ReadWriteCloser, peer neti
 		return err
 	}
 	go f.readTarget()
+	if f.lease {
+		go f.writeLeaseAcks(ctx)
+	}
 	go f.keepAlive(ctx)
 	for {
-		p, err := ReadFrame(stream)
+		p, control, err := readRecord(stream)
 		if err != nil {
 			return err
+		}
+		if control != nil {
+			if !f.lease {
+				return errors.New("hybrid: lease not negotiated")
+			}
+			if err := f.handleLease(*control); err != nil {
+				return err
+			}
+			continue
 		}
 		if p == nil {
 			continue
@@ -315,9 +367,15 @@ func (f *flow) readTarget() {
 		s.mu.Lock()
 		conn := s.conn
 		raw := conn != nil && !f.disabled && !f.paused && f.tuple.IsValid() && time.Since(f.lastRaw) < rawStale
+		if f.lease {
+			raw = conn != nil && !f.disabled && !f.paused && f.tuple.IsValid() && time.Now().Before(f.leaseUntil)
+		}
 		tuple := f.tuple
 		s.mu.Unlock()
 		for len(ps) > 0 {
+			if !raw && f.lease {
+				f.probeLeaseDownstream(ps[0])
+			}
 			// The short-header packets at the front go out raw together.
 			n := 0
 			for raw && n < len(ps) && Short(ps[n]) {

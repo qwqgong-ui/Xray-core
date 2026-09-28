@@ -123,6 +123,7 @@ func Public(ip netip.Addr) bool {
 // Request has no flow ID. Forwarded origin information is accepted only from
 // explicitly trusted inbound tags; clients always send Hops=0 and no ClientIP.
 type Request struct {
+	Lease    bool
 	Target   string
 	ClientIP netip.Addr
 	Hops     byte
@@ -134,7 +135,8 @@ func ReadRequest(r io.Reader) (Request, error) {
 	if _, err := io.ReadFull(r, h[:]); err != nil {
 		return q, err
 	}
-	if string(h[:4]) != Magic || h[4] > 8 {
+	q.Lease = string(h[:4]) == "HQS2"
+	if (!q.Lease && string(h[:4]) != Magic) || h[4] > 8 {
 		return q, errors.New("hybrid: unsupported request")
 	}
 	q.Hops = h[4]
@@ -159,6 +161,9 @@ func ReadRequest(r io.Reader) (Request, error) {
 }
 func WriteRequest(w io.Writer, q Request) error {
 	b := append([]byte(Magic), q.Hops)
+	if q.Lease {
+		copy(b, "HQS2")
+	}
 	if q.ClientIP.IsValid() {
 		ip := q.ClientIP.Unmap().AsSlice()
 		b = append(b, byte(len(ip)))

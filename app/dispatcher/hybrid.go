@@ -172,7 +172,7 @@ func (d *DefaultDispatcher) serveHybrid(ctx context.Context, dest net.Destinatio
 			timer.Stop()
 		}
 		return target, resolved, err
-	})
+	}, request.Lease)
 	if err != nil && err != io.EOF {
 		errors.LogDebugInner(ctx, err, "hybrid stream ended")
 	}
