@@ -116,7 +116,7 @@ func LookupForIP(domain string, strategy DomainStrategy, localAddr net.Address) 
 // addresses.
 func QueryRecordDNS(ctx context.Context, domain string, qtype uint16) (*dns.RecordResponse, error) {
 	if dnsClient == nil {
-		return nil, errors.New("DNS client not initialized").AtError()
+		return nil, errors.New("DNS client not initialized")
 	}
 	client, ok := dnsClient.(dns.RecordClient)
 	if !ok {
