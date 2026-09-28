@@ -82,6 +82,20 @@ func TestLeaseZeroCIDBindingAndRenewal(t *testing.T) {
 	if got, err := ReadFrame(a); err != nil || string(got) != string(p) {
 		t.Fatalf("pre-activation fallback %x %v", got, err)
 	}
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	proof := make([]byte, 64)
+	if n, _, err := client.ReadFrom(proof); err != nil || string(proof[:n]) != string(p) {
+		t.Fatalf("initial reverse proof: %x %v", proof[:n], err)
+	}
+	// A video burst can deliver many packets before the first raw proof's
+	// acknowledgement returns. It must not evict that outstanding proof.
+	for i := 0; i < 16; i++ {
+		next := []byte{0x40, byte(i), 77}
+		target.down <- next
+		if got, err := ReadFrame(a); err != nil || string(got) != string(next) {
+			t.Fatalf("burst fallback %x %v", got, err)
+		}
+	}
 	if err := writeLease(a, leaseControl{kind: leaseActivate, seq: 1, digest: sha256.Sum256(p)}); err != nil {
 		t.Fatal(err)
 	}
@@ -148,4 +162,26 @@ func TestLeaseZeroCIDBindingAndRenewal(t *testing.T) {
 	if got, err := ReadFrame(a); err != nil || string(got) != string(p) {
 		t.Fatalf("expired fallback %x %v", got, err)
 	}
+}
+
+func TestLeasePauseStopsProbeCopies(t *testing.T) {
+	h := newHarness(t)
+	s, f := h.server, h.flow
+	s.mu.Lock()
+	f.lease = true
+	f.paused = true
+	f.tuple = netip.MustParseAddrPort(h.client.LocalAddr().String())
+	f.leaseUntil = time.Now().Add(leaseDuration)
+	f.leaseConfirmUntil = time.Now().Add(3 * time.Second)
+	s.mu.Unlock()
+	h.target.down <- shortPacket("", 1)
+	h.recvFrame(t, 1)
+	recvRaw(t, h.client, 1)
+	f.pause()
+	s.mu.Lock()
+	f.leaseProofNext = time.Time{} // the rate limiter alone must not hide a leak
+	s.mu.Unlock()
+	h.target.down <- shortPacket("", 2)
+	h.recvFrame(t, 2)
+	h.expectNoRaw(t)
 }

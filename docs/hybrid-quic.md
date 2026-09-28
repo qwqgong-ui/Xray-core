@@ -94,7 +94,7 @@ Terminal Xray, top-level additions:
 previous Xray. Only listed inbounds may supply a forwarded original-client IP.
 The first Xray obtains that address from its actual inbound connection; a
 mihomo request cannot specify it. The terminal uses that original address plus
-an observed target CID to bind raw, so the intermediate server's address does
+an authenticated stream binding (or an observed CID for legacy HQS1) to bind raw, so the intermediate server's address does
 not prevent acceleration. Do not share a trusted inbound with untrusted direct
 clients. Forwarded metadata is trusted hop by hop, with a maximum of eight
 forwarding hops.
@@ -107,7 +107,7 @@ intermediate proxy, stays on the reliable path.
 
 ## Framing and lifetime
 
-The request consists of `HQS1`, one hop-count byte, one origin-address-length byte
+The request consists of `HQS2` (or legacy `HQS1`), one hop-count byte, one origin-address-length byte
 (0, 4 or 16), the optional origin IP bytes, and the destination address. A direct
 client sends zero hops and no origin. Addresses use a big-endian uint16 byte
 length followed by UTF-8 `host:port`, limited to 259 bytes.
@@ -115,7 +115,7 @@ length followed by UTF-8 `host:port`, limited to 259 bytes.
 The terminal replies with status byte 0, the actual target IP:port and the raw
 IP:port in the same address format. `0.0.0.0:443` means raw is unavailable.
 Setup failure closes the stream. No application packet is sent before this
-exchange completes, so the client can use native UDP if setup is rejected.
+exchange completes. HQS2 clients must not bypass a rejected registration through native UDP.
 Once accepted, a flow never changes its target connection.
 
 Subsequent frames have a big-endian uint16 prefix:
@@ -124,6 +124,7 @@ Subsequent frames have a big-endian uint16 prefix:
 - 0: from the client, stop sending raw downstream; from the server, raw is
   permanently dead on its side.
 - 65535: keepalive, sent every 30 seconds while the stream exists.
+- 65534 in HQS2: a 41-byte lease control (type, uint64 sequence, SHA-256 digest).
 - Other lengths: invalid; close the stream.
 
 All non-short-header packets stay on the stream, including Retry and Version
@@ -134,7 +135,20 @@ independently of new application writes, so an idle flow loses raw acceleration
 after 15 seconds. A raw write/read failure gives raw up for the life of the
 flow. The server notifies the client on raw socket failure.
 
-Returning to the stream is not the end of raw. A flow that was carrying nothing
+HQS2 supports zero-length CIDs through a source address and port lease created
+only on the reserved reliable stream. A registered upstream packet digest proves
+the observed UDP tuple. One fixed target packet proves the reverse path; it is
+copied to raw at most once every 250 ms while ordinary data remains on the stream.
+The proof remains stable across bursts until confirmed, and pause or a three-second
+confirmation timeout stops all probe copies. The client reports the raw packet's
+digest on the stream before the terminal enables both directions.
+
+Each renewal received on the reliable stream sets expiry to current time plus
+30 seconds, never adding to the old deadline. Clients can renew continuously.
+Raw activity and ordinary keepalives do not renew it. Expired or paused HQS2
+bindings require reliable registration and confirmation again.
+
+For legacy HQS1, returning to the stream is not the end of raw. A flow that was carrying nothing
 when raw went quiet keeps its binding and probes again on its next packet; one
 that was busy sends the zero-length frame first, then probes again after 30
 seconds, doubling to at most 10 minutes and giving raw up after eight attempts.
@@ -144,14 +158,14 @@ client's next raw packet resumes raw in both directions; only a raw failure on
 either side, or a client that has given up, is permanent. Packets already in
 flight may be lost; application QUIC retransmits.
 
-A binding that has seen no raw packet for 60 seconds stops carrying downstream
+A legacy HQS1 binding that has seen no raw packet for 60 seconds stops carrying downstream
 traffic and may be taken over by the same client from a different port, which is
 how a flow survives a NAT remapping it across an idle period. Stream
 EOF/cancellation closes the target and removes all bindings, including flows
 that never used raw. Keepalives prevent intermediate proxy idle timers from
 reclaiming a stream carrying raw traffic.
 
-Zero-length or ambiguous CIDs cannot bind. CID ownership and the original source
+In legacy HQS1, zero-length or ambiguous CIDs cannot bind. CID ownership and the original source
 IP constrain raw demultiplexing; the relay does not decrypt or authenticate QUIC
 packets itself. Target QUIC still performs its own packet authentication.
 

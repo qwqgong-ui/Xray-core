@@ -41,27 +41,29 @@ type Server struct {
 	gso            atomic.Bool // the raw socket takes UDP_SEGMENT
 }
 type flow struct {
-	server          *Server
-	stream          io.ReadWriteCloser
-	target          Target
-	peer            netip.Addr
-	tuple           netip.AddrPort
-	lastRaw         time.Time
-	disabled        bool
-	paused          bool
-	cids            []string
-	writeMu         sync.Mutex
-	closeOnce       sync.Once
-	cancel          context.CancelFunc
-	lease           bool
-	leaseSeq        uint64
-	leaseUntil      time.Time
-	leaseProbeUntil time.Time
-	leaseDigest     [32]byte
-	leaseAcks       chan leaseControl
-	leaseProofs     [8][32]byte
-	leaseProofCount int
-	leaseUpReady    bool
+	server            *Server
+	stream            io.ReadWriteCloser
+	target            Target
+	peer              netip.Addr
+	tuple             netip.AddrPort
+	lastRaw           time.Time
+	disabled          bool
+	paused            bool
+	cids              []string
+	writeMu           sync.Mutex
+	closeOnce         sync.Once
+	cancel            context.CancelFunc
+	lease             bool
+	leaseSeq          uint64
+	leaseUntil        time.Time
+	leaseProbeUntil   time.Time
+	leaseDigest       [32]byte
+	leaseAcks         chan leaseControl
+	leaseProof        []byte
+	leaseProofDigest  [32]byte
+	leaseProofNext    time.Time
+	leaseConfirmUntil time.Time
+	leaseUpReady      bool
 }
 
 func NewServer(advertised netip.AddrPort, alternate ...netip.AddrPort) *Server {
@@ -233,6 +235,8 @@ func (f *flow) pause() {
 	defer s.mu.Unlock()
 	f.paused = true
 	f.leaseUpReady = false
+	f.leaseConfirmUntil = time.Time{}
+	f.leaseProof = nil
 }
 func (f *flow) disable() {
 	s := f.server

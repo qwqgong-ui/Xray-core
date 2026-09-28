@@ -38,7 +38,9 @@ func (s *Server) bindLeaseLocked(p []byte, a netip.AddrPort, now time.Time) bool
 	s.tuples[a] = f
 	f.leaseProbeUntil = time.Time{}
 	f.leaseUntil = now.Add(leaseDuration)
-	f.leaseProofCount = 0
+	f.leaseProof = nil
+	f.leaseProofNext = time.Time{}
+	f.leaseConfirmUntil = now.Add(3 * time.Second)
 	f.paused = true // wait for reliable acknowledgement before switching downstream
 	f.leaseUpReady = false
 	seq := f.leaseSeq
@@ -91,19 +93,14 @@ func (f *flow) handleLease(c leaseControl) error {
 		f.tuple = netip.AddrPort{}
 		f.leaseUntil = time.Time{}
 		f.leaseUpReady = false
+		f.leaseProof = nil
+		f.leaseConfirmUntil = time.Time{}
 		f.leaseSeq = c.seq
 		f.leaseDigest = c.digest
 		f.leaseProbeUntil = now.Add(3 * time.Second)
 	case leaseActivate:
-		if c.seq == f.leaseSeq && f.tuple.IsValid() && now.Before(f.leaseUntil) {
-			matched := false
-			for i := 0; i < min(f.leaseProofCount, len(f.leaseProofs)); i++ {
-				if f.leaseProofs[i] == c.digest {
-					matched = true
-					break
-				}
-			}
-			if !matched {
+		if c.seq == f.leaseSeq && f.tuple.IsValid() && now.Before(f.leaseUntil) && now.Before(f.leaseConfirmUntil) {
+			if len(f.leaseProof) == 0 || f.leaseProofDigest != c.digest {
 				s.mu.Unlock()
 				return nil
 			}
@@ -111,6 +108,8 @@ func (f *flow) handleLease(c leaseControl) error {
 			// acknowledgement can reach the client. Downstream stays mirrored
 			// until that acknowledgement has been written.
 			f.leaseUpReady = true
+			f.leaseConfirmUntil = time.Time{}
+			f.leaseProof = nil
 			s.mu.Unlock()
 			if err := f.sendLease(leaseControl{kind: leaseConfirmed, seq: c.seq}); err != nil {
 				return err
@@ -151,14 +150,21 @@ func (f *flow) probeLeaseDownstream(p []byte) {
 	}
 	s := f.server
 	s.mu.Lock()
-	if f.disabled || !f.paused || !f.tuple.IsValid() || !time.Now().Before(f.leaseUntil) || s.conn == nil {
+	now := time.Now()
+	if f.disabled || !f.paused || !f.tuple.IsValid() || !now.Before(f.leaseUntil) || !now.Before(f.leaseConfirmUntil) || now.Before(f.leaseProofNext) || s.conn == nil {
 		s.mu.Unlock()
 		return
 	}
-	f.leaseProofs[f.leaseProofCount%len(f.leaseProofs)] = sha256.Sum256(p)
-	f.leaseProofCount++
+	// Keep the first proof stable for this attempt. A burst must neither
+	// evict it before the ACK returns nor mirror the entire download to UDP.
+	if f.leaseProof == nil {
+		f.leaseProof = append([]byte(nil), p...)
+		f.leaseProofDigest = sha256.Sum256(p)
+	}
+	f.leaseProofNext = now.Add(250 * time.Millisecond)
+	proof := f.leaseProof
 	conn, tuple := s.conn, f.tuple
 	s.mu.Unlock()
 	// A failed probe leaves the reliable copy intact; the client will time out.
-	s.writeRaw(conn, tuple, [][]byte{p})
+	s.writeRaw(conn, tuple, [][]byte{proof})
 }
