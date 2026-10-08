@@ -7,7 +7,6 @@ import (
 
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
-	"github.com/xtls/xray-core/transport/internet"
 )
 
 // plainPacketConn hides *net.UDPConn, so a reader takes the one-datagram path.
@@ -26,7 +25,7 @@ func listenUDP(t *testing.T) *net.UDPConn {
 func newTestReader(t *testing.T, conn net.PacketConn, peer *net.UDPConn, h *Handler) *PacketReader {
 	t.Helper()
 	dest := net.DestinationFromAddr(peer.LocalAddr())
-	wrapper := &internet.PacketConnWrapper{PacketConn: conn, Dest: peer.LocalAddr()}
+	wrapper := &net.PacketConnWrapper{PacketConn: conn, Dest: peer.LocalAddr()}
 	r, ok := NewPacketReader(wrapper, h, nil, net.UDPDestination(nil, 0), dest).(*PacketReader)
 	if !ok {
 		t.Fatal("not a freedom PacketReader")
