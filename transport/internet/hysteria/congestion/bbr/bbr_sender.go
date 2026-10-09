@@ -681,6 +681,11 @@ func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
 	return bps
 }
 
+// PacingRateBytesPerSecond exposes the effective rate to optional Linux EDT.
+func (b *bbrSender) PacingRateBytesPerSecond() uint64 {
+	return uint64(b.bandwidthForPacer())
+}
+
 // Returns the current estimate of the RTT of the connection.  Outside of the
 // edge cases, this is minimum RTT.
 func (b *bbrSender) getMinRtt() time.Duration {

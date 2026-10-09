@@ -1,0 +1,652 @@
+diff --git a/connection.go b/connection.go
+index 2deffc6..395c0fe 100644
+--- a/connection.go
++++ b/connection.go
+@@ -210,6 +210,10 @@ type Conn struct {
+ 	// pacingDeadline is the time when the next packet should be sent
+ 	pacingDeadline monotime.Time
+ 
++	kernelPacingWanted   atomic.Bool
++	kernelPacingProvider atomic.Pointer[kernelPacingProvider]
++	kernelPacer          kernelPacingState
++
+ 	peerParams *wire.TransportParameters
+ 
+ 	timer *time.Timer
+@@ -2594,6 +2598,9 @@ func (c *Conn) sendPackets(now monotime.Time) error {
+ 		return nil
+ 	}
+ 
++	if c.kernelPacingReady() {
++		return c.sendPacketsWithKernelPacing(now)
++	}
+ 	if c.conn.capabilities().GSO {
+ 		return c.sendPacketsWithGSO(now)
+ 	}
+@@ -3195,6 +3202,7 @@ func estimateMaxPayloadSize(mtu protocol.ByteCount) protocol.ByteCount {
+ // SetCongestionControl replace the current congestion control algorithm with a new one.
+ func (c *Conn) SetCongestionControl(cc congestion.CongestionControl) {
+ 	c.sentPacketHandler.SetCongestionControl(cc)
++	c.setKernelPacingProvider(cc)
+ }
+ 
+ // InitialPacketSize returns the datagram size the connection starts out with,
+diff --git a/kernel_pacing.go b/kernel_pacing.go
+new file mode 100644
+index 0000000..7b66d64
+--- /dev/null
++++ b/kernel_pacing.go
+@@ -0,0 +1,167 @@
++package quic
++
++import (
++	"net"
++	"time"
++
++	"github.com/apernet/quic-go/congestion"
++	"github.com/apernet/quic-go/internal/ackhandler"
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++)
++
++func (c *sconn) enableKernelPacing() bool {
++	enabler, ok := c.rawConn.(interface{ enableKernelPacing() bool })
++	return ok && enabler.enableKernelPacing()
++}
++
++func (c *sconn) WriteWithTxTime(p []byte, ecn protocol.ECN, txtime uint64) error {
++	writer, ok := c.rawConn.(interface {
++		WritePacketWithTxTime([]byte, net.Addr, []byte, uint16, protocol.ECN, uint64) (int, error)
++	})
++	if !ok {
++		return c.Write(p, 0, ecn)
++	}
++	ai := c.remoteAddrInfo.Load()
++	_, err := writer.WritePacketWithTxTime(p, ai.addr, ai.oob, 0, ecn, txtime)
++	if err != nil && !c.wroteFirstPacket && isPermissionError(err) {
++		_, err = writer.WritePacketWithTxTime(p, ai.addr, ai.oob, 0, ecn, txtime)
++	}
++	c.wroteFirstPacket = true
++	return err
++}
++
++// Kernel pacing is opt-in per QUIC connection. Unsupported sockets / platforms
++// keep the existing user-space pacer and GSO path.
++type kernelPacingProvider struct{ rate func() uint64 }
++type kernelPacingState struct {
++	next        monotime.Time
++	departures  [32]monotime.Time
++	head, count int
++	provider    *kernelPacingProvider
++}
++
++const kernelPacingMaxLead = time.Millisecond
++
++// EnableKernelPacing asks Linux fq to schedule individual 1-RTT datagrams.
++// The congestion controller must implement PacingRateBytesPerSecond() uint64.
++// No wire-protocol changes are made. Handshakes, ACK-only and PTO probes retain
++// their existing immediate-send behavior.
++func (c *Conn) EnableKernelPacing() { c.kernelPacingWanted.Store(true) }
++
++func (c *Conn) setKernelPacingProvider(cc congestion.CongestionControl) {
++	var p *kernelPacingProvider
++	if r, ok := cc.(interface{ PacingRateBytesPerSecond() uint64 }); ok {
++		p = &kernelPacingProvider{rate: r.PacingRateBytesPerSecond}
++	}
++	c.kernelPacingProvider.Store(p)
++}
++
++func (c *Conn) kernelPacingReady() bool {
++	p := c.kernelPacingProvider.Load()
++	if !c.kernelPacingWanted.Load() || p == nil {
++		return false
++	}
++	enabler, ok := c.conn.(interface{ enableKernelPacing() bool })
++	if !ok || !enabler.enableKernelPacing() {
++		return false
++	}
++	if c.kernelPacer.provider != p {
++		c.kernelPacer = kernelPacingState{provider: p}
++	}
++	return true
++}
++
++func (p *kernelPacingState) waitUntil(now monotime.Time) monotime.Time {
++	for p.count > 0 && !p.departures[p.head].After(now) {
++		p.head = (p.head + 1) % len(p.departures)
++		p.count--
++	}
++	var deadline monotime.Time
++	if p.next.After(now.Add(kernelPacingMaxLead)) {
++		deadline = p.next.Add(-kernelPacingMaxLead)
++	}
++	if p.count == len(p.departures) {
++		slot := p.departures[p.head].Add(time.Nanosecond)
++		if slot.After(deadline) {
++			deadline = slot
++		}
++	}
++	return deadline
++}
++
++func (p *kernelPacingState) schedule(now monotime.Time, size protocol.ByteCount, rate uint64) (monotime.Time, time.Duration) {
++	if rate == 0 {
++		return 0, 0
++	}
++	departure := p.next
++	if departure.Before(now) {
++		departure = now
++	}
++	// Datagram sizes are bounded by QUIC; round up to avoid over-sending.
++	n := uint64(size) * uint64(time.Second)
++	interval := time.Duration(n / rate)
++	if n%rate != 0 {
++		interval++
++	}
++	if interval < time.Nanosecond {
++		interval = time.Nanosecond
++	}
++	p.next = departure.Add(interval)
++	p.departures[(p.head+p.count)%len(p.departures)] = departure
++	p.count++
++	return departure, interval
++}
++
++func (c *Conn) sendPacketsWithKernelPacing(now monotime.Time) error {
++	sender, ok := c.sendQueue.(interface {
++		SendWithTxTime(*packetBuffer, protocol.ECN, monotime.Time, time.Duration)
++	})
++	if !ok {
++		return c.sendPacketsWithoutGSO(now)
++	}
++	for {
++		now = monotime.Now()
++		if deadline := c.kernelPacer.waitUntil(now); !deadline.IsZero() {
++			c.pacingDeadline = deadline
++			return nil
++		}
++		rate := c.kernelPacer.provider.rate()
++		if rate == 0 {
++			return c.sendPacketsWithoutGSO(now)
++		}
++		buf := getPacketBuffer()
++		ecn := c.sentPacketHandler.ECNMode(true)
++		size, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now)
++		if err != nil {
++			buf.Release()
++			if err == errNothingToPack {
++				return nil
++			}
++			return err
++		}
++		departure, interval := c.kernelPacer.schedule(now, size, rate)
++		// Keep QUIC's existing enqueue-time accounting. Kernel lead is bounded to
++		// 1 ms and 32 datagrams; never inject future or foreign-clock timestamps
++		// into bandwidth / RTT / PTO accounting.
++		sender.SendWithTxTime(buf, ecn, departure, interval)
++		if c.sendQueue.WouldBlock() {
++			return nil
++		}
++		sendMode := c.sentPacketHandler.SendMode(now)
++		if sendMode == ackhandler.SendPacingLimited {
++			c.resetPacingDeadline()
++			return nil
++		}
++		if sendMode != ackhandler.SendAny {
++			return nil
++		}
++		c.receivedPacketMx.Lock()
++		hasPackets := !c.receivedPackets.Empty()
++		c.receivedPacketMx.Unlock()
++		if hasPackets {
++			c.pacingDeadline = deadlineSendImmediately
++			return nil
++		}
++	}
++}
+diff --git a/kernel_pacing_linux.go b/kernel_pacing_linux.go
+new file mode 100644
+index 0000000..98616ad
+--- /dev/null
++++ b/kernel_pacing_linux.go
+@@ -0,0 +1,59 @@
++//go:build linux && !android
++
++package quic
++
++import (
++	"encoding/binary"
++	"syscall"
++	"unsafe"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"golang.org/x/sys/unix"
++)
++
++func (c *oobConn) enableKernelPacing() bool {
++	c.kernelPacingOnce.Do(func() {
++		raw, err := c.SyscallConn()
++		if err != nil {
++			return
++		}
++		var option [8]byte // struct sock_txtime: clockid (s32), flags (u32)
++		binary.NativeEndian.PutUint32(option[:4], uint32(unix.CLOCK_MONOTONIC))
++		var sockErr error
++		err = raw.Control(func(fd uintptr) {
++			sockErr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET, unix.SO_TXTIME, string(option[:]))
++		})
++		c.kernelPacingOK = err == nil && sockErr == nil
++	})
++	return c.kernelPacingOK
++}
++
++func kernelTxTime(departure monotime.Time) (uint64, error) {
++	// quic-go monotime has a process-relative epoch, not the kernel's epoch.
++	// Read that clock first so syscall latency cannot make the kernel timestamp
++	// accidentally earlier than the requested departure.
++	now := monotime.Now()
++	var ts unix.Timespec
++	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts); err != nil {
++		return 0, err
++	}
++	lead := departure.Sub(now)
++	if lead < 0 {
++		lead = 0
++	}
++	return uint64(ts.Nano()) + uint64(lead), nil
++}
++
++func appendTxTimeMsg(oob []byte, txtime uint64) []byte {
++	if txtime == 0 {
++		return oob
++	}
++	start := len(oob)
++	oob = append(oob, make([]byte, unix.CmsgSpace(8))...)
++	h := (*unix.Cmsghdr)(unsafe.Pointer(&oob[start]))
++	h.Level = syscall.SOL_SOCKET
++	h.Type = unix.SCM_TXTIME
++	h.SetLen(unix.CmsgLen(8))
++	binary.NativeEndian.PutUint64(oob[start+unix.CmsgLen(0):], txtime)
++	return oob
++}
+diff --git a/kernel_pacing_linux_test.go b/kernel_pacing_linux_test.go
+new file mode 100644
+index 0000000..9c0bea7
+--- /dev/null
++++ b/kernel_pacing_linux_test.go
+@@ -0,0 +1,149 @@
++//go:build linux && !android
++
++package quic
++
++import (
++	"encoding/binary"
++	"net"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"golang.org/x/sys/unix"
++)
++
++func TestKernelPacingControlMessagesAndClock(t *testing.T) {
++	original := appendUDPSegmentSizeMsg(nil, 1200)
++	before := append([]byte(nil), original...)
++	oob := appendTxTimeMsg(original, 123456789)
++	msgs, err := unix.ParseSocketControlMessage(oob)
++	if err != nil || len(msgs) != 2 {
++		t.Fatalf("control messages: %v %v", msgs, err)
++	}
++	if msgs[0].Header.Type != unix.UDP_SEGMENT || binary.NativeEndian.Uint16(msgs[0].Data) != 1200 {
++		t.Fatal("GSO control lost")
++	}
++	if msgs[1].Header.Level != unix.SOL_SOCKET || msgs[1].Header.Type != unix.SCM_TXTIME || binary.NativeEndian.Uint64(msgs[1].Data) != 123456789 {
++		t.Fatal("incorrect TXTIME control")
++	}
++	if string(before) != string(original) {
++		t.Fatal("existing OOB modified")
++	}
++	departure := monotime.Now().Add(10 * time.Millisecond)
++	kt, err := kernelTxTime(departure)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var now unix.Timespec
++	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
++		t.Fatal(err)
++	}
++	delta := time.Duration(kt - uint64(now.Nano()))
++	if delta < 5*time.Millisecond || delta > 15*time.Millisecond {
++		t.Fatalf("wrong clock domain: %v", delta)
++	}
++}
++
++type kernelPacingTestConn struct {
++	sendConn
++	times []uint64
++	leads []time.Duration
++}
++
++func (c *kernelPacingTestConn) WriteWithTxTime(_ []byte, _ protocol.ECN, timestamp uint64) error {
++	c.times = append(c.times, timestamp)
++	now, _ := kernelTxTime(monotime.Now())
++	c.leads = append(c.leads, time.Duration(timestamp-now))
++	return nil
++}
++func TestKernelPacingLateWorkerKeepsSpacing(t *testing.T) {
++	conn := &kernelPacingTestConn{}
++	queue := newSendQueue(conn).(*sendQueue)
++	for range 4 {
++		buf := getPacketBuffer()
++		buf.Data = append(buf.Data, 1)
++		queue.SendWithTxTime(buf, protocol.ECT0, monotime.Now().Add(-time.Second), time.Millisecond)
++	}
++	done := make(chan error, 1)
++	go func() { done <- queue.Run() }()
++	queue.Close()
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++	if len(conn.times) != 4 {
++		t.Fatal("packets not drained")
++	}
++	for _, lead := range conn.leads {
++		if lead > kernelPacingMaxLead+100*time.Microsecond {
++			t.Fatalf("late worker exceeded kernel lead bound: %v", lead)
++		}
++	}
++	for i := 1; i < len(conn.times); i++ {
++		if conn.times[i]-conn.times[i-1] < uint64(time.Millisecond) {
++			t.Fatal("overdue packets burst together")
++		}
++	}
++}
++
++func TestKernelPacingFQIntegration(t *testing.T) {
++	peer := os.Getenv("QUIC_KERNEL_PACING_PEER")
++	if peer == "" {
++		t.Skip("requires isolated veth namespaces with fq and echo receiver")
++	}
++	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer udp.Close()
++	raw, err := newConn(udp, false, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !raw.enableKernelPacing() {
++		t.Fatal("SO_TXTIME unavailable")
++	}
++	base, err := kernelTxTime(monotime.Now().Add(30 * time.Millisecond))
++	if err != nil {
++		t.Fatal(err)
++	}
++	planned := make(map[byte]uint64)
++	for stream := 0; stream < 2; stream++ {
++		for i := 0; i < 10; i++ {
++			id := byte(stream*10 + i)
++			timestamp := base + uint64(i)*uint64(time.Duration(stream+2)*time.Millisecond)
++			planned[id] = timestamp
++			if _, err := raw.WritePacketWithTxTime([]byte{id}, &net.UDPAddr{IP: net.ParseIP(peer), Port: 34567 + stream}, nil, 0, protocol.ECT0, timestamp); err != nil {
++				t.Fatal(err)
++			}
++		}
++	}
++	udp.SetReadDeadline(time.Now().Add(3 * time.Second))
++	actual := make(map[byte]uint64)
++	for len(actual) < len(planned) {
++		var buf [64]byte
++		n, _, err := udp.ReadFromUDP(buf[:])
++		if err != nil {
++			t.Fatal(err)
++		}
++		if n != 9 {
++			t.Fatalf("invalid echo size %d", n)
++		}
++		id := buf[0]
++		got := binary.BigEndian.Uint64(buf[1:9])
++		if got+uint64(100*time.Microsecond) < planned[id] {
++			t.Fatalf("packet %d sent early by %v", id, time.Duration(planned[id]-got))
++		}
++		actual[id] = got
++	}
++	for stream := 0; stream < 2; stream++ {
++		first := byte(stream * 10)
++		span := time.Duration(actual[first+9] - actual[first])
++		minimum := time.Duration(9*(stream+2))*time.Millisecond - 3*time.Millisecond
++		if span < minimum {
++			t.Fatalf("stream %d burst instead of paced: %v", stream, span)
++		}
++		t.Logf("shared UDP stream %d: 10 packets, receiver span %v", stream, span)
++	}
++}
+diff --git a/kernel_pacing_other.go b/kernel_pacing_other.go
+new file mode 100644
+index 0000000..966b925
+--- /dev/null
++++ b/kernel_pacing_other.go
+@@ -0,0 +1,13 @@
++//go:build !linux || android
++
++package quic
++
++import (
++	"errors"
++	"github.com/apernet/quic-go/internal/monotime"
++)
++
++func kernelTxTime(monotime.Time) (uint64, error) {
++	return 0, errors.New("kernel pacing unavailable")
++}
++func appendTxTimeMsg(oob []byte, _ uint64) []byte { return oob }
+diff --git a/kernel_pacing_test.go b/kernel_pacing_test.go
+new file mode 100644
+index 0000000..46dc683
+--- /dev/null
++++ b/kernel_pacing_test.go
+@@ -0,0 +1,58 @@
++package quic
++
++import (
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"testing"
++	"time"
++)
++
++func TestKernelPacingRateAndLeadBound(t *testing.T) {
++	p := kernelPacingState{}
++	now := monotime.Time(time.Hour)
++	a, interval := p.schedule(now, 1200, 1_200_000)
++	if a != now || interval != time.Millisecond {
++		t.Fatalf("departure=%v interval=%v", a, interval)
++	}
++	b, _ := p.schedule(now, 1200, 1_200_000)
++	if b != now.Add(time.Millisecond) {
++		t.Fatalf("spacing: %v", b.Sub(a))
++	}
++	if wait := p.waitUntil(now); wait != now.Add(time.Millisecond) {
++		t.Fatalf("lead not bounded: %v", wait.Sub(now))
++	}
++	p.waitUntil(now.Add(time.Second))
++	d, slow := p.schedule(now.Add(time.Second), 1200, 120_000)
++	if d != now.Add(time.Second) || slow != 10*time.Millisecond {
++		t.Fatal("idle reset or bandwidth change broken")
++	}
++}
++
++func TestKernelPacingDatagramBoundAndIndependentConnections(t *testing.T) {
++	now := monotime.Time(time.Hour)
++	p := kernelPacingState{}
++	for range len(p.departures) {
++		p.schedule(now, protocol.ByteCount(1200), 1_200_000_000)
++	}
++	if p.waitUntil(now.Add(-time.Nanosecond)).IsZero() {
++		t.Fatal("unbounded kernel queue")
++	}
++	other := kernelPacingState{}
++	departure, _ := other.schedule(now, 1200, 1000)
++	if departure != now {
++		t.Fatal("connections share pacing state")
++	}
++	p.waitUntil(now.Add(time.Second))
++	if p.count != 0 {
++		t.Fatal("expired reservations retained")
++	}
++}
++
++func TestKernelPacingUnsupportedSocketFallback(t *testing.T) {
++	c := &Conn{}
++	c.EnableKernelPacing()
++	c.kernelPacingProvider.Store(&kernelPacingProvider{rate: func() uint64 { return 1000 }})
++	if c.kernelPacingReady() {
++		t.Fatal("nil / unsupported socket enabled kernel pacing")
++	}
++}
+diff --git a/send_conn.go b/send_conn.go
+index 75a87df..65256e2 100644
+--- a/send_conn.go
++++ b/send_conn.go
+@@ -57,7 +57,7 @@ func newSendConn(c rawConn, remote net.Addr, info packetInfo, logger utils.Logge
+ 	oob := info.OOB()
+ 	// increase oob slice capacity, so we can add the UDP_SEGMENT and ECN control messages without allocating
+ 	l := len(oob)
+-	oob = append(oob, make([]byte, 64)...)[:l]
++	oob = append(oob, make([]byte, 96)...)[:l]
+ 	sc := &sconn{
+ 		rawConn:   c,
+ 		localAddr: localAddr,
+diff --git a/send_queue.go b/send_queue.go
+index cabc1c4..0dbe4e7 100644
+--- a/send_queue.go
++++ b/send_queue.go
+@@ -3,6 +3,9 @@ package quic
+ import (
+ 	"errors"
+ 	"net"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
+ 
+ 	"github.com/apernet/quic-go/internal/protocol"
+ )
+@@ -17,9 +20,11 @@ type sender interface {
+ }
+ 
+ type queueEntry struct {
+-	buf     *packetBuffer
+-	gsoSize uint16
+-	ecn     protocol.ECN
++	buf       *packetBuffer
++	gsoSize   uint16
++	ecn       protocol.ECN
++	departure monotime.Time
++	interval  time.Duration
+ }
+ 
+ type sendQueue struct {
+@@ -48,8 +53,16 @@ func newSendQueue(conn sendConn) sender {
+ // Callers need to make sure that there's actually space in the send queue by calling WouldBlock.
+ // Otherwise Send will panic.
+ func (h *sendQueue) Send(p *packetBuffer, gsoSize uint16, ecn protocol.ECN) {
++	h.enqueue(queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn})
++}
++
++func (h *sendQueue) SendWithTxTime(p *packetBuffer, ecn protocol.ECN, departure monotime.Time, interval time.Duration) {
++	h.enqueue(queueEntry{buf: p, ecn: ecn, departure: departure, interval: interval})
++}
++
++func (h *sendQueue) enqueue(entry queueEntry) {
+ 	select {
+-	case h.queue <- queueEntry{buf: p, gsoSize: gsoSize, ecn: ecn}:
++	case h.queue <- entry:
+ 		// clear available channel if we've reached capacity
+ 		if len(h.queue) == sendQueueCapacity {
+ 			select {
+@@ -78,6 +91,7 @@ func (h *sendQueue) Available() <-chan struct{} {
+ func (h *sendQueue) Run() error {
+ 	defer close(h.runStopped)
+ 	var shouldClose bool
++	var nextTx uint64
+ 	for {
+ 		if shouldClose && len(h.queue) == 0 {
+ 			return nil
+@@ -88,7 +102,40 @@ func (h *sendQueue) Run() error {
+ 			// make sure that all queued packets are actually sent out
+ 			shouldClose = true
+ 		case e := <-h.queue:
+-			if err := h.conn.Write(e.buf.Data, e.gsoSize, e.ecn); err != nil {
++			var err error
++			if writer, ok := h.conn.(interface {
++				WriteWithTxTime([]byte, protocol.ECN, uint64) error
++			}); ok && !e.departure.IsZero() {
++				for {
++					txtime, clockErr := kernelTxTime(e.departure)
++					if clockErr != nil {
++						err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
++						break
++					}
++					// A delayed worker must preserve spacing rather than release
++					// all overdue entries as an immediate burst.
++					if txtime < nextTx {
++						txtime = nextTx
++					}
++					kernelNow, clockErr := kernelTxTime(monotime.Now())
++					if clockErr != nil {
++						err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
++						break
++					}
++					if txtime > kernelNow+uint64(kernelPacingMaxLead) {
++						// Catch-up traffic remains in the bounded user-space queue;
++						// never shift a delayed batch far into the kernel's future.
++						time.Sleep(time.Duration(txtime-kernelNow) - kernelPacingMaxLead)
++						continue
++					}
++					nextTx = txtime + uint64(e.interval)
++					err = writer.WriteWithTxTime(e.buf.Data, e.ecn, txtime)
++					break
++				}
++			} else {
++				err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
++			}
++			if err != nil {
+ 				// This additional check enables:
+ 				// 1. Checking for "datagram too large" message from the kernel, as such,
+ 				// 2. Path MTU discovery,and
+diff --git a/sys_conn_oob.go b/sys_conn_oob.go
+index 1a56d3c..e56728d 100644
+--- a/sys_conn_oob.go
++++ b/sys_conn_oob.go
+@@ -74,6 +74,9 @@ type oobConn struct {
+ 	buffers  [batchSize]*packetBuffer
+ 
+ 	cap connCapabilities
++
++	kernelPacingOnce sync.Once
++	kernelPacingOK   bool
+ }
+ 
+ var _ rawConn = &oobConn{}
+@@ -245,6 +248,10 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
+ 
+ // WritePacket writes a new packet.
+ func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
++	return c.WritePacketWithTxTime(b, addr, packetInfoOOB, gsoSize, ecn, 0)
++}
++
++func (c *oobConn) WritePacketWithTxTime(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN, txtime uint64) (int, error) {
+ 	oob := packetInfoOOB
+ 	if gsoSize > 0 {
+ 		if !c.capabilities().GSO {
+@@ -270,6 +277,7 @@ func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gso
+ 			}
+ 		}
+ 	}
++	oob = appendTxTimeMsg(oob, txtime)
+ 	n, _, err := c.WriteMsgUDP(b, oob, addr.(*net.UDPAddr))
+ 	return n, err
+ }

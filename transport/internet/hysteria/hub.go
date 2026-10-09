@@ -88,6 +88,7 @@ func (h *httpHandler) AuthHTTP(w http.ResponseWriter, r *http.Request) bool {
 				panic(quicParams.Congestion)
 			}
 
+			conn.EnableKernelPacing()
 			if h.validator != nil {
 				udpSM := &udpSessionManager{
 					conn: h.conn,

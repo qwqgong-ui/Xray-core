@@ -209,6 +209,7 @@ func (c *client) dial(ctx context.Context) error {
 	}
 
 	c.pktConn = pktConn
+	conn.EnableKernelPacing()
 	c.tr = tr
 	c.conn = conn
 	c.udpSM = &udpSessionManager{
