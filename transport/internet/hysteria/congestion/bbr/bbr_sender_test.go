@@ -1,9 +1,12 @@
 package bbr
 
 import (
+	"math"
 	"testing"
+	"time"
 
 	"github.com/apernet/quic-go/congestion"
+	"github.com/apernet/quic-go/monotime"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,6 +31,70 @@ func TestSetMaxDatagramSizeRescalesPacketSizedWindows(t *testing.T) {
 	require.Equal(t, maxCongestionWindowPackets*newMaxDatagramSize, b.maxCongestionWindow)
 	require.Equal(t, minCongestionWindowPackets*newMaxDatagramSize, b.minCongestionWindow)
 	require.Equal(t, initialCongestionWindowPackets*newMaxDatagramSize, b.congestionWindow)
+}
+
+func TestBBRPostSendFlightStartsAndRestartsSampler(t *testing.T) {
+	b, _ := newECNTestSender()
+	const size = congestion.ByteCount(1200)
+	now := monotime.Now()
+	b.OnPacketSent(now, size, 1, size, true)
+	require.True(t, b.exitingQuiescence)
+	state := b.sampler.connectionStateMap.GetEntry(1)
+	require.Equal(t, size, state.sendTimeState.bytesInFlight)
+	require.Equal(t, now, state.lastAckedPacketSentTime)
+	b.OnCongestionEventEx(size, now.Add(20*time.Millisecond), []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: size}}, nil)
+	require.Positive(t, b.bandwidthEstimate())
+	b.exitingQuiescence = false
+	b.OnPacketSent(now.Add(time.Second), size, 2, size, true)
+	require.True(t, b.exitingQuiescence)
+	require.Equal(t, now.Add(time.Second), b.sampler.connectionStateMap.GetEntry(2).lastAckedPacketSentTime)
+	// ACK-only packets do not represent a new flight of application data.
+	b.exitingQuiescence = false
+	b.OnPacketSent(now.Add(2*time.Second), 0, 3, 40, false)
+	require.False(t, b.exitingQuiescence)
+}
+
+func TestBBRLossOnlyEventEntersAndExtendsRecovery(t *testing.T) {
+	b, _ := newECNTestSender()
+	b.isAtFullBandwidth = true
+	now := monotime.Now()
+	for i := congestion.PacketNumber(1); i <= 3; i++ {
+		b.OnPacketSent(now, congestion.ByteCount(i)*1200, i, 1200, true)
+	}
+	b.OnCongestionEventEx(3600, now.Add(time.Second), nil, []congestion.LostPacketInfo{{PacketNumber: 1, BytesLost: 1200}})
+	require.True(t, b.InRecovery())
+	require.Equal(t, congestion.PacketNumber(3), b.endRecoveryAt)
+	b.OnPacketSent(now.Add(2*time.Second), 3600, 4, 1200, true)
+	b.OnCongestionEventEx(3600, now.Add(3*time.Second), nil, []congestion.LostPacketInfo{{PacketNumber: 2, BytesLost: 1200}})
+	require.Equal(t, congestion.PacketNumber(4), b.endRecoveryAt)
+	require.NotPanics(t, func() { b.OnCongestionEventEx(0, now, nil, nil) })
+}
+
+func TestBBREffectivePacingRatePreservesSlowLink(t *testing.T) {
+	b, _ := newECNTestSender()
+	b.pacingRate = 8_000
+	require.Equal(t, uint64(1000), b.PacingRateBytesPerSecond())
+	b.pacingRate = 1
+	require.Equal(t, uint64(1), b.PacingRateBytesPerSecond())
+}
+
+func TestBBRSmallFlightACKIsNotApplicationLimited(t *testing.T) {
+	b, _ := newECNTestSender()
+	now := monotime.Now()
+	b.OnPacketSent(now, 1200, 1, 1200, true)
+	b.OnCongestionEventEx(1200, now.Add(20*time.Millisecond), []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: 1200}}, nil)
+	require.False(t, b.sampler.IsAppLimited())
+	b.OnAppLimited()
+	require.True(t, b.sampler.IsAppLimited())
+}
+
+func TestBBRBandwidthArithmeticDoesNotOverflow(t *testing.T) {
+	const bytes = congestion.ByteCount(1_000_000_000)
+	require.Equal(t, Bandwidth(8_000_000_000), BandwidthFromDelta(bytes, time.Second))
+	require.Equal(t, bytes, bytesFromBandwidthAndTimeDelta(8_000_000_000, time.Second))
+	require.Equal(t, time.Second, timeDeltaFromBytesAndBandwidth(bytes, 8_000_000_000))
+	require.Equal(t, congestion.ByteCount(math.MaxInt64), bytesFromBandwidthAndTimeDelta(infBandwidth, time.Hour))
+	require.Equal(t, infBandwidth, BandwidthFromDelta(math.MaxInt64, time.Nanosecond))
 }
 
 func TestSetMaxDatagramSizeClampsCongestionWindow(t *testing.T) {

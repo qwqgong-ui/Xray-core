@@ -17,6 +17,38 @@ type ecnTestRTTStats struct {
 	smoothedRTT time.Duration
 }
 
+func TestECNFreezeAndShrinkRespectDrainAndRecovery(t *testing.T) {
+	for _, phase := range []ecnBBRPhase{ecnPhaseFreeze, ecnPhaseShrink} {
+		for _, mode := range []bbrMode{bbrModeDrain, bbrModeProbeRtt, bbrModeProbeBw} {
+			b, _ := newECNTestSender()
+			confirmZeroCE(b)
+			b.OnECNFeedback(true, false, 15, 0, 1)
+			if phase == ecnPhaseShrink {
+				b.OnECNFeedback(true, false, 15, 0, 1)
+			}
+			b.mode = mode
+			if mode == bbrModeProbeBw {
+				b.recoveryState = bbrRecoveryStateConservation
+			}
+			b.pacingRate = testBandwidth / 4
+			b.congestionWindow = b.minCongestionWindow
+			b.applyECNPolicy(true, true)
+			require.LessOrEqual(t, b.PacingRate(), testBandwidth/4)
+			require.Equal(t, b.minCongestionWindow, b.GetCongestionWindow())
+		}
+	}
+}
+
+func TestECNPathMigrationResetsMTUAndPacer(t *testing.T) {
+	b, _ := newECNTestSender()
+	b.SetMaxDatagramSize(1452)
+	b.OnPathMigrationWithMTU(1200)
+	require.Equal(t, congestion.ByteCount(1200), b.maxDatagramSize)
+	require.Equal(t, congestion.ByteCount(4800), b.minCongestionWindow)
+	require.NotPanics(t, func() { b.SetMaxDatagramSize(1300) })
+	require.True(t, b.HasPacingBudget(b.clock.Now()))
+}
+
 func (s *ecnTestRTTStats) MinRTT() time.Duration                  { return s.minRTT }
 func (s *ecnTestRTTStats) LatestRTT() time.Duration               { return s.latestRTT }
 func (s *ecnTestRTTStats) SmoothedRTT() time.Duration             { return s.smoothedRTT }

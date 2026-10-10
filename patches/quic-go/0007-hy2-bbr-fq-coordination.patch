@@ -1,0 +1,1426 @@
+diff --git a/connection.go b/connection.go
+index 395c0fe..4ad408b 100644
+--- a/connection.go
++++ b/connection.go
+@@ -211,6 +211,7 @@ type Conn struct {
+ 	pacingDeadline monotime.Time
+ 
+ 	kernelPacingWanted   atomic.Bool
++	kernelPacingActive   atomic.Bool
+ 	kernelPacingProvider atomic.Pointer[kernelPacingProvider]
+ 	kernelPacer          kernelPacingState
+ 
+@@ -943,6 +944,7 @@ func (c *Conn) idleTimeoutStartTime() monotime.Time {
+ func (c *Conn) switchToNewPath(tr *Transport, now monotime.Time) {
+ 	initialPacketSize := protocol.ByteCount(c.config.InitialPacketSize)
+ 	c.sentPacketHandler.MigratedPath(now, initialPacketSize)
++	c.resetKernelPacing()
+ 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
+ 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
+ 		maxPacketSize = c.peerParams.MaxUDPPayloadSize
+@@ -1328,6 +1330,7 @@ func (c *Conn) handleShortHeaderPacket(
+ 	}
+ 	c.pathManager.SwitchToPath(p.remoteAddr)
+ 	c.sentPacketHandler.MigratedPath(p.rcvTime, protocol.ByteCount(c.config.InitialPacketSize))
++	c.resetKernelPacing()
+ 	maxPacketSize := protocol.ByteCount(protocol.MaxPacketBufferSize)
+ 	if c.peerParams.MaxUDPPayloadSize > 0 && c.peerParams.MaxUDPPayloadSize < maxPacketSize {
+ 		maxPacketSize = c.peerParams.MaxUDPPayloadSize
+@@ -2158,6 +2161,13 @@ func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encryption
+ 	if !acked1RTTPacket {
+ 		return nil
+ 	}
++	if c.kernelPacingWanted.Load() && c.kernelPacingProvider.Load() != nil {
++		// A decimated ACK threshold can exceed BBR's four-packet minimum
++		// window. Bound sparse-flight feedback by this path's RTT while
++		// retaining the packet-count savings on bulk transfers.
++		delay := min(protocol.MaxAckDelay, max(time.Millisecond, c.rttStats.SmoothedRTT()/4))
++		c.receivedPacketHandler.SetAckDelay(delay)
++	}
+ 	// On the client side: If the packet acknowledged a 1-RTT packet, this confirms the handshake.
+ 	// This is only possible if the ACK was sent in a 1-RTT packet.
+ 	// This is an optimization over simply waiting for a HANDSHAKE_DONE frame, see section 4.1.2 of RFC 9001.
+@@ -2496,7 +2506,7 @@ func (c *Conn) applyTransportParameters() {
+ func (c *Conn) triggerSending(now monotime.Time) error {
+ 	c.pacingDeadline = 0
+ 
+-	sendMode := c.sentPacketHandler.SendMode(now)
++	sendMode := c.sendMode(now)
+ 	switch sendMode {
+ 	case ackhandler.SendAny:
+ 		return c.sendPackets(now)
+@@ -2613,6 +2623,7 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
+ 		ecn := c.sentPacketHandler.ECNMode(true)
+ 		if _, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now); err != nil {
+ 			if err == errNothingToPack {
++				c.notifyAppLimited()
+ 				buf.Release()
+ 				return nil
+ 			}
+@@ -2655,6 +2666,7 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
+ 			if err != errNothingToPack {
+ 				return err
+ 			}
++			c.notifyAppLimited()
+ 			if buf.Len() == 0 {
+ 				buf.Release()
+ 				return nil
+@@ -2715,6 +2727,12 @@ func (c *Conn) resetPacingDeadline() {
+ 	c.pacingDeadline = deadline
+ }
+ 
++func (c *Conn) notifyAppLimited() {
++	if receiver, ok := c.sentPacketHandler.(interface{ OnAppLimited() }); ok {
++		receiver.OnAppLimited()
++	}
++}
++
+ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+ 	if !c.handshakeConfirmed {
+ 		ecn := c.sentPacketHandler.ECNMode(false)
+@@ -2731,6 +2749,9 @@ func (c *Conn) maybeSendAckOnlyPacket(now monotime.Time) error {
+ 	ecn := c.sentPacketHandler.ECNMode(true)
+ 	p, buf, err := c.packer.PackAckOnlyPacket(c.maxPacketSize(), now, c.version)
+ 	if err != nil {
++		if buf != nil {
++			buf.Release()
++		}
+ 		if err == errNothingToPack {
+ 			return nil
+ 		}
+diff --git a/internal/ackhandler/ack_decimation_test.go b/internal/ackhandler/ack_decimation_test.go
+index 4ed9399..d39f410 100644
+--- a/internal/ackhandler/ack_decimation_test.go
++++ b/internal/ackhandler/ack_decimation_test.go
+@@ -124,16 +124,30 @@ func TestAckDecimationKeepsMaxAckDelay(t *testing.T) {
+ 	}
+ 
+ 	// Short of the threshold no ACK is queued, but the alarm stays armed at
+-	// max_ack_delay from the most recent packet.
++	// max_ack_delay from the first unacknowledged packet.
+ 	now := monotime.Now()
++	deadline := now.Add(time.Millisecond + protocol.MaxAckDelay)
+ 	for i := 0; i < maxPacketsBeforeAck-1; i++ {
+ 		now = now.Add(time.Millisecond)
+ 		require.NoError(t, tr.ReceivedPacket(pn, protocol.ECNNon, now, true))
+ 		require.Nil(t, tr.GetAckFrame(now, true))
+-		require.Equal(t, now.Add(protocol.MaxAckDelay), tr.GetAlarmTimeout())
++		require.Equal(t, deadline, tr.GetAlarmTimeout())
+ 		pn++
+ 	}
+ 
+ 	// The alarm fires on time and produces the ACK.
+ 	require.NotNil(t, tr.GetAckFrame(now.Add(protocol.MaxAckDelay), true))
+ }
++
++func TestAckDecimationSparseBBRFlightUsesRTTBudget(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.ackThreshold = maxPacketsBeforeAck
++	tr.pathSettled = true
++	tr.SetAckDelay(time.Millisecond)
++	now := monotime.Now()
++	for i := 0; i < 4; i++ {
++		require.NoError(t, tr.ReceivedPacket(protocol.PacketNumber(i+1), protocol.ECNNon, now.Add(time.Duration(i)*100*time.Microsecond), true))
++	}
++	require.Equal(t, now.Add(time.Millisecond), tr.GetAlarmTimeout())
++	require.NotNil(t, tr.GetAckFrame(now.Add(time.Millisecond), true))
++}
+diff --git a/internal/ackhandler/cc_adapter.go b/internal/ackhandler/cc_adapter.go
+index da3d9c3..d497ad5 100644
+--- a/internal/ackhandler/cc_adapter.go
++++ b/internal/ackhandler/cc_adapter.go
+@@ -21,6 +21,8 @@ func (a *ccAdapter) HasPacingBudget(now monotime.Time) bool {
+ 	return a.CC.HasPacingBudget(now)
+ }
+ 
++func (a *ccAdapter) OnAppLimited() { forwardAppLimited(a.CC) }
++
+ func (a *ccAdapter) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytes protocol.ByteCount, isRetransmittable bool) {
+ 	a.CC.OnPacketSent(sentTime, congestion.ByteCount(bytesInFlight), congestion.PacketNumber(packetNumber), congestion.ByteCount(bytes), isRetransmittable)
+ }
+@@ -47,6 +49,10 @@ func (a *ccAdapter) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64
+ 
+ func (a *ccAdapter) OnPathMigration() bool { return forwardPathMigration(a.CC) }
+ 
++func (a *ccAdapter) OnPathMigrationWithMTU(size protocol.ByteCount) bool {
++	return forwardPathMigrationWithMTU(a.CC, size)
++}
++
+ func (a *ccAdapter) OnRetransmissionTimeout(packetsRetransmitted bool) {
+ 	a.CC.OnRetransmissionTimeout(packetsRetransmitted)
+ }
+diff --git a/internal/ackhandler/cc_adapter_ex.go b/internal/ackhandler/cc_adapter_ex.go
+index 89abc4d..b2f19db 100644
+--- a/internal/ackhandler/cc_adapter_ex.go
++++ b/internal/ackhandler/cc_adapter_ex.go
+@@ -24,6 +24,8 @@ func (a *ccAdapterEx) HasPacingBudget(now monotime.Time) bool {
+ 	return a.CC.HasPacingBudget(now)
+ }
+ 
++func (a *ccAdapterEx) OnAppLimited() { forwardAppLimited(a.CC) }
++
+ func (a *ccAdapterEx) OnPacketSent(sentTime monotime.Time, bytesInFlight protocol.ByteCount, packetNumber protocol.PacketNumber, bytes protocol.ByteCount, isRetransmittable bool) {
+ 	a.CC.OnPacketSent(sentTime, congestion.ByteCount(bytesInFlight), congestion.PacketNumber(packetNumber), congestion.ByteCount(bytes), isRetransmittable)
+ }
+@@ -54,6 +56,10 @@ func (a *ccAdapterEx) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint
+ 
+ func (a *ccAdapterEx) OnPathMigration() bool { return forwardPathMigration(a.CC) }
+ 
++func (a *ccAdapterEx) OnPathMigrationWithMTU(size protocol.ByteCount) bool {
++	return forwardPathMigrationWithMTU(a.CC, size)
++}
++
+ func (a *ccAdapterEx) OnRetransmissionTimeout(packetsRetransmitted bool) {
+ 	a.CC.OnRetransmissionTimeout(packetsRetransmitted)
+ }
+diff --git a/internal/ackhandler/congestion_signals.go b/internal/ackhandler/congestion_signals.go
+index cbdbc3c..31413b0 100644
+--- a/internal/ackhandler/congestion_signals.go
++++ b/internal/ackhandler/congestion_signals.go
+@@ -1,5 +1,28 @@
+ package ackhandler
+ 
++import (
++	"github.com/apernet/quic-go/congestion"
++	"github.com/apernet/quic-go/internal/protocol"
++)
++
++type pathMigrationWithMTUReceiver interface {
++	OnPathMigrationWithMTU(protocol.ByteCount) bool
++}
++
++func forwardAppLimited(cc any) {
++	if receiver, ok := cc.(interface{ OnAppLimited() }); ok {
++		receiver.OnAppLimited()
++	}
++}
++
++func forwardPathMigrationWithMTU(cc any, size protocol.ByteCount) bool {
++	if receiver, ok := cc.(interface{ OnPathMigrationWithMTU(congestion.ByteCount) }); ok {
++		receiver.OnPathMigrationWithMTU(congestion.ByteCount(size))
++		return true
++	}
++	return forwardPathMigration(cc)
++}
++
+ // These optional interfaces deliberately use primitive arguments. External
+ // congestion controllers can consume validated ACK_ECN deltas and path changes
+ // without changing the public CongestionControl interface.
+diff --git a/internal/ackhandler/received_packet_handler.go b/internal/ackhandler/received_packet_handler.go
+index e6b88c2..a8cbe47 100644
+--- a/internal/ackhandler/received_packet_handler.go
++++ b/internal/ackhandler/received_packet_handler.go
+@@ -2,6 +2,7 @@ package ackhandler
+ 
+ import (
+ 	"fmt"
++	"time"
+ 
+ 	"github.com/apernet/quic-go/internal/monotime"
+ 	"github.com/apernet/quic-go/internal/protocol"
+@@ -68,6 +69,10 @@ func (h *ReceivedPacketHandler) SetPathSettled(settled bool) {
+ 	h.appDataPackets.SetPathSettled(settled)
+ }
+ 
++func (h *ReceivedPacketHandler) SetAckDelay(delay time.Duration) {
++	h.appDataPackets.SetAckDelay(delay)
++}
++
+ func (h *ReceivedPacketHandler) DropPackets(encLevel protocol.EncryptionLevel) {
+ 	//nolint:exhaustive // 1-RTT packet number space is never dropped.
+ 	switch encLevel {
+diff --git a/internal/ackhandler/received_packet_tracker.go b/internal/ackhandler/received_packet_tracker.go
+index d54f9d3..59e82e0 100644
+--- a/internal/ackhandler/received_packet_tracker.go
++++ b/internal/ackhandler/received_packet_tracker.go
+@@ -152,6 +152,13 @@ func (h *appDataReceivedPacketTracker) resetAckThreshold() {
+ 	h.quietPacketsSinceStep = 0
+ }
+ 
++func (h *appDataReceivedPacketTracker) SetAckDelay(delay time.Duration) {
++	h.maxAckDelay = min(protocol.MaxAckDelay, max(time.Nanosecond, delay))
++	if !h.ackAlarm.IsZero() {
++		h.ackAlarm = min(h.ackAlarm, h.largestObservedRcvdTime.Add(h.maxAckDelay))
++	}
++}
++
+ // recordQuietPacket counts an ack-eliciting packet that arrived with nothing
+ // wrong, and steps the threshold up once enough of them have.
+ func (h *appDataReceivedPacketTracker) recordQuietPacket() {
+@@ -194,7 +201,7 @@ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber,
+ 		h.ackQueued = true
+ 		h.ackAlarm = 0 // cancel the ack alarm
+ 	}
+-	if !h.ackQueued {
++	if !h.ackQueued && h.ackAlarm.IsZero() {
+ 		// No ACK queued, but we'll need to acknowledge the packet after max_ack_delay.
+ 		h.ackAlarm = rcvTime.Add(h.maxAckDelay)
+ 		if h.logger.Debug() {
+diff --git a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
+index 8d76588..c3f6e47 100644
+--- a/internal/ackhandler/sent_packet_handler.go
++++ b/internal/ackhandler/sent_packet_handler.go
+@@ -1114,9 +1114,13 @@ func (h *sentPacketHandler) TimeUntilSend() monotime.Time {
+ 	return h.getCongestionControl().TimeUntilSend(h.bytesInFlight)
+ }
+ 
++func (h *sentPacketHandler) OnAppLimited() { forwardAppLimited(h.getCongestionControl()) }
++
+ func (h *sentPacketHandler) SetMaxDatagramSize(s protocol.ByteCount) {
++	h.congestionMutex.Lock()
++	defer h.congestionMutex.Unlock()
+ 	h.maxDatagramSize = s
+-	h.getCongestionControl().SetMaxDatagramSize(s)
++	h.congestion.SetMaxDatagramSize(s)
+ }
+ 
+ func (h *sentPacketHandler) SetLastDatagramPadding(n protocol.ByteCount) {
+@@ -1210,6 +1214,9 @@ func (h *sentPacketHandler) ResetForRetry(now monotime.Time) {
+ }
+ 
+ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
++	h.congestionMutex.Lock()
++	h.maxDatagramSize = initialMaxDatagramSize
++	h.congestionMutex.Unlock()
+ 	h.rttStats.ResetForPathMigration()
+ 	if h.enableECN {
+ 		h.ecnTracker = newECNTracker(h.logger, h.qlogger)
+@@ -1228,7 +1235,9 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
+ 	}
+ 	cc := h.getCongestionControl()
+ 	migrationHandled := false
+-	if receiver, ok := cc.(pathMigrationReceiver); ok {
++	if receiver, ok := cc.(pathMigrationWithMTUReceiver); ok {
++		migrationHandled = receiver.OnPathMigrationWithMTU(initialMaxDatagramSize)
++	} else if receiver, ok := cc.(pathMigrationReceiver); ok {
+ 		migrationHandled = receiver.OnPathMigration()
+ 	}
+ 	if !migrationHandled {
+@@ -1254,6 +1263,9 @@ func (h *sentPacketHandler) getCongestionControl() congestion.SendAlgorithmWithD
+ func (h *sentPacketHandler) SetCongestionControl(cc congestionExt.CongestionControl) {
+ 	h.congestionMutex.Lock()
+ 	cc.SetRTTStatsProvider(h.rttStats)
++	if h.maxDatagramSize > 0 {
++		cc.SetMaxDatagramSize(congestionExt.ByteCount(h.maxDatagramSize))
++	}
+ 	if ccEx, isEx := cc.(congestionExt.CongestionControlEx); isEx {
+ 		h.congestion = &ccAdapterEx{ccEx}
+ 	} else {
+diff --git a/kernel_pacing.go b/kernel_pacing.go
+index 7b66d64..962d9e4 100644
+--- a/kernel_pacing.go
++++ b/kernel_pacing.go
+@@ -2,6 +2,9 @@ package quic
+ 
+ import (
+ 	"net"
++	"os"
++	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/apernet/quic-go/congestion"
+@@ -12,7 +15,7 @@ import (
+ 
+ func (c *sconn) enableKernelPacing() bool {
+ 	enabler, ok := c.rawConn.(interface{ enableKernelPacing() bool })
+-	return ok && enabler.enableKernelPacing()
++	return !c.kernelPacingFailed.Load() && ok && enabler.enableKernelPacing() && c.kernelPacingPathReady()
+ }
+ 
+ func (c *sconn) WriteWithTxTime(p []byte, ecn protocol.ECN, txtime uint64) error {
+@@ -28,17 +31,53 @@ func (c *sconn) WriteWithTxTime(p []byte, ecn protocol.ECN, txtime uint64) error
+ 		_, err = writer.WritePacketWithTxTime(p, ai.addr, ai.oob, 0, ecn, txtime)
+ 	}
+ 	c.wroteFirstPacket = true
++	if err != nil && isKernelPacingUnsupported(err) {
++		c.kernelPacingFailed.Store(true)
++		// A rejected TXTIME datagram has not been sent. Keep its departure
++		// before retrying without the control message, then restore software pacing.
++		if now, clockErr := kernelTxTime(monotime.Now()); clockErr == nil && txtime > now {
++			time.Sleep(time.Duration(txtime - now))
++		}
++		return c.Write(p, 0, ecn)
++	}
+ 	return err
+ }
+ 
+ // Kernel pacing is opt-in per QUIC connection. Unsupported sockets / platforms
+ // keep the existing user-space pacer and GSO path.
+-type kernelPacingProvider struct{ rate func() uint64 }
++type kernelPacingProvider struct {
++	rate               func() uint64
++	mu                 sync.Mutex
++	lastDeparture      monotime.Time
++	lastSize           protocol.ByteCount
++	migrationSupported bool
++	wake               func()
++	failed             atomic.Bool
++	clock              func(monotime.Time) (uint64, error)
++}
++
++func (p *kernelPacingProvider) recordDeparture(t monotime.Time, size protocol.ByteCount) {
++	p.mu.Lock()
++	p.lastDeparture, p.lastSize = t, size
++	p.mu.Unlock()
++}
++
++func (p *kernelPacingProvider) nextDeparture(rate uint64) monotime.Time {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if p.lastDeparture.IsZero() || rate == 0 {
++		return 0
++	}
++	return p.lastDeparture.Add(kernelPacingInterval(p.lastSize, rate))
++}
++
+ type kernelPacingState struct {
+-	next        monotime.Time
+-	departures  [32]monotime.Time
+-	head, count int
+-	provider    *kernelPacingProvider
++	next          monotime.Time
++	departures    [32]monotime.Time
++	head, count   int
++	provider      *kernelPacingProvider
++	lastDeparture monotime.Time
++	lastSize      protocol.ByteCount
+ }
+ 
+ const kernelPacingMaxLead = time.Millisecond
+@@ -49,17 +88,52 @@ const kernelPacingMaxLead = time.Millisecond
+ // their existing immediate-send behavior.
+ func (c *Conn) EnableKernelPacing() { c.kernelPacingWanted.Store(true) }
+ 
++// KernelPacingEnabled reports the last send-loop backend decision. It is safe
++// to inspect from another goroutine and becomes false on unsupported paths.
++func (c *Conn) KernelPacingEnabled() bool { return c.kernelPacingActive.Load() }
++
+ func (c *Conn) setKernelPacingProvider(cc congestion.CongestionControl) {
+ 	var p *kernelPacingProvider
+ 	if r, ok := cc.(interface{ PacingRateBytesPerSecond() uint64 }); ok {
+-		p = &kernelPacingProvider{rate: r.PacingRateBytesPerSecond}
++		p = &kernelPacingProvider{rate: r.PacingRateBytesPerSecond, wake: c.scheduleSending}
++		_, oldMigration := cc.(interface{ OnPathMigration() })
++		_, mtuMigration := cc.(interface{ OnPathMigrationWithMTU(congestion.ByteCount) })
++		p.migrationSupported = oldMigration || mtuMigration
+ 	}
+ 	c.kernelPacingProvider.Store(p)
+ }
+ 
+-func (c *Conn) kernelPacingReady() bool {
++func (c *Conn) resetKernelPacing() {
++	c.receivedPacketHandler.SetPathSettled(false)
++	c.receivedPacketHandler.SetAckDelay(protocol.MaxAckDelay)
++	p := c.kernelPacingProvider.Load()
++	if p != nil {
++		var replacement *kernelPacingProvider
++		if p.migrationSupported {
++			replacement = &kernelPacingProvider{rate: p.rate, migrationSupported: true, wake: c.scheduleSending}
++		}
++		c.kernelPacingProvider.CompareAndSwap(p, replacement)
++	}
++	c.kernelPacer = kernelPacingState{}
++}
++
++func (c *Conn) kernelPacingReady() (ready bool) {
++	defer func() { c.kernelPacingActive.Store(ready) }()
+ 	p := c.kernelPacingProvider.Load()
+-	if !c.kernelPacingWanted.Load() || p == nil {
++	if !c.handshakeConfirmed || !c.kernelPacingWanted.Load() || p == nil || p.failed.Load() || os.Getenv("QUIC_GO_DISABLE_KERNEL_PACING") == "1" {
++		return false
++	}
++	if p.rate() == 0 {
++		return false
++	}
++	// Sub-millisecond local paths benefit from UDP GSO and the software pacer.
++	// EDT's bounded look-ahead would dominate their RTT and model feedback.
++	if c.rttStats != nil && c.rttStats.MinRTT() < 2*kernelPacingMaxLead {
++		return false
++	}
++	if _, ok := c.sendQueue.(interface {
++		SendWithPacing(*packetBuffer, protocol.ECN, monotime.Time, time.Duration, time.Duration, *kernelPacingProvider)
++	}); !ok {
+ 		return false
+ 	}
+ 	enabler, ok := c.conn.(interface{ enableKernelPacing() bool })
+@@ -72,14 +146,47 @@ func (c *Conn) kernelPacingReady() bool {
+ 	return true
+ }
+ 
++// Only bypass the software pacing decision. SendMode has already checked
++// congestion windows, amplification limits, PTO and packet tracking limits.
++func (c *Conn) sendMode(now monotime.Time) ackhandler.SendMode {
++	mode := c.sentPacketHandler.SendMode(now)
++	if mode == ackhandler.SendPacingLimited && c.kernelPacingReady() {
++		return ackhandler.SendAny
++	}
++	return mode
++}
++
++func (c *Conn) kernelPacingLead() time.Duration {
++	// Short RTTs still need enough look-ahead to avoid waking a Go timer for
++	// each datagram. fq supplies the fine-grained timer; queue depth and lead
++	// remain bounded independently of the bandwidth estimate.
++	return kernelPacingMaxLead
++}
++
++func (p *kernelPacingState) refresh(rate uint64) {
++	if rate == 0 {
++		return
++	}
++	if !p.lastDeparture.IsZero() {
++		p.next = p.lastDeparture.Add(kernelPacingInterval(p.lastSize, rate))
++	}
++	if p.provider != nil {
++		p.next = max(p.next, p.provider.nextDeparture(rate))
++	}
++}
++
+ func (p *kernelPacingState) waitUntil(now monotime.Time) monotime.Time {
++	return p.waitUntilWithLead(now, kernelPacingMaxLead)
++}
++
++func (p *kernelPacingState) waitUntilWithLead(now monotime.Time, lead time.Duration) monotime.Time {
+ 	for p.count > 0 && !p.departures[p.head].After(now) {
+ 		p.head = (p.head + 1) % len(p.departures)
+ 		p.count--
+ 	}
+ 	var deadline monotime.Time
+-	if p.next.After(now.Add(kernelPacingMaxLead)) {
+-		deadline = p.next.Add(-kernelPacingMaxLead)
++	if p.next.After(now.Add(lead)) {
++		deadline = p.next.Add(-lead)
+ 	}
+ 	if p.count == len(p.departures) {
+ 		slot := p.departures[p.head].Add(time.Nanosecond)
+@@ -98,6 +205,18 @@ func (p *kernelPacingState) schedule(now monotime.Time, size protocol.ByteCount,
+ 	if departure.Before(now) {
+ 		departure = now
+ 	}
++	interval := kernelPacingInterval(size, rate)
++	p.next = departure.Add(interval)
++	p.lastDeparture, p.lastSize = departure, size
++	p.departures[(p.head+p.count)%len(p.departures)] = departure
++	p.count++
++	return departure, interval
++}
++
++func kernelPacingInterval(size protocol.ByteCount, rate uint64) time.Duration {
++	if size <= 0 || rate == 0 {
++		return 0
++	}
+ 	// Datagram sizes are bounded by QUIC; round up to avoid over-sending.
+ 	n := uint64(size) * uint64(time.Second)
+ 	interval := time.Duration(n / rate)
+@@ -107,48 +226,74 @@ func (p *kernelPacingState) schedule(now monotime.Time, size protocol.ByteCount,
+ 	if interval < time.Nanosecond {
+ 		interval = time.Nanosecond
+ 	}
+-	p.next = departure.Add(interval)
+-	p.departures[(p.head+p.count)%len(p.departures)] = departure
+-	p.count++
+-	return departure, interval
++	return interval
+ }
+ 
+ func (c *Conn) sendPacketsWithKernelPacing(now monotime.Time) error {
+ 	sender, ok := c.sendQueue.(interface {
+-		SendWithTxTime(*packetBuffer, protocol.ECN, monotime.Time, time.Duration)
++		SendWithPacing(*packetBuffer, protocol.ECN, monotime.Time, time.Duration, time.Duration, *kernelPacingProvider)
+ 	})
+ 	if !ok {
+ 		return c.sendPacketsWithoutGSO(now)
+ 	}
+ 	for {
+ 		now = monotime.Now()
+-		if deadline := c.kernelPacer.waitUntil(now); !deadline.IsZero() {
+-			c.pacingDeadline = deadline
++		if !c.kernelPacingReady() {
++			c.pacingDeadline = deadlineSendImmediately
+ 			return nil
+ 		}
+ 		rate := c.kernelPacer.provider.rate()
+ 		if rate == 0 {
+ 			return c.sendPacketsWithoutGSO(now)
+ 		}
++		lead := c.kernelPacingLead()
++		c.kernelPacer.refresh(rate)
++		if paced, ok := c.sendQueue.(interface{ PacingWouldBlock() bool }); ok && paced.PacingWouldBlock() {
++			// The worker wakes the loop after releasing a slot. No high-frequency
++			// polling timer is needed, and ACK/PTO timers remain active.
++			c.pacingDeadline = 0
++			return c.maybeSendAckOnlyPacket(now)
++		}
++		if deadline := c.kernelPacer.waitUntilWithLead(now, lead); !deadline.IsZero() {
++			c.pacingDeadline = deadline
++			// An EDT deadline must never suppress a due ACK or leave its alarm
++			// expired, which would otherwise spin the connection timer.
++			return c.maybeSendAckOnlyPacket(now)
++		}
+ 		buf := getPacketBuffer()
+ 		ecn := c.sentPacketHandler.ECNMode(true)
+-		size, err := c.appendOneShortHeaderPacket(buf, c.maxPacketSize(), ecn, now)
++		packet, err := c.packer.AppendPacket(buf, c.maxPacketSize(), now, c.version)
+ 		if err != nil {
+ 			buf.Release()
+ 			if err == errNothingToPack {
++				c.notifyAppLimited()
+ 				return nil
+ 			}
+ 			return err
+ 		}
++		size := buf.Len()
++		c.logShortHeaderPacket(packet, ecn, size)
++		c.registerPackedShortHeaderPacket(packet, ecn, now)
++		if len(packet.StreamFrames) == 0 && !ackhandler.HasAckElicitingFrames(packet.Frames) {
++			c.sendQueue.Send(buf, 0, ecn)
++			// An ACK can consume the packet's room while STREAM frames remain
++			// queued. Preserve the sending opportunity for those frames.
++			c.pacingDeadline = deadlineSendImmediately
++			return nil
++		}
+ 		departure, interval := c.kernelPacer.schedule(now, size, rate)
+ 		// Keep QUIC's existing enqueue-time accounting. Kernel lead is bounded to
+ 		// 1 ms and 32 datagrams; never inject future or foreign-clock timestamps
+ 		// into bandwidth / RTT / PTO accounting.
+-		sender.SendWithTxTime(buf, ecn, departure, interval)
++		sender.SendWithPacing(buf, ecn, departure, interval, lead, c.kernelPacer.provider)
++		if paced, ok := c.sendQueue.(interface{ PacingWouldBlock() bool }); ok && paced.PacingWouldBlock() {
++			c.pacingDeadline = 0
++			return nil
++		}
+ 		if c.sendQueue.WouldBlock() {
+ 			return nil
+ 		}
+-		sendMode := c.sentPacketHandler.SendMode(now)
++		sendMode := c.sendMode(now)
+ 		if sendMode == ackhandler.SendPacingLimited {
+ 			c.resetPacingDeadline()
+ 			return nil
+diff --git a/kernel_pacing_fq_linux.go b/kernel_pacing_fq_linux.go
+new file mode 100644
+index 0000000..0375e01
+--- /dev/null
++++ b/kernel_pacing_fq_linux.go
+@@ -0,0 +1,377 @@
++//go:build linux && !android
++
++package quic
++
++import (
++	"encoding/binary"
++	"errors"
++	"net"
++	"os"
++	"syscall"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"golang.org/x/sys/unix"
++)
++
++const kernelPacingPathTTL = 5 * time.Second
++
++// Linux UAPI values not exported by x/sys/unix on all architectures.
++const kernelPacingTcMsgSize = 20
++
++func isKernelPacingUnsupported(err error) bool {
++	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOPROTOOPT) || errors.Is(err, unix.EOPNOTSUPP)
++}
++
++// SO_TXTIME alone does not prove that the route uses fq. Cache per sending
++// path, not per shared listener socket; address / packet-info changes invalidate
++// immediately, and route or qdisc changes are rechecked within a short TTL.
++func (c *sconn) kernelPacingPathReady() bool {
++	ai := c.remoteAddrInfo.Load()
++	now := monotime.Now()
++	if ai == c.kernelPacingPathInfo && now.Sub(c.kernelPacingPathChecked) < kernelPacingPathTTL {
++		return c.kernelPacingPathOK
++	}
++	c.kernelPacingPathInfo, c.kernelPacingPathChecked = ai, now
++	c.kernelPacingPathOK = false
++	remote, ok := ai.addr.(*net.UDPAddr)
++	if !ok {
++		return false
++	}
++	conn, ok := c.rawConn.(interface {
++		SyscallConn() (syscall.RawConn, error)
++	})
++	if !ok {
++		return false
++	}
++	raw, err := conn.SyscallConn()
++	if err != nil {
++		return false
++	}
++	var cookie uint64
++	var mark, bound int
++	var tos int
++	var socketErr error
++	err = raw.Control(func(fd uintptr) {
++		cookie, socketErr = unix.GetsockoptUint64(int(fd), unix.SOL_SOCKET, unix.SO_NETNS_COOKIE)
++		if socketErr != nil {
++			return
++		}
++		mark, socketErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK)
++		if socketErr != nil {
++			return
++		}
++		bound, socketErr = unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_BINDTOIFINDEX)
++		if socketErr != nil {
++			return
++		}
++		if remote.IP.To4() != nil {
++			tos, socketErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TOS)
++		} else {
++			tos, socketErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_TCLASS)
++		}
++	})
++	if err != nil || socketErr != nil {
++		return false
++	}
++	// quic-go's ECN cmsg writes the entire TOS/TCLASS byte, clearing socket
++	// DSCP. Until that existing behavior can be represented per packet, do
++	// not validate a DSCP policy route that may differ from the sendmsg route.
++	if tos&0xfc != 0 && c.rawConn.capabilities().ECN {
++		return false
++	}
++	local, ok := c.rawConn.LocalAddr().(*net.UDPAddr)
++	if !ok {
++		return false
++	}
++	source := local.IP
++	oif := bound
++	msgs, err := unix.ParseSocketControlMessage(ai.oob)
++	if err != nil {
++		return false
++	}
++	for _, msg := range msgs {
++		var infoIndex int
++		if msg.Header.Level == unix.IPPROTO_IP && msg.Header.Type == unix.IP_PKTINFO && len(msg.Data) == 12 {
++			infoIndex = int(binary.NativeEndian.Uint32(msg.Data[:4]))
++			source = net.IP(msg.Data[4:8])
++		} else if msg.Header.Level == unix.IPPROTO_IPV6 && msg.Header.Type == unix.IPV6_PKTINFO && len(msg.Data) == 20 {
++			infoIndex = int(binary.NativeEndian.Uint32(msg.Data[16:]))
++			source = net.IP(msg.Data[:16])
++		}
++		if infoIndex > 0 {
++			if oif != 0 && oif != infoIndex {
++				return false
++			}
++			oif = infoIndex
++		}
++	}
++	if remote.Zone != "" {
++		iface, err := net.InterfaceByName(remote.Zone)
++		if err != nil || (oif != 0 && oif != iface.Index) {
++			return false
++		}
++		oif = iface.Index
++	}
++	index, err := kernelPacingRoute(remote, source, local.Port, oif, mark, byte(tos&0xfc), cookie)
++	if err != nil {
++		return false
++	}
++	c.kernelPacingPathOK = kernelPacingFQ(index, cookie)
++	if c.logger != nil && c.logger.Debug() {
++		c.logger.Debugf("Linux FQ EDT path %s: ready=%t, interface=%d", remote, c.kernelPacingPathOK, index)
++	}
++	return c.kernelPacingPathOK
++}
++
++func kernelPacingAttr(data []byte, typ uint16, value []byte) []byte {
++	n := 4 + len(value)
++	start := len(data)
++	data = append(data, make([]byte, (n+3)&^3)...)
++	binary.NativeEndian.PutUint16(data[start:], uint16(n))
++	binary.NativeEndian.PutUint16(data[start+2:], typ)
++	copy(data[start+4:], value)
++	return data
++}
++
++func kernelPacingAttrs(data []byte) (map[uint16][]byte, error) {
++	attrs := make(map[uint16][]byte)
++	for len(data) > 0 {
++		if len(data) < 4 {
++			return nil, unix.EINVAL
++		}
++		n := int(binary.NativeEndian.Uint16(data))
++		aligned := (n + 3) &^ 3
++		if n < 4 || aligned > len(data) {
++			return nil, unix.EINVAL
++		}
++		typ := binary.NativeEndian.Uint16(data[2:]) & 0x3fff
++		if _, exists := attrs[typ]; exists {
++			return nil, unix.EINVAL
++		}
++		attrs[typ] = data[4:n]
++		data = data[aligned:]
++	}
++	return attrs, nil
++}
++
++func kernelPacingU32(n uint32) []byte {
++	var v [4]byte
++	binary.NativeEndian.PutUint32(v[:], n)
++	return v[:]
++}
++
++func kernelPacingRoute(remote *net.UDPAddr, source net.IP, port, oif, mark int, tos byte, cookie uint64) (int, error) {
++	data := make([]byte, unix.SizeofRtMsg)
++	data[0], data[1], data[3] = unix.AF_INET, 32, tos
++	dest := remote.IP.To4()
++	if dest == nil {
++		data[0], data[1] = unix.AF_INET6, 128
++		dest = remote.IP.To16()
++	}
++	if dest == nil {
++		return 0, unix.EINVAL
++	}
++	data = kernelPacingAttr(data, unix.RTA_DST, dest)
++	if len(source) > 0 && !source.IsUnspecified() {
++		if len(dest) == 4 {
++			source = source.To4()
++		} else {
++			source = source.To16()
++		}
++		if source == nil {
++			return 0, unix.EINVAL
++		}
++		data[2] = byte(len(source) * 8)
++		data = kernelPacingAttr(data, unix.RTA_SRC, source)
++	}
++	if oif > 0 {
++		data = kernelPacingAttr(data, unix.RTA_OIF, kernelPacingU32(uint32(oif)))
++	}
++	if mark != 0 {
++		data = kernelPacingAttr(data, unix.RTA_MARK, kernelPacingU32(uint32(mark)))
++	}
++	data = kernelPacingAttr(data, unix.RTA_UID, kernelPacingU32(uint32(os.Getuid())))
++	data = kernelPacingAttr(data, unix.RTA_IP_PROTO, []byte{unix.IPPROTO_UDP})
++	var ports [2]byte
++	binary.BigEndian.PutUint16(ports[:], uint16(port))
++	data = kernelPacingAttr(data, unix.RTA_SPORT, ports[:])
++	binary.BigEndian.PutUint16(ports[:], uint16(remote.Port))
++	data = kernelPacingAttr(data, unix.RTA_DPORT, ports[:])
++	msgs, err := kernelPacingNetlink(unix.RTM_GETROUTE, false, data, cookie)
++	if err != nil || len(msgs) != 1 {
++		return 0, unix.EINVAL
++	}
++	msg := msgs[0]
++	if len(msg) < unix.SizeofRtMsg || (msg[7] != unix.RTN_UNICAST && msg[7] != unix.RTN_LOCAL) {
++		return 0, unix.EINVAL
++	}
++	attrs, err := kernelPacingAttrs(msg[unix.SizeofRtMsg:])
++	if err != nil || len(attrs[unix.RTA_OIF]) != 4 || attrs[unix.RTA_MULTIPATH] != nil || attrs[30] != nil { // RTA_NH_ID
++		return 0, unix.EINVAL
++	}
++	return int(binary.NativeEndian.Uint32(attrs[unix.RTA_OIF])), nil
++}
++
++func kernelPacingFQ(index int, cookie uint64) bool {
++	request := make([]byte, kernelPacingTcMsgSize)
++	binary.NativeEndian.PutUint32(request[4:], uint32(index))
++	msgs, err := kernelPacingNetlink(unix.RTM_GETQDISC, true, request, cookie)
++	if err != nil {
++		return false
++	}
++	type qdisc struct {
++		handle, parent uint32
++		kind           string
++		paced          bool
++	}
++	var root *qdisc
++	var leaves []qdisc
++	for _, msg := range msgs {
++		if len(msg) < kernelPacingTcMsgSize {
++			return false
++		}
++		if int(binary.NativeEndian.Uint32(msg[4:])) != index {
++			continue
++		}
++		attrs, err := kernelPacingAttrs(msg[kernelPacingTcMsgSize:])
++		if err != nil {
++			return false
++		}
++		kind := attrs[unix.TCA_KIND]
++		if len(kind) == 0 || kind[len(kind)-1] != 0 {
++			return false
++		}
++		q := qdisc{binary.NativeEndian.Uint32(msg[8:]), binary.NativeEndian.Uint32(msg[12:]), string(kind[:len(kind)-1]), false}
++		if q.kind == "fq" {
++			options, err := kernelPacingAttrs(attrs[unix.TCA_OPTIONS])
++			if err != nil {
++				return false
++			}
++			// TCA_FQ_RATE_ENABLE=5, HORIZON=14, OFFLOAD_HORIZON=18.
++			q.paced = len(options[5]) == 4 && binary.NativeEndian.Uint32(options[5]) == 1
++			if v := options[14]; v != nil && (len(v) != 4 || binary.NativeEndian.Uint32(v) < uint32(kernelPacingMaxLead/time.Microsecond)) {
++				q.paced = false
++			}
++			if v := options[18]; v != nil && (len(v) != 4 || binary.NativeEndian.Uint32(v) != 0) {
++				q.paced = false
++			}
++		}
++		if q.parent == 0xffffffff { // TC_H_ROOT
++			if root != nil {
++				return false
++			}
++			root = &q
++		} else if q.parent != 0xfffffff1 { // TC_H_INGRESS / clsact
++			leaves = append(leaves, q)
++		}
++	}
++	if root == nil {
++		return false
++	}
++	if root.kind == "fq" {
++		return root.paced && len(leaves) == 0
++	}
++	if root.kind != "mq" {
++		return false
++	}
++	link := make([]byte, unix.SizeofIfInfomsg)
++	binary.NativeEndian.PutUint32(link[4:], uint32(index))
++	links, err := kernelPacingNetlink(unix.RTM_GETLINK, false, link, cookie)
++	if err != nil || len(links) != 1 || len(links[0]) < unix.SizeofIfInfomsg {
++		return false
++	}
++	attrs, err := kernelPacingAttrs(links[0][unix.SizeofIfInfomsg:])
++	if err != nil || len(attrs[unix.IFLA_NUM_TX_QUEUES]) != 4 {
++		return false
++	}
++	queues := binary.NativeEndian.Uint32(attrs[unix.IFLA_NUM_TX_QUEUES])
++	if queues == 0 || uint32(len(leaves)) != queues {
++		return false
++	}
++	seen := make(map[uint32]bool)
++	for _, leaf := range leaves {
++		minor := leaf.parent & 0xffff
++		if leaf.kind != "fq" || !leaf.paced || leaf.parent&0xffff0000 != root.handle || minor == 0 || minor > queues || seen[minor] {
++			return false
++		}
++		seen[minor] = true
++	}
++	return true
++}
++
++// Bounded, read-only rtnetlink requests. Require the socket and lookup to be in
++// the same network namespace and a complete dump; uncertainty keeps GSO/pacing.
++func kernelPacingNetlink(typ uint16, dump bool, payload []byte, cookie uint64) ([][]byte, error) {
++	fd, err := unix.Socket(unix.AF_NETLINK, unix.SOCK_RAW|unix.SOCK_CLOEXEC, unix.NETLINK_ROUTE)
++	if err != nil {
++		return nil, err
++	}
++	defer unix.Close(fd)
++	ns, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_NETNS_COOKIE)
++	if err != nil || ns != cookie {
++		return nil, unix.EINVAL
++	}
++	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Usec: 100000}); err != nil {
++		return nil, err
++	}
++	data := make([]byte, unix.NLMSG_HDRLEN, unix.NLMSG_HDRLEN+len(payload))
++	binary.NativeEndian.PutUint32(data, uint32(unix.NLMSG_HDRLEN+len(payload)))
++	binary.NativeEndian.PutUint16(data[4:], typ)
++	flags := uint16(unix.NLM_F_REQUEST)
++	if dump {
++		flags |= unix.NLM_F_DUMP
++	}
++	binary.NativeEndian.PutUint16(data[6:], flags)
++	binary.NativeEndian.PutUint32(data[8:], 1)
++	data = append(data, payload...)
++	if err := unix.Sendto(fd, data, 0, &unix.SockaddrNetlink{Family: unix.AF_NETLINK}); err != nil {
++		return nil, err
++	}
++	buf := make([]byte, 65536)
++	var result [][]byte
++	for received := 0; received < 8<<20; {
++		n, _, flags, from, err := unix.Recvmsg(fd, buf, nil, 0)
++		if err != nil {
++			return nil, err
++		}
++		peer, ok := from.(*unix.SockaddrNetlink)
++		if !ok || peer.Pid != 0 || n == 0 || flags&unix.MSG_TRUNC != 0 {
++			return nil, unix.EINVAL
++		}
++		received += n
++		msgs, err := syscall.ParseNetlinkMessage(buf[:n])
++		if err != nil {
++			return nil, err
++		}
++		for _, msg := range msgs {
++			if msg.Header.Seq != 1 || msg.Header.Flags&unix.NLM_F_DUMP_INTR != 0 {
++				return nil, unix.EINVAL
++			}
++			if msg.Header.Type == unix.NLMSG_ERROR {
++				if len(msg.Data) < 4 {
++					return nil, unix.EINVAL
++				}
++				code := int32(binary.NativeEndian.Uint32(msg.Data))
++				if code != 0 {
++					return nil, syscall.Errno(-code)
++				}
++				continue
++			}
++			if msg.Header.Type == unix.NLMSG_DONE {
++				if len(msg.Data) >= 4 && binary.NativeEndian.Uint32(msg.Data) != 0 {
++					return nil, unix.EINVAL
++				}
++				return result, nil
++			}
++			if msg.Header.Type != typ-2 {
++				return nil, unix.EINVAL
++			}
++			result = append(result, append([]byte(nil), msg.Data...))
++			if !dump {
++				return result, nil
++			}
++		}
++	}
++	return nil, unix.EINVAL
++}
+diff --git a/kernel_pacing_linux_test.go b/kernel_pacing_linux_test.go
+index 9c0bea7..8115700 100644
+--- a/kernel_pacing_linux_test.go
++++ b/kernel_pacing_linux_test.go
+@@ -11,6 +11,8 @@ import (
+ 
+ 	"github.com/apernet/quic-go/internal/monotime"
+ 	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/stretchr/testify/require"
+ 	"golang.org/x/sys/unix"
+ )
+ 
+@@ -46,6 +48,115 @@ func TestKernelPacingControlMessagesAndClock(t *testing.T) {
+ 	}
+ }
+ 
++func TestKernelPacingFQPathDetection(t *testing.T) {
++	peer := os.Getenv("QUIC_KERNEL_PACING_PEER")
++	if peer == "" {
++		t.Skip("requires isolated fq route")
++	}
++	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
++	require.NoError(t, err)
++	defer udp.Close()
++	raw, err := newConn(udp, false, false)
++	require.NoError(t, err)
++	conn := newSendConn(raw, &net.UDPAddr{IP: net.ParseIP(peer), Port: 34567}, packetInfo{}, utils.DefaultLogger)
++	want := os.Getenv("QUIC_KERNEL_PACING_EXPECT_FQ") != "0"
++	require.Equal(t, want, conn.enableKernelPacing())
++	require.Equal(t, want, conn.enableKernelPacing())
++	fd, err := udp.SyscallConn()
++	require.NoError(t, err)
++	var optionErr error
++	require.NoError(t, fd.Control(func(fd uintptr) { optionErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TOS, 0x28) }))
++	require.NoError(t, optionErr)
++	conn.kernelPacingPathChecked = 0
++	require.False(t, conn.enableKernelPacing(), "nonzero DSCP with ECN must not validate a different policy route")
++}
++
++type kernelRejectTxTimeConn struct {
++	*net.UDPConn
++	timed, plain int
++}
++
++func (c *kernelRejectTxTimeConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (int, int, error) {
++	msgs, err := unix.ParseSocketControlMessage(oob)
++	if err != nil {
++		return 0, 0, err
++	}
++	for _, msg := range msgs {
++		if msg.Header.Level == unix.SOL_SOCKET && msg.Header.Type == unix.SCM_TXTIME {
++			c.timed++
++			return 0, 0, unix.EOPNOTSUPP
++		}
++	}
++	c.plain++
++	return len(b), len(oob), nil
++}
++
++func TestKernelPacingTXTimeWriteFallback(t *testing.T) {
++	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
++	require.NoError(t, err)
++	defer udp.Close()
++	wrapped := &kernelRejectTxTimeConn{UDPConn: udp}
++	raw, err := newConn(wrapped, false, false)
++	require.NoError(t, err)
++	conn := newSendConn(raw, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 34567}, packetInfo{}, utils.DefaultLogger)
++	stamp, err := kernelTxTime(monotime.Now())
++	require.NoError(t, err)
++	require.NoError(t, conn.WriteWithTxTime([]byte{1}, protocol.ECT0, stamp))
++	require.Equal(t, 1, wrapped.timed)
++	require.Equal(t, 1, wrapped.plain)
++	require.True(t, conn.kernelPacingFailed.Load())
++}
++
++type kernelClockFailureConn struct {
++	sendConn
++	writtenAt monotime.Time
++}
++
++func (c *kernelClockFailureConn) Write(_ []byte, _ uint16, _ protocol.ECN) error {
++	c.writtenAt = monotime.Now()
++	return nil
++}
++func (c *kernelClockFailureConn) WriteWithTxTime([]byte, protocol.ECN, uint64) error {
++	panic("clock failure must use ordinary Write")
++}
++
++func TestKernelPacingClockFailureRestoresSoftwarePacing(t *testing.T) {
++	conn := &kernelClockFailureConn{}
++	queue := newSendQueue(conn).(*sendQueue)
++	p := &kernelPacingProvider{rate: func() uint64 { return 1_200_000 }, clock: func(monotime.Time) (uint64, error) { return 0, unix.EPERM }}
++	departure := monotime.Now().Add(time.Millisecond)
++	buf := getPacketBuffer()
++	buf.Data = append(buf.Data, make([]byte, 1200)...)
++	queue.SendWithPacing(buf, protocol.ECT0, departure, time.Millisecond, time.Millisecond, p)
++	done := make(chan error, 1)
++	go func() { done <- queue.Run() }()
++	queue.Close()
++	require.NoError(t, <-done)
++	require.False(t, conn.writtenAt.Before(departure))
++	require.True(t, p.failed.Load())
++	c := &Conn{conn: &kernelEnabledSendConn{enabled: true}, sendQueue: queue, handshakeConfirmed: true}
++	c.EnableKernelPacing()
++	c.kernelPacingProvider.Store(p)
++	require.False(t, c.kernelPacingReady())
++}
++
++func TestKernelPacingSoftBackpressureKeepsImmediateQueueAvailable(t *testing.T) {
++	conn := &kernelPacingTestConn{}
++	queue := newSendQueue(conn).(*sendQueue)
++	p := &kernelPacingProvider{rate: func() uint64 { return 1000 }}
++	buf := getPacketBuffer()
++	buf.Data = append(buf.Data, make([]byte, 1200)...)
++	queue.SendWithPacing(buf, protocol.ECT0, monotime.Now(), 1200*time.Millisecond, time.Millisecond, p)
++	require.True(t, queue.PacingWouldBlock())
++	require.False(t, queue.WouldBlock())
++	// ACK/PTO still fit even while ordinary data is held back.
++	ack := getPacketBuffer()
++	ack.Data = append(ack.Data, 1)
++	queue.Send(ack, 0, protocol.ECT0)
++	(<-queue.queue).buf.Release()
++	(<-queue.queue).buf.Release()
++}
++
+ type kernelPacingTestConn struct {
+ 	sendConn
+ 	times []uint64
+diff --git a/kernel_pacing_other.go b/kernel_pacing_other.go
+index 966b925..b302baa 100644
+--- a/kernel_pacing_other.go
++++ b/kernel_pacing_other.go
+@@ -11,3 +11,6 @@ func kernelTxTime(monotime.Time) (uint64, error) {
+ 	return 0, errors.New("kernel pacing unavailable")
+ }
+ func appendTxTimeMsg(oob []byte, _ uint64) []byte { return oob }
++
++func (c *sconn) kernelPacingPathReady() bool { return false }
++func isKernelPacingUnsupported(error) bool   { return false }
+diff --git a/kernel_pacing_test.go b/kernel_pacing_test.go
+index 46dc683..28fdcdf 100644
+--- a/kernel_pacing_test.go
++++ b/kernel_pacing_test.go
+@@ -1,8 +1,13 @@
+ package quic
+ 
+ import (
++	"github.com/apernet/quic-go/internal/ackhandler"
++	mockackhandler "github.com/apernet/quic-go/internal/mocks/ackhandler"
+ 	"github.com/apernet/quic-go/internal/monotime"
+ 	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
+ 	"testing"
+ 	"time"
+ )
+@@ -28,6 +33,88 @@ func TestKernelPacingRateAndLeadBound(t *testing.T) {
+ 	}
+ }
+ 
++type kernelEnabledSendConn struct {
++	sendConn
++	enabled bool
++}
++
++func (c *kernelEnabledSendConn) enableKernelPacing() bool { return c.enabled }
++
++func TestKernelPacingBypassesOnlySoftwareBudget(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	sph := mockackhandler.NewMockSentPacketHandler(ctrl)
++	conn := &kernelEnabledSendConn{enabled: true}
++	c := &Conn{conn: conn, sendQueue: newSendQueue(conn), sentPacketHandler: sph, handshakeConfirmed: true}
++	c.EnableKernelPacing()
++	c.kernelPacingProvider.Store(&kernelPacingProvider{rate: func() uint64 { return 1_200_000 }})
++	for _, mode := range []ackhandler.SendMode{ackhandler.SendNone, ackhandler.SendAck, ackhandler.SendPTOAppData, ackhandler.SendAny} {
++		sph.EXPECT().SendMode(gomock.Any()).Return(mode)
++		require.Equal(t, mode, c.sendMode(monotime.Now()))
++	}
++	sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendPacingLimited)
++	require.Equal(t, ackhandler.SendAny, c.sendMode(monotime.Now()))
++	conn.enabled = false
++	sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendPacingLimited)
++	require.Equal(t, ackhandler.SendPacingLimited, c.sendMode(monotime.Now()))
++}
++
++func TestKernelPacingDeadlineAllowsACK(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	sph := mockackhandler.NewMockSentPacketHandler(ctrl)
++	tc := newServerTestConnection(t, ctrl, nil, false, connectionOptSentPacketHandler(sph), connectionOptHandshakeConfirmed())
++	c := tc.conn
++	c.rttStats.UpdateRTT(5*time.Millisecond, 0)
++	sendConn := &kernelEnabledSendConn{sendConn: tc.sendConn, enabled: true}
++	c.conn, c.sendQueue = sendConn, newSendQueue(sendConn)
++	c.EnableKernelPacing()
++	p := &kernelPacingProvider{rate: func() uint64 { return 1000 }}
++	c.kernelPacingProvider.Store(p)
++	c.kernelPacer = kernelPacingState{provider: p, next: monotime.Now().Add(time.Second)}
++	sph.EXPECT().ECNMode(true).Return(protocol.ECNNon)
++	tc.packer.EXPECT().PackAckOnlyPacket(gomock.Any(), gomock.Any(), gomock.Any()).Return(shortHeaderPacket{}, nil, errNothingToPack)
++	require.NoError(t, c.sendPacketsWithKernelPacing(monotime.Now()))
++	require.True(t, c.pacingDeadline.After(monotime.Now()))
++}
++
++func TestKernelPacingACKOnlyPreservesDataWake(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	sph := mockackhandler.NewMockSentPacketHandler(ctrl)
++	tc := newServerTestConnection(t, ctrl, nil, false, connectionOptSentPacketHandler(sph), connectionOptHandshakeConfirmed())
++	c := tc.conn
++	c.rttStats.UpdateRTT(5*time.Millisecond, 0)
++	conn := &kernelEnabledSendConn{sendConn: tc.sendConn, enabled: true}
++	c.conn, c.sendQueue = conn, newSendQueue(conn)
++	c.EnableKernelPacing()
++	p := &kernelPacingProvider{rate: func() uint64 { return 1_200_000 }}
++	c.kernelPacingProvider.Store(p)
++	c.kernelPacer.provider = p
++	sph.EXPECT().ECNMode(true).Return(protocol.ECNNon)
++	sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any())
++	tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(func(buf *packetBuffer, _ protocol.ByteCount, _ monotime.Time, _ protocol.Version) (shortHeaderPacket, error) {
++		buf.Data = append(buf.Data, 1)
++		return shortHeaderPacket{}, nil
++	})
++	require.NoError(t, c.sendPacketsWithKernelPacing(monotime.Now()))
++	require.Equal(t, deadlineSendImmediately, c.pacingDeadline)
++	(<-c.sendQueue.(*sendQueue).queue).buf.Release()
++}
++
++func TestKernelPacingRateChangeAndWorkerProgress(t *testing.T) {
++	now := monotime.Time(time.Hour)
++	provider := &kernelPacingProvider{}
++	p := kernelPacingState{provider: provider}
++	p.schedule(now, 1200, 120_000)
++	provider.recordDeparture(now.Add(2*time.Millisecond), 1200)
++	p.refresh(1_200_000)
++	require.Equal(t, now.Add(3*time.Millisecond), p.next)
++	p.refresh(12_000)
++	require.Equal(t, now.Add(102*time.Millisecond), p.next)
++	rtt := utils.NewRTTStats()
++	rtt.UpdateRTT(160*time.Microsecond, 0)
++	c := &Conn{rttStats: rtt}
++	require.Equal(t, time.Millisecond, c.kernelPacingLead())
++}
++
+ func TestKernelPacingDatagramBoundAndIndependentConnections(t *testing.T) {
+ 	now := monotime.Time(time.Hour)
+ 	p := kernelPacingState{}
+diff --git a/send_conn.go b/send_conn.go
+index 65256e2..d646848 100644
+--- a/send_conn.go
++++ b/send_conn.go
+@@ -4,6 +4,7 @@ import (
+ 	"net"
+ 	"sync/atomic"
+ 
++	"github.com/apernet/quic-go/internal/monotime"
+ 	"github.com/apernet/quic-go/internal/protocol"
+ 	"github.com/apernet/quic-go/internal/utils"
+ )
+@@ -39,7 +40,11 @@ type sconn struct {
+ 	gotGSOError bool
+ 	// Used to catch the error sometimes returned by the first sendmsg call on Linux,
+ 	// see https://github.com/golang/go/issues/63322.
+-	wroteFirstPacket bool
++	wroteFirstPacket        bool
++	kernelPacingFailed      atomic.Bool
++	kernelPacingPathInfo    *remoteAddrInfo
++	kernelPacingPathChecked monotime.Time
++	kernelPacingPathOK      bool
+ }
+ 
+ var _ sendConn = &sconn{}
+diff --git a/send_queue.go b/send_queue.go
+index 0dbe4e7..c1d2d2a 100644
+--- a/send_queue.go
++++ b/send_queue.go
+@@ -3,6 +3,7 @@ package quic
+ import (
+ 	"errors"
+ 	"net"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/apernet/quic-go/internal/monotime"
+@@ -25,14 +26,19 @@ type queueEntry struct {
+ 	ecn       protocol.ECN
+ 	departure monotime.Time
+ 	interval  time.Duration
++	lead      time.Duration
++	pacing    *kernelPacingProvider
++	rate      uint64
+ }
+ 
+ type sendQueue struct {
+-	queue       chan queueEntry
+-	closeCalled chan struct{} // runStopped when Close() is called
+-	runStopped  chan struct{} // runStopped when the run loop returns
+-	available   chan struct{}
+-	conn        sendConn
++	queue         chan queueEntry
++	closeCalled   chan struct{} // runStopped when Close() is called
++	runStopped    chan struct{} // runStopped when the run loop returns
++	available     chan struct{}
++	conn          sendConn
++	pacingPending atomic.Int32
++	pacingLimit   atomic.Int32
+ }
+ 
+ var _ sender = &sendQueue{}
+@@ -60,11 +66,20 @@ func (h *sendQueue) SendWithTxTime(p *packetBuffer, ecn protocol.ECN, departure
+ 	h.enqueue(queueEntry{buf: p, ecn: ecn, departure: departure, interval: interval})
+ }
+ 
++func (h *sendQueue) SendWithPacing(p *packetBuffer, ecn protocol.ECN, departure monotime.Time, interval, lead time.Duration, provider *kernelPacingProvider) {
++	// Bound worker catch-up time as well as kernel lead. Slow connections
++	// cannot accumulate many overdue datagrams while the worker is stalled.
++	limit := int32(max(1, min(time.Duration(sendQueueCapacity), lead/max(time.Nanosecond, interval))))
++	h.pacingLimit.Store(limit)
++	h.pacingPending.Add(1)
++	h.enqueue(queueEntry{buf: p, ecn: ecn, departure: departure, interval: interval, lead: lead, pacing: provider, rate: provider.rate()})
++}
++
+ func (h *sendQueue) enqueue(entry queueEntry) {
+ 	select {
+ 	case h.queue <- entry:
+ 		// clear available channel if we've reached capacity
+-		if len(h.queue) == sendQueueCapacity {
++		if h.WouldBlock() {
+ 			select {
+ 			case <-h.available:
+ 			default:
+@@ -84,6 +99,10 @@ func (h *sendQueue) WouldBlock() bool {
+ 	return len(h.queue) == sendQueueCapacity
+ }
+ 
++func (h *sendQueue) PacingWouldBlock() bool {
++	return h.pacingLimit.Load() > 0 && h.pacingPending.Load() >= h.pacingLimit.Load()
++}
++
+ func (h *sendQueue) Available() <-chan struct{} {
+ 	return h.available
+ }
+@@ -92,6 +111,9 @@ func (h *sendQueue) Run() error {
+ 	defer close(h.runStopped)
+ 	var shouldClose bool
+ 	var nextTx uint64
++	var lastTx uint64
++	var lastSize protocol.ByteCount
++	var lastProvider *kernelPacingProvider
+ 	for {
+ 		if shouldClose && len(h.queue) == 0 {
+ 			return nil
+@@ -103,33 +125,55 @@ func (h *sendQueue) Run() error {
+ 			shouldClose = true
+ 		case e := <-h.queue:
+ 			var err error
++			if e.pacing != nil && e.pacing != lastProvider {
++				nextTx = 0
++				lastTx = 0
++				lastProvider = e.pacing
++			}
+ 			if writer, ok := h.conn.(interface {
+ 				WriteWithTxTime([]byte, protocol.ECN, uint64) error
+ 			}); ok && !e.departure.IsZero() {
++				clock := kernelTxTime
++				if e.pacing != nil && e.pacing.clock != nil {
++					clock = e.pacing.clock
++				}
+ 				for {
+-					txtime, clockErr := kernelTxTime(e.departure)
++					txtime, clockErr := clock(e.departure)
+ 					if clockErr != nil {
++						h.kernelPacingClockFallback(e)
+ 						err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+ 						break
+ 					}
+ 					// A delayed worker must preserve spacing rather than release
+ 					// all overdue entries as an immediate burst.
++					if lastTx != 0 && e.rate != 0 {
++						nextTx = lastTx + uint64(kernelPacingInterval(lastSize, e.rate))
++					}
+ 					if txtime < nextTx {
+ 						txtime = nextTx
+ 					}
+-					kernelNow, clockErr := kernelTxTime(monotime.Now())
++					kernelNow, clockErr := clock(monotime.Now())
+ 					if clockErr != nil {
++						h.kernelPacingClockFallback(e)
+ 						err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+ 						break
+ 					}
+-					if txtime > kernelNow+uint64(kernelPacingMaxLead) {
++					lead := e.lead
++					if lead == 0 {
++						lead = kernelPacingMaxLead
++					}
++					if txtime > kernelNow+uint64(lead) {
+ 						// Catch-up traffic remains in the bounded user-space queue;
+ 						// never shift a delayed batch far into the kernel's future.
+-						time.Sleep(time.Duration(txtime-kernelNow) - kernelPacingMaxLead)
++						time.Sleep(time.Duration(txtime-kernelNow) - lead)
+ 						continue
+ 					}
+ 					nextTx = txtime + uint64(e.interval)
++					lastTx, lastSize = txtime, e.buf.Len()
+ 					err = writer.WriteWithTxTime(e.buf.Data, e.ecn, txtime)
++					if err == nil && e.pacing != nil {
++						e.pacing.recordDeparture(monotime.Now().Add(time.Duration(txtime-kernelNow)), e.buf.Len())
++					}
+ 					break
+ 				}
+ 			} else {
+@@ -146,6 +190,12 @@ func (h *sendQueue) Run() error {
+ 				}
+ 			}
+ 			e.buf.Release()
++			if e.pacing != nil {
++				h.pacingPending.Add(-1)
++				if e.pacing.wake != nil {
++					e.pacing.wake()
++				}
++			}
+ 			select {
+ 			case h.available <- struct{}{}:
+ 			default:
+@@ -154,6 +204,17 @@ func (h *sendQueue) Run() error {
+ 	}
+ }
+ 
++func (h *sendQueue) kernelPacingClockFallback(e queueEntry) {
++	if e.pacing != nil {
++		e.pacing.failed.Store(true)
++	}
++	// The Go monotonic clock still knows the planned departure. Do not emit a
++	// future reservation early merely because the kernel clock syscall failed.
++	if wait := monotime.Until(e.departure); wait > 0 {
++		time.Sleep(wait)
++	}
++}
++
+ func (h *sendQueue) Close() {
+ 	close(h.closeCalled)
+ 	// wait until the run loop returned

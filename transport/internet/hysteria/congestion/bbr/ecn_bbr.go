@@ -138,6 +138,16 @@ func (b *bbrSender) applyECNPolicy(isRoundStart, hasSafetyLoss bool) {
 	if !state.capable || state.failed {
 		return
 	}
+	// ECN floors are growth hints, not permission to undo queue draining,
+	// PROBE_RTT or loss recovery. Apply CE policy, then preserve the stronger
+	// limits computed by the BBR model.
+	if hasSafetyLoss || b.InRecovery() || b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt {
+		pacing, window := b.PacingRate(), b.congestionWindow
+		defer func() {
+			b.pacingRate = min(b.PacingRate(), pacing)
+			b.congestionWindow = min(b.congestionWindow, window)
+		}()
+	}
 
 	if state.pendingSample && !state.pendingCE && !hasSafetyLoss {
 		state.btlBwFloor = max(state.btlBwFloor, b.bandwidthEstimate())
@@ -272,15 +282,20 @@ func (b *bbrSender) OnPathMigration() {
 	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])
 	b.applyProfile(b.profile)
 	b.pacer = common.NewPacer(b.bandwidthForPacer)
+	b.pacer.SetMaxDatagramSize(b.maxDatagramSize)
 	b.roundTripCount = 0
 	b.currentRoundTripEnd = b.lastSentPacket
 	b.numLossEventsInRound = 0
 	b.bytesLostInRound = 0
 	b.minRtt = 0
 	b.minRttTimestamp = now
-	b.pacingRate = scaleBandwidth(b.pacingRate, ecnPathMigrationDecay)
+	// STARTUP only raises pacing. Rebuild it from the new path rather than
+	// retaining a rate that might already exceed the new bottleneck.
+	b.pacingRate = 0
 	b.congestionWindow = max(b.minCongestionWindow, scaleWindow(b.congestionWindow, ecnPathMigrationDecay))
 	b.bytesInFlight = 0
+	b.lastSampleIsAppLimited = false
+	b.hasNoAppLimitedSample = false
 	b.isAtFullBandwidth = false
 	b.roundsWithoutBandwidthGain = 0
 	b.bandwidthAtLastRound = 0
@@ -290,6 +305,18 @@ func (b *bbrSender) OnPathMigration() {
 	b.exitProbeRttAt = 0
 	b.probeRttRoundPassed = false
 	b.enterStartupMode(now)
+}
+
+// OnPathMigrationWithMTU resets packet-sized bounds for the new path. Ordinary
+// PMTU updates remain monotonic; only a path change may reduce the MTU.
+func (b *bbrSender) OnPathMigrationWithMTU(size congestion.ByteCount) {
+	if size > 0 && size != b.maxDatagramSize {
+		oldSize := b.maxDatagramSize
+		b.rescalePacketSizedWindows(size)
+		b.ecn.rescaleWindows(oldSize, size)
+		b.congestionWindow = clampWindow(b.congestionWindow, b.minCongestionWindow, b.maxCongestionWindow)
+	}
+	b.OnPathMigration()
 }
 
 func (state *ecnBBRState) rescaleWindows(oldSize, newSize congestion.ByteCount) {

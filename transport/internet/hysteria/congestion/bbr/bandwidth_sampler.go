@@ -6,6 +6,7 @@ import (
 
 	"github.com/apernet/quic-go/congestion"
 	"github.com/apernet/quic-go/monotime"
+	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/common"
 )
 
 const (
@@ -868,10 +869,15 @@ func sentPacketToSendTimeState(sentPacket *connectionStateOnSentPacket, sendTime
 // BytesFromBandwidthAndTimeDelta calculates the bytes
 // from a bandwidth(bits per second) and a time delta
 func bytesFromBandwidthAndTimeDelta(bandwidth Bandwidth, delta time.Duration) congestion.ByteCount {
-	return (congestion.ByteCount(bandwidth) * congestion.ByteCount(delta)) /
-		(congestion.ByteCount(time.Second) * 8)
+	if delta <= 0 {
+		return 0
+	}
+	return congestion.ByteCount(min(uint64(math.MaxInt64), common.MulDiv(uint64(bandwidth), uint64(delta), uint64(time.Second)*8)))
 }
 
 func timeDeltaFromBytesAndBandwidth(bytes congestion.ByteCount, bandwidth Bandwidth) time.Duration {
-	return time.Duration(bytes*8) * time.Second / time.Duration(bandwidth)
+	if bytes <= 0 {
+		return 0
+	}
+	return time.Duration(min(uint64(math.MaxInt64), common.MulDiv(uint64(bytes), uint64(time.Second)*8, uint64(bandwidth))))
 }

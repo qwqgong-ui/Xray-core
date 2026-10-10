@@ -25,8 +25,6 @@ import (
 //
 
 const (
-	minBps = 65536 // 64 KB/s
-
 	invalidPacketNumber            = -1
 	initialCongestionWindowPackets = 60
 	minCongestionWindowPackets     = 4
@@ -371,6 +369,7 @@ func newBbrSender(
 		debug:           debug,
 	}
 	b.pacer = common.NewPacer(b.bandwidthForPacer)
+	b.pacer.SetMaxDatagramSize(initialMaxDatagramSize)
 	b.applyProfile(profile)
 	if b.debug {
 		b.debugPrint("Profile: %s", b.profile)
@@ -454,12 +453,18 @@ func (b *bbrSender) OnPacketSent(
 
 	b.lastSentPacket = packetNumber
 	b.bytesInFlight = bytesInFlight
+	// quic-go includes this packet in bytesInFlight before invoking the
+	// controller. The sampler expects the flight size before sending it.
+	priorInFlight := bytesInFlight
+	if isRetransmittable {
+		priorInFlight = max(0, bytesInFlight-bytes)
+	}
 
-	if bytesInFlight == 0 {
+	if isRetransmittable && priorInFlight == 0 {
 		b.exitingQuiescence = true
 	}
 
-	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, bytesInFlight, isRetransmittable)
+	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, priorInFlight, isRetransmittable)
 }
 
 // CanSend implements the SendAlgorithm interface.
@@ -540,6 +545,9 @@ func (b *bbrSender) OnCongestionEvent(number congestion.PacketNumber, lostBytes,
 }
 
 func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, eventTime monotime.Time, ackedPackets []congestion.AckedPacketInfo, lostPackets []congestion.LostPacketInfo) {
+	if len(ackedPackets) == 0 && len(lostPackets) == 0 {
+		return
+	}
 	totalBytesAckedBefore := b.sampler.TotalBytesAcked()
 	totalBytesLostBefore := b.sampler.TotalBytesLost()
 
@@ -551,8 +559,6 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	// empty. If acked_packets is empty, it's the send state of the largest
 	// packet in lost_packets.
 	var lastPacketSendState sendTimeState
-
-	b.maybeAppLimited(priorInFlight)
 
 	// Update bytesInFlight
 	b.bytesInFlight = priorInFlight
@@ -567,6 +573,10 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 		lastAckedPacket := ackedPackets[len(ackedPackets)-1].PacketNumber
 		isRoundStart = b.updateRoundTripCounter(lastAckedPacket)
 		b.updateRecoveryState(lastAckedPacket, hasSafetyLoss, isRoundStart)
+	} else if hasSafetyLoss {
+		// Loss timers also report events without an ACK. They must enter or
+		// extend recovery, but cannot acknowledge our way out of it.
+		b.updateRecoveryState(invalidPacketNumber, true, false)
 	}
 
 	sample := b.sampler.OnCongestionEvent(eventTime,
@@ -671,14 +681,10 @@ func (b *bbrSender) bandwidthEstimate() Bandwidth {
 }
 
 func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
-	bps := congestion.ByteCount(float64(b.PacingRate()) / float64(BytesPerSecond))
-	if bps < minBps {
-		// We need to make sure that the bandwidth value for pacer is never zero,
-		// otherwise it will go into an edge case where HasPacingBudget = false
-		// but TimeUntilSend is before, causing the quic-go send loop to go crazy and get stuck.
-		return minBps
-	}
-	return bps
+	// Preserve slow-link and ECN drain rates. Only guard against integer
+	// rounding to zero; a 64 KiB/s floor prevented either pacer from draining
+	// links below that rate.
+	return max(1, congestion.ByteCount(b.PacingRate()/BytesPerSecond))
 }
 
 // PacingRateBytesPerSecond exposes the effective rate to optional Linux EDT.
@@ -695,7 +701,10 @@ func (b *bbrSender) getMinRtt() time.Duration {
 	// min_rtt could be available if the handshake packet gets neutered then
 	// gets acknowledged. This could only happen for QUIC crypto where we do not
 	// drop keys.
-	minRtt := b.rttStats.MinRTT()
+	var minRtt time.Duration
+	if b.rttStats != nil {
+		minRtt = b.rttStats.MinRTT()
+	}
 	if minRtt == 0 {
 		return 100 * time.Millisecond
 	} else {
@@ -706,6 +715,7 @@ func (b *bbrSender) getMinRtt() time.Duration {
 // Computes the target congestion window using the specified gain.
 func (b *bbrSender) getTargetCongestionWindow(gain float64) congestion.ByteCount {
 	bdp := bdpFromRttAndBandwidth(b.getMinRtt(), b.bandwidthEstimate())
+	bdp = min(bdp, b.maxCongestionWindow)
 	congestionWindow := congestion.ByteCount(gain * float64(bdp))
 
 	// BDP estimate will be zero if no bandwidth samples are available yet.
@@ -841,6 +851,12 @@ func (b *bbrSender) maybeAppLimited(bytesInFlight congestion.ByteCount) {
 	if bytesInFlight < b.getTargetCongestionWindow(1) {
 		b.sampler.OnAppLimited()
 	}
+}
+
+// OnAppLimited is called only when QUIC has no packet to pack. A small flight
+// during an ACK, pacing or congestion limit is not evidence of an idle app.
+func (b *bbrSender) OnAppLimited() {
+	b.maybeAppLimited(b.bytesInFlight)
 }
 
 // Transitions from STARTUP to DRAIN and from DRAIN to PROBE_BW if
@@ -1078,7 +1094,7 @@ func (b *bbrSender) debugPrint(format string, a ...any) {
 }
 
 func bdpFromRttAndBandwidth(rtt time.Duration, bandwidth Bandwidth) congestion.ByteCount {
-	return congestion.ByteCount(rtt) * congestion.ByteCount(bandwidth) / congestion.ByteCount(BytesPerSecond) / congestion.ByteCount(time.Second)
+	return bytesFromBandwidthAndTimeDelta(bandwidth, rtt)
 }
 
 func GetInitialPacketSize(addr net.Addr) congestion.ByteCount {

@@ -11,6 +11,7 @@ SingleUser 的 Xray 自身修改已经合入 Go 源码。正常构建需要额�
 | `patches/xray/` | 已合入源码的历史补丁系列，供维护和补丁工作流使用；不要在当前源码上重复应用 |
 | `patches/quic-go/0001-*.patch` | 给 BBR 暴露经过校验的 ACK_ECN 增量及相关状态 |
 | `patches/quic-go/0002-*.patch` | 1400 字节以下更快的 PMTU 探测 |
+| `patches/quic-go/0006-*.patch`、`0007-*.patch` | Linux FQ EDT、BBR/ACK/MTU 联动与自动回退 |
 | `patches/apply-dependency-patches.sh` | 复制锁定依赖、校验并应用补丁，生成独立 modfile 与 GOFLAGS，不改根目录 go.mod |
 
 补丁脚本生成的 `.xray-patched-deps.*` 是构建辅助目录。GOFLAGS 中的 modfile 路径相对仓库根目录，因此加载后应留在仓库根目录执行 Go 命令。

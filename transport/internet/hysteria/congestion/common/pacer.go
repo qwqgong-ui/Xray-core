@@ -1,6 +1,8 @@
 package common
 
 import (
+	"math"
+	"math/bits"
 	"time"
 
 	"github.com/apernet/quic-go/congestion"
@@ -36,23 +38,28 @@ func (p *Pacer) SentPacket(sendTime monotime.Time, size congestion.ByteCount) {
 	} else {
 		p.budgetAtLastSent = budget - size
 	}
-	p.lastSentTime = sendTime
+	p.lastSentTime = max(p.lastSentTime, sendTime)
 }
 
 func (p *Pacer) Budget(now monotime.Time) congestion.ByteCount {
 	if p.lastSentTime.IsZero() {
 		return p.maxBurstSize()
 	}
-	budget := p.budgetAtLastSent + (p.getBandwidth()*congestion.ByteCount(now.Sub(p.lastSentTime).Nanoseconds()))/1e9
-	if budget < 0 { // protect against overflows
-		budget = congestion.ByteCount(1<<62 - 1)
+	burst := p.maxBurstSize()
+	if now <= p.lastSentTime {
+		return min(burst, p.budgetAtLastSent)
 	}
-	return min(p.maxBurstSize(), budget)
+	credit := MulDiv(uint64(max(1, p.getBandwidth())), uint64(now.Sub(p.lastSentTime)), uint64(time.Second))
+	missing := max(0, burst-p.budgetAtLastSent)
+	if credit >= uint64(missing) {
+		return burst
+	}
+	return p.budgetAtLastSent + congestion.ByteCount(credit)
 }
 
 func (p *Pacer) maxBurstSize() congestion.ByteCount {
 	return max(
-		congestion.ByteCount((maxBurstPacingDelayMultiplier*congestion.MinPacingDelay).Nanoseconds())*p.getBandwidth()/1e9,
+		congestion.ByteCount(min(uint64(math.MaxInt64), MulDiv(uint64(max(1, p.getBandwidth())), uint64(maxBurstPacingDelayMultiplier*congestion.MinPacingDelay), uint64(time.Second)))),
 		maxBurstPackets*p.maxDatagramSize,
 	)
 }
@@ -64,7 +71,7 @@ func (p *Pacer) TimeUntilSend() monotime.Time {
 		return 0
 	}
 	diff := 1e9 * uint64(p.maxDatagramSize-p.budgetAtLastSent)
-	bw := uint64(p.getBandwidth())
+	bw := uint64(max(1, p.getBandwidth()))
 	// We might need to round up this value.
 	// Otherwise, we might have a budget (slightly) smaller than the datagram size when the timer expires.
 	d := diff / bw
@@ -73,6 +80,17 @@ func (p *Pacer) TimeUntilSend() monotime.Time {
 		d++
 	}
 	return p.lastSentTime.Add(max(congestion.MinPacingDelay, time.Duration(d)*time.Nanosecond))
+}
+
+// MulDiv calculates a*b/divisor without overflowing the intermediate product.
+// Saturation also keeps pathological model samples from wrapping into a low rate.
+func MulDiv(a, b, divisor uint64) uint64 {
+	hi, lo := bits.Mul64(a, b)
+	if divisor == 0 || hi >= divisor {
+		return math.MaxUint64
+	}
+	q, _ := bits.Div64(hi, lo, divisor)
+	return q
 }
 
 func (p *Pacer) SetMaxDatagramSize(s congestion.ByteCount) {
