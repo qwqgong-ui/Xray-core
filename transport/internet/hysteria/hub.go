@@ -298,7 +298,7 @@ func Listen(ctx context.Context, address net.Address, port net.Port, streamSetti
 		EnableDatagrams:                true,
 		MaxDatagramFrameSize:           MaxDatagramFrameSize,
 		AssumePeerMaxDatagramFrameSize: MaxDatagramFrameSize,
-		DisablePathManager:             true,
+		DisablePathManager:             false,
 	}
 	if quicParams.InitStreamReceiveWindow == 0 {
 		quicConfig.InitialStreamReceiveWindow = 8388608
