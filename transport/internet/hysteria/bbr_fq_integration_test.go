@@ -36,6 +36,10 @@ func (c *fqTestPacketConn) ReadBatch(messages []ipv4.Message, flags int) (int, e
 	return n, err
 }
 
+func (c *fqTestPacketConn) WriteBatch(messages []ipv4.Message, flags int) (int, error) {
+	return c.batch.WriteBatch(messages, flags)
+}
+
 // Run the server and client roles in isolated veth namespaces with fq. This
 // exercises HY2 HTTP/3 authentication, controller replacement, TCP streams,
 // bidirectional ACKs, PMTU and two clients sharing the server UDP socket.

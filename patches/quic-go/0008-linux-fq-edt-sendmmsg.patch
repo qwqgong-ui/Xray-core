@@ -1,0 +1,952 @@
+diff --git a/kernel_pacing_batch.go b/kernel_pacing_batch.go
+new file mode 100644
+index 0000000..58c9d21
+--- /dev/null
++++ b/kernel_pacing_batch.go
+@@ -0,0 +1,159 @@
++package quic
++
++import (
++	"errors"
++	"io"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++)
++
++type kernelPacingPacket struct {
++	data      []byte
++	ecn       protocol.ECN
++	txtime    uint64
++	departure monotime.Time
++}
++
++type kernelPacingBatchWriter interface {
++	WriteBatchWithTxTime([]kernelPacingPacket) (int, error)
++}
++
++type kernelPacingQueueState struct {
++	nextTx, lastTx uint64
++	lastSize       protocol.ByteCount
++	lastProvider   *kernelPacingProvider
++}
++
++// prepare retains the per-datagram schedule, including late-worker spacing.
++// Only the first entry may wait: an already prepared batch must be submitted
++// before waiting for a later entry to enter the kernel's look-ahead window.
++func (s *kernelPacingQueueState) prepare(e queueEntry, wait bool) (kernelPacingPacket, bool, error) {
++	if e.pacing != nil && e.pacing != s.lastProvider {
++		*s = kernelPacingQueueState{lastProvider: e.pacing}
++	}
++	clock := kernelTxTime
++	if e.pacing != nil && e.pacing.clock != nil {
++		clock = e.pacing.clock
++	}
++	for {
++		txtime, err := clock(e.departure)
++		if err != nil {
++			return kernelPacingPacket{}, false, err
++		}
++		nextTx := s.nextTx
++		if s.lastTx != 0 && e.rate != 0 {
++			nextTx = s.lastTx + uint64(kernelPacingInterval(s.lastSize, e.rate))
++		}
++		txtime = max(txtime, nextTx)
++		kernelNow, err := clock(monotime.Now())
++		if err != nil {
++			return kernelPacingPacket{}, false, err
++		}
++		lead := e.lead
++		if lead == 0 {
++			lead = kernelPacingMaxLead
++		}
++		if txtime > kernelNow+uint64(lead) {
++			if !wait {
++				return kernelPacingPacket{}, false, nil
++			}
++			time.Sleep(time.Duration(txtime-kernelNow) - lead)
++			continue
++		}
++		s.nextTx = txtime + uint64(e.interval)
++		s.lastTx, s.lastSize = txtime, e.buf.Len()
++		return kernelPacingPacket{
++			data: e.buf.Data, ecn: e.ecn, txtime: txtime,
++			departure: monotime.Now().Add(time.Duration(txtime) - time.Duration(kernelNow)),
++		}, true, nil
++	}
++}
++
++func (s *kernelPacingQueueState) writeOne(h *sendQueue, e queueEntry) error {
++	writer, ok := h.conn.(interface {
++		WriteWithTxTime([]byte, protocol.ECN, uint64) error
++	})
++	if !ok || e.departure.IsZero() {
++		return h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
++	}
++	p, _, err := s.prepare(e, true)
++	if err != nil {
++		h.kernelPacingClockFallback(e)
++		return h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
++	}
++	err = writer.WriteWithTxTime(p.data, p.ecn, p.txtime)
++	if err == nil && e.pacing != nil {
++		e.pacing.recordDeparture(p.departure, e.buf.Len())
++	}
++	return err
++}
++
++func (s *kernelPacingQueueState) writeBatch(h *sendQueue, first queueEntry, writer kernelPacingBatchWriter) (pending queueEntry, hasPending bool, err error) {
++	var entries [sendQueueCapacity]queueEntry
++	var packets [sendQueueCapacity]kernelPacingPacket
++	entries[0] = first
++	count := 1
++	defer func() {
++		for _, e := range entries[:count] {
++			h.releaseEntry(e)
++		}
++	}()
++	p, _, clockErr := s.prepare(first, true)
++	if clockErr != nil {
++		h.kernelPacingClockFallback(first)
++		return pending, false, h.conn.Write(first.buf.Data, first.gsoSize, first.ecn)
++	}
++	packets[0] = p
++collect:
++	for count < len(entries) {
++		select {
++		case e := <-h.queue:
++			// Do not combine immediate ACK/PTO packets or different pacing epochs.
++			if e.departure.IsZero() || e.gsoSize != 0 || e.pacing != first.pacing {
++				pending, hasPending = e, true
++				break collect
++			}
++			p, ready, clockErr := s.prepare(e, false)
++			if clockErr != nil || !ready {
++				pending, hasPending = e, true
++				break collect
++			}
++			entries[count], packets[count] = e, p
++			count++
++		default:
++			break collect // never wait for a batch to fill
++		}
++	}
++	for sent := 0; sent < count; {
++		n, err := writer.WriteBatchWithTxTime(packets[sent:count])
++		if n < 0 || n > count-sent {
++			return pending, hasPending, io.ErrShortWrite
++		}
++		for i := sent; i < sent+n; i++ {
++			if entries[i].pacing != nil {
++				entries[i].pacing.recordDeparture(packets[i].departure, entries[i].buf.Len())
++			}
++		}
++		sent += n
++		if err != nil {
++			if !isKernelPacingSizeError(err) {
++				return pending, hasPending, err
++			}
++			// The accepted prefix is complete. Drop only the oversized first
++			// unsent datagram, retaining the existing PMTU/loss behavior.
++			if sent < count {
++				sent++
++			}
++		} else if n == 0 {
++			return pending, hasPending, io.ErrNoProgress
++		}
++	}
++	return pending, hasPending, nil
++}
++
++func isKernelPacingSizeError(err error) bool {
++	var tooLarge *DatagramTooLargeError
++	return isSendMsgSizeErr(err) || errors.As(err, &tooLarge)
++}
+diff --git a/kernel_pacing_batch_linux.go b/kernel_pacing_batch_linux.go
+new file mode 100644
+index 0000000..0cec9ec
+--- /dev/null
++++ b/kernel_pacing_batch_linux.go
+@@ -0,0 +1,98 @@
++//go:build linux && !android
++
++package quic
++
++import (
++	"errors"
++	"net"
++	"sync"
++
++	"golang.org/x/net/ipv4"
++	"golang.org/x/sys/unix"
++)
++
++type kernelPacingBatchMessages struct {
++	messages [sendQueueCapacity]ipv4.Message
++	buffers  [sendQueueCapacity][1][]byte
++	controls [sendQueueCapacity][oobBufferSize]byte
++}
++
++var kernelPacingBatchMessagesPool = sync.Pool{New: func() any { return new(kernelPacingBatchMessages) }}
++
++func (c *sconn) WriteBatchWithTxTime(packets []kernelPacingPacket) (int, error) {
++	if len(packets) == 0 {
++		return 0, nil
++	}
++	writer, ok := c.rawConn.(interface {
++		WritePacketsWithTxTime([]kernelPacingPacket, net.Addr, []byte) (int, error)
++	})
++	if len(packets) == 1 || !ok || c.kernelPacingBatchFailed {
++		if err := c.WriteWithTxTime(packets[0].data, packets[0].ecn, packets[0].txtime); err != nil {
++			return 0, err
++		}
++		return 1, nil
++	}
++	ai := c.remoteAddrInfo.Load()
++	n, err := writer.WritePacketsWithTxTime(packets, ai.addr, ai.oob)
++	if n == 0 && err != nil && !c.wroteFirstPacket && isPermissionError(err) {
++		n, err = writer.WritePacketsWithTxTime(packets, ai.addr, ai.oob)
++	}
++	c.wroteFirstPacket = true
++	if err != nil && (errors.Is(err, unix.ENOSYS) || isKernelPacingUnsupported(err)) {
++		// Diagnose TXTIME through the existing scalar path. A missing batch
++		// syscall or a custom PacketConn need not disable working EDT pacing.
++		c.kernelPacingBatchFailed = true
++		if n < len(packets) {
++			p := packets[n]
++			if err := c.WriteWithTxTime(p.data, p.ecn, p.txtime); err != nil {
++				return n, err
++			}
++			n++
++		}
++		return n, nil
++	}
++	return n, err
++}
++
++func (c *oobConn) WritePacketsWithTxTime(packets []kernelPacingPacket, addr net.Addr, packetInfoOOB []byte) (int, error) {
++	type batchWriter interface {
++		WriteBatch([]ipv4.Message, int) (int, error)
++	}
++	writer, ok := c.OOBCapablePacketConn.(batchWriter)
++	if !ok {
++		// Unwrap only an ordinary UDPConn. Bypassing a custom WriteMsgUDP
++		// could lose its packet transformation or other required semantics.
++		if _, plain := c.OOBCapablePacketConn.(*net.UDPConn); !plain {
++			return 0, unix.ENOSYS
++		}
++		writer, ok = c.batchConn.(batchWriter)
++		if !ok {
++			return 0, unix.ENOSYS
++		}
++	}
++	if len(packets) == 0 {
++		return 0, nil
++	}
++	packets = packets[:min(len(packets), sendQueueCapacity)]
++	batch := kernelPacingBatchMessagesPool.Get().(*kernelPacingBatchMessages)
++	defer func() {
++		for i := range packets {
++			batch.buffers[i][0] = nil
++			batch.messages[i] = ipv4.Message{}
++		}
++		kernelPacingBatchMessagesPool.Put(batch)
++	}()
++	for i, p := range packets {
++		batch.buffers[i][0] = p.data
++		// Each msghdr needs its own ancillary storage. The shared listener
++		// may also be writing for other connections at the same time.
++		oob := append(batch.controls[i][:0], packetInfoOOB...)
++		batch.messages[i] = ipv4.Message{
++			Buffers: batch.buffers[i][:], Addr: addr,
++			OOB: c.packetOOB(p.data, addr, oob, 0, p.ecn, p.txtime),
++		}
++	}
++	n, err := writer.WriteBatch(batch.messages[:len(packets)], 0)
++	// x/net returns the raw syscall count (-1 on failure) on some paths.
++	return max(0, n), err
++}
+diff --git a/kernel_pacing_batch_linux_test.go b/kernel_pacing_batch_linux_test.go
+new file mode 100644
+index 0000000..12855c6
+--- /dev/null
++++ b/kernel_pacing_batch_linux_test.go
+@@ -0,0 +1,220 @@
++//go:build linux && !android
++
++package quic
++
++import (
++	"encoding/binary"
++	"net"
++	"net/netip"
++	"os"
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/net/ipv4"
++	"golang.org/x/sys/unix"
++)
++
++type pacingBatchSocket struct {
++	*net.UDPConn
++	write func([]ipv4.Message) (int, error)
++	plain [][]byte
++}
++
++func (c *pacingBatchSocket) WriteBatch(messages []ipv4.Message, _ int) (int, error) {
++	return c.write(messages)
++}
++
++func (c *pacingBatchSocket) WriteMsgUDP(data, oob []byte, _ *net.UDPAddr) (int, int, error) {
++	c.plain = append(c.plain, append([]byte(nil), data...))
++	return len(data), len(oob), nil
++}
++
++func TestKernelPacingBatchIndependentControlMessages(t *testing.T) {
++	for _, ip := range []string{"127.0.0.1", "::1"} {
++		t.Run(ip, func(t *testing.T) {
++			addr := &net.UDPAddr{IP: net.ParseIP(ip), Port: 12345}
++			info := packetInfo{addr: netip.MustParseAddr(ip)}
++			oob := append(make([]byte, 0, oobBufferSize), info.OOB()...)
++			before := append([]byte(nil), oob[:cap(oob)]...)
++			packets := []kernelPacingPacket{
++				{data: []byte{0}, ecn: protocol.ECT0, txtime: 100},
++				{data: []byte{1}, ecn: protocol.ECT1, txtime: 200},
++				{data: []byte{2}, ecn: protocol.ECNNon, txtime: 300},
++				{data: []byte{3}, ecn: protocol.ECNUnsupported, txtime: 400},
++			}
++			conn := &pacingBatchSocket{}
++			conn.write = func(messages []ipv4.Message) (int, error) {
++				require.Len(t, messages, len(packets))
++				for i, msg := range messages {
++					require.Equal(t, addr, msg.Addr)
++					require.Equal(t, packets[i].data, msg.Buffers[0])
++					require.Equal(t, oob, msg.OOB[:len(oob)], "packet info lost")
++					controls, err := unix.ParseSocketControlMessage(msg.OOB)
++					require.NoError(t, err)
++					var timestamp uint64
++					var ecn []byte
++					for _, cm := range controls {
++						require.NotEqual(t, int32(unix.IPPROTO_UDP), cm.Header.Level, "EDT datagrams must not become GSO segments")
++						if cm.Header.Level == unix.SOL_SOCKET && cm.Header.Type == unix.SCM_TXTIME {
++							timestamp = binary.NativeEndian.Uint64(cm.Data)
++						} else if (cm.Header.Level == unix.IPPROTO_IP && cm.Header.Type == unix.IP_TOS) || (cm.Header.Level == unix.IPPROTO_IPV6 && cm.Header.Type == unix.IPV6_TCLASS) {
++							ecn = cm.Data
++						}
++					}
++					require.Equal(t, packets[i].txtime, timestamp)
++					if packets[i].ecn == protocol.ECNUnsupported {
++						require.Nil(t, ecn)
++					} else if ip == "::1" {
++						require.Equal(t, uint32(packets[i].ecn.ToHeaderBits()), binary.NativeEndian.Uint32(ecn))
++					} else {
++						require.Equal(t, packets[i].ecn.ToHeaderBits(), ecn[0])
++					}
++				}
++				return len(messages), nil
++			}
++			raw := &oobConn{OOBCapablePacketConn: conn, cap: connCapabilities{ECN: true}}
++			n, err := raw.WritePacketsWithTxTime(packets, addr, oob)
++			require.NoError(t, err)
++			require.Equal(t, len(packets), n)
++			require.Equal(t, before, oob[:cap(oob)], "shared packet info storage mutated")
++		})
++	}
++}
++
++func TestKernelPacingBatchPermissionRetry(t *testing.T) {
++	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
++	require.NoError(t, err)
++	defer udp.Close()
++	calls := 0
++	wrapped := &pacingBatchSocket{UDPConn: udp}
++	wrapped.write = func(messages []ipv4.Message) (int, error) {
++		calls++
++		if calls == 1 {
++			return -1, os.NewSyscallError("sendmmsg", unix.EPERM)
++		}
++		return len(messages), nil
++	}
++	raw, err := newConn(wrapped, false, false)
++	require.NoError(t, err)
++	conn := newSendConn(raw, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 34567}, packetInfo{}, utils.DefaultLogger)
++	n, err := conn.WriteBatchWithTxTime([]kernelPacingPacket{{data: []byte{0}}, {data: []byte{1}}})
++	require.NoError(t, err)
++	require.Equal(t, 2, n)
++	require.Equal(t, 2, calls)
++	require.True(t, conn.wroteFirstPacket)
++}
++
++func TestKernelPacingBatchUnsupportedSyscallKeepsScalarEDT(t *testing.T) {
++	for _, errno := range []unix.Errno{unix.ENOSYS, unix.EOPNOTSUPP, unix.EINVAL, unix.ENOPROTOOPT} {
++		t.Run(errno.Error(), func(t *testing.T) {
++			udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
++			require.NoError(t, err)
++			defer udp.Close()
++			wrapped := &pacingBatchSocket{UDPConn: udp}
++			calls := 0
++			wrapped.write = func([]ipv4.Message) (int, error) {
++				calls++
++				return -1, os.NewSyscallError("sendmmsg", errno)
++			}
++			raw, err := newConn(wrapped, false, false)
++			require.NoError(t, err)
++			conn := newSendConn(raw, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 34567}, packetInfo{}, utils.DefaultLogger)
++			packets := []kernelPacingPacket{{data: []byte{0}}, {data: []byte{1}}, {data: []byte{2}}}
++			for len(packets) > 0 {
++				n, err := conn.WriteBatchWithTxTime(packets)
++				require.NoError(t, err)
++				require.Positive(t, n)
++				packets = packets[n:]
++			}
++			require.Equal(t, 1, calls)
++			require.Equal(t, [][]byte{{0}, {1}, {2}}, wrapped.plain)
++			require.True(t, conn.kernelPacingBatchFailed)
++			require.False(t, conn.kernelPacingFailed.Load())
++		})
++	}
++}
++
++func TestKernelPacingBatchDoesNotBypassCustomWrite(t *testing.T) {
++	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero})
++	require.NoError(t, err)
++	defer udp.Close()
++	wrapped := &kernelRejectTxTimeConn{UDPConn: udp}
++	raw, err := newConn(wrapped, false, false)
++	require.NoError(t, err)
++	conn := newSendConn(raw, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 34567}, packetInfo{}, utils.DefaultLogger)
++	packets := []kernelPacingPacket{{data: []byte{0}, txtime: 1}, {data: []byte{1}, txtime: 2}}
++	for len(packets) > 0 {
++		n, err := conn.WriteBatchWithTxTime(packets)
++		require.NoError(t, err)
++		require.Positive(t, n)
++		packets = packets[n:]
++	}
++	require.Equal(t, 2, wrapped.timed)
++	require.Equal(t, 2, wrapped.plain)
++	require.True(t, conn.kernelPacingFailed.Load())
++}
++
++func TestKernelPacingBatchUDPRoundTrip(t *testing.T) {
++	for _, network := range []string{"udp4", "udp6"} {
++		t.Run(network, func(t *testing.T) {
++			ip := net.IPv4(127, 0, 0, 1)
++			if network == "udp6" {
++				ip = net.IPv6loopback
++			}
++			receiver, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
++			require.NoError(t, err)
++			defer receiver.Close()
++			recv, err := newConn(receiver, false, false)
++			require.NoError(t, err)
++			sender, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
++			require.NoError(t, err)
++			defer sender.Close()
++			raw, err := newConn(sender, false, false)
++			require.NoError(t, err)
++			require.True(t, raw.enableKernelPacing())
++			stamp, err := kernelTxTime(monotime.Now())
++			require.NoError(t, err)
++			packets := []kernelPacingPacket{
++				{data: []byte{0}, ecn: protocol.ECT0, txtime: stamp},
++				{data: []byte{1, 1}, ecn: protocol.ECT1, txtime: stamp + 1000},
++				{data: []byte{2, 2, 2}, ecn: protocol.ECNNon, txtime: stamp + 2000},
++			}
++			for remaining := packets; len(remaining) > 0; {
++				n, err := raw.WritePacketsWithTxTime(remaining, receiver.LocalAddr(), nil)
++				require.NoError(t, err)
++				require.Positive(t, n)
++				remaining = remaining[n:]
++			}
++			require.NoError(t, receiver.SetReadDeadline(time.Now().Add(time.Second)))
++			for _, expected := range packets {
++				packet, err := recv.ReadPacket()
++				require.NoError(t, err)
++				require.Equal(t, expected.data, packet.data)
++				require.Equal(t, expected.ecn, packet.ecn)
++				packet.buffer.Release()
++			}
++		})
++	}
++}
++
++func BenchmarkKernelPacingBatchControlMessages(b *testing.B) {
++	conn := &pacingBatchSocket{write: func(messages []ipv4.Message) (int, error) { return len(messages), nil }}
++	raw := &oobConn{OOBCapablePacketConn: conn, cap: connCapabilities{ECN: true}}
++	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
++	packets := make([]kernelPacingPacket, sendQueueCapacity)
++	for i := range packets {
++		packets[i] = kernelPacingPacket{data: make([]byte, 1200), ecn: protocol.ECT0, txtime: uint64(i + 1)}
++	}
++	b.ReportAllocs()
++	b.SetBytes(int64(len(packets) * 1200))
++	b.ResetTimer()
++	for range b.N {
++		if _, err := raw.WritePacketsWithTxTime(packets, addr, nil); err != nil {
++			b.Fatal(err)
++		}
++	}
++}
+diff --git a/kernel_pacing_batch_test.go b/kernel_pacing_batch_test.go
+new file mode 100644
+index 0000000..fb89fb8
+--- /dev/null
++++ b/kernel_pacing_batch_test.go
+@@ -0,0 +1,218 @@
++package quic
++
++import (
++	"errors"
++	"io"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/stretchr/testify/require"
++)
++
++type pacingBatchResult struct {
++	n   int
++	err error
++}
++
++type pacingBatchCall struct {
++	ids   []byte
++	times []uint64
++	at    monotime.Time
++}
++
++type pacingBatchTestConn struct {
++	sendConn
++	calls     []pacingBatchCall
++	accepted  []byte
++	immediate []byte
++	results   []pacingBatchResult
++}
++
++func (c *pacingBatchTestConn) WriteBatchWithTxTime(packets []kernelPacingPacket) (int, error) {
++	call := pacingBatchCall{at: monotime.Now()}
++	for _, p := range packets {
++		call.ids = append(call.ids, p.data[0])
++		call.times = append(call.times, p.txtime)
++	}
++	c.calls = append(c.calls, call)
++	r := pacingBatchResult{n: len(packets)}
++	if len(c.results) > 0 {
++		r, c.results = c.results[0], c.results[1:]
++	}
++	for _, p := range packets[:r.n] {
++		c.accepted = append(c.accepted, p.data[0])
++	}
++	return r.n, r.err
++}
++
++func (c *pacingBatchTestConn) Write(data []byte, _ uint16, _ protocol.ECN) error {
++	c.immediate = append(c.immediate, data[0])
++	return nil
++}
++
++func pacingBatchProvider(rate uint64) *kernelPacingProvider {
++	return &kernelPacingProvider{
++		rate: func() uint64 { return rate },
++		clock: func(departure monotime.Time) (uint64, error) {
++			return uint64(max(departure, monotime.Now())), nil
++		},
++	}
++}
++
++func enqueuePacingBatch(q *sendQueue, p *kernelPacingProvider, id byte, size int, departure monotime.Time) *packetBuffer {
++	buf := getPacketBuffer()
++	buf.Data = append(buf.Data, make([]byte, size)...)
++	buf.Data[0] = id
++	q.SendWithPacing(buf, protocol.ECT0, departure, kernelPacingInterval(buf.Len(), p.rate()), kernelPacingMaxLead, p)
++	return buf
++}
++
++func drainPacingBatch(q *sendQueue) error {
++	close(q.closeCalled)
++	return q.Run()
++}
++
++func TestKernelPacingBatchReadyOnly(t *testing.T) {
++	for _, count := range []int{1, 4, sendQueueCapacity} {
++		synctest.Test(t, func(t *testing.T) {
++			conn := &pacingBatchTestConn{}
++			q := newSendQueue(conn).(*sendQueue)
++			p := pacingBatchProvider(1_000_000)
++			now := monotime.Now()
++			for i := range count {
++				enqueuePacingBatch(q, p, byte(i), 40+i*10, now.Add(-time.Second))
++			}
++			require.NoError(t, drainPacingBatch(q))
++			require.Len(t, conn.calls, 1)
++			require.Len(t, conn.calls[0].ids, count)
++			require.Equal(t, now, conn.calls[0].at, "a ready packet must not wait for the batch to fill")
++			for i := 1; i < count; i++ {
++				require.Equal(t, uint64((40+(i-1)*10)*int(time.Microsecond)), conn.calls[0].times[i]-conn.calls[0].times[i-1])
++			}
++			require.Zero(t, q.pacingPending.Load())
++			require.Equal(t, now.Add(time.Duration(conn.calls[0].times[count-1]-uint64(now))), p.lastDeparture)
++		})
++	}
++}
++
++func TestKernelPacingBatchRetriesOnlyUnsentPackets(t *testing.T) {
++	fatal := errors.New("batch write failed")
++	for _, tc := range []struct {
++		name     string
++		results  []pacingBatchResult
++		accepted []byte
++		requests [][]byte
++		wantErr  error
++	}{
++		{name: "partial", results: []pacingBatchResult{{n: 2}}, accepted: []byte{0, 1, 2, 3}, requests: [][]byte{{0, 1, 2, 3}, {2, 3}}},
++		{name: "oversized", results: []pacingBatchResult{{n: 1}, {err: &DatagramTooLargeError{}}}, accepted: []byte{0, 2, 3}, requests: [][]byte{{0, 1, 2, 3}, {1, 2, 3}, {2, 3}}},
++		{name: "prefix-and-oversized", results: []pacingBatchResult{{n: 1, err: &DatagramTooLargeError{}}}, accepted: []byte{0, 2, 3}, requests: [][]byte{{0, 1, 2, 3}, {2, 3}}},
++		{name: "fatal", results: []pacingBatchResult{{n: 1, err: fatal}}, accepted: []byte{0}, requests: [][]byte{{0, 1, 2, 3}}, wantErr: fatal},
++		{name: "no-progress", results: []pacingBatchResult{{}}, requests: [][]byte{{0, 1, 2, 3}}, wantErr: io.ErrNoProgress},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			synctest.Test(t, func(t *testing.T) {
++				conn := &pacingBatchTestConn{results: tc.results}
++				q := newSendQueue(conn).(*sendQueue)
++				p := pacingBatchProvider(1_000_000)
++				var bufs []*packetBuffer
++				for i := range 4 {
++					bufs = append(bufs, enqueuePacingBatch(q, p, byte(i), 40, monotime.Now()))
++				}
++				if tc.wantErr != nil {
++					pending := getPacketWithContents([]byte{4})
++					q.Send(pending, 0, protocol.ECNNon)
++					bufs = append(bufs, pending)
++				}
++				err := drainPacingBatch(q)
++				if tc.wantErr != nil {
++					require.ErrorIs(t, err, tc.wantErr)
++				} else {
++					require.NoError(t, err)
++				}
++				require.Equal(t, tc.accepted, conn.accepted)
++				require.Len(t, conn.calls, len(tc.requests))
++				for i, ids := range tc.requests {
++					require.Equal(t, ids, conn.calls[i].ids)
++				}
++				for _, buf := range bufs {
++					require.Zero(t, buf.refCount, "every collected buffer must be released exactly once")
++				}
++				require.Zero(t, q.pacingPending.Load())
++			})
++		})
++	}
++}
++
++func TestKernelPacingBatchKeepsImmediateAndProviderBoundaries(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		conn := &pacingBatchTestConn{}
++		q := newSendQueue(conn).(*sendQueue)
++		p, other := pacingBatchProvider(1_000_000), pacingBatchProvider(2_000_000)
++		now := monotime.Now()
++		for i := range 2 {
++			enqueuePacingBatch(q, p, byte(i), 40, now)
++		}
++		q.Send(getPacketWithContents([]byte{2}), 0, protocol.ECNNon)
++		for i := 3; i < 5; i++ {
++			enqueuePacingBatch(q, other, byte(i), 40, now)
++		}
++		require.NoError(t, drainPacingBatch(q))
++		require.Equal(t, []byte{2}, conn.immediate)
++		require.Len(t, conn.calls, 2)
++		require.Equal(t, []byte{0, 1}, conn.calls[0].ids)
++		require.Equal(t, []byte{3, 4}, conn.calls[1].ids)
++		require.Equal(t, uint64(now), conn.calls[1].times[0], "a new pacing epoch must reset spacing")
++	})
++}
++
++func TestKernelPacingBatchFlushesBeforeLeadWait(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		conn := &pacingBatchTestConn{}
++		q := newSendQueue(conn).(*sendQueue)
++		p := pacingBatchProvider(1_000_000)
++		now := monotime.Now()
++		for i := range 3 {
++			enqueuePacingBatch(q, p, byte(i), 700, now.Add(-time.Second))
++		}
++		require.NoError(t, drainPacingBatch(q))
++		require.Len(t, conn.calls, 2)
++		require.Equal(t, []byte{0, 1}, conn.calls[0].ids)
++		require.Equal(t, now, conn.calls[0].at)
++		require.Equal(t, []byte{2}, conn.calls[1].ids)
++		require.GreaterOrEqual(t, conn.calls[1].at.Sub(now), 400*time.Microsecond)
++		for _, call := range conn.calls {
++			for _, timestamp := range call.times {
++				require.LessOrEqual(t, time.Duration(timestamp-uint64(call.at)), kernelPacingMaxLead)
++			}
++		}
++	})
++}
++
++func TestKernelPacingBatchClockFailureFlushesReadyPrefix(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		conn := &pacingBatchTestConn{}
++		q := newSendQueue(conn).(*sendQueue)
++		p := pacingBatchProvider(1_000_000)
++		now := monotime.Now()
++		bad := now.Add(100 * time.Microsecond)
++		p.clock = func(departure monotime.Time) (uint64, error) {
++			if departure == bad {
++				return 0, errors.New("clock failed")
++			}
++			return uint64(max(departure, monotime.Now())), nil
++		}
++		enqueuePacingBatch(q, p, 0, 40, now)
++		enqueuePacingBatch(q, p, 1, 40, bad)
++		require.NoError(t, drainPacingBatch(q))
++		require.Len(t, conn.calls, 1)
++		require.Equal(t, now, conn.calls[0].at)
++		require.Equal(t, []byte{0}, conn.accepted)
++		require.Equal(t, []byte{1}, conn.immediate)
++		require.True(t, p.failed.Load())
++		require.Equal(t, bad, monotime.Now())
++	})
++}
+diff --git a/kernel_pacing_linux_test.go b/kernel_pacing_linux_test.go
+index 8115700..c2dd8d3 100644
+--- a/kernel_pacing_linux_test.go
++++ b/kernel_pacing_linux_test.go
+@@ -221,13 +221,22 @@ func TestKernelPacingFQIntegration(t *testing.T) {
+ 	}
+ 	planned := make(map[byte]uint64)
+ 	for stream := 0; stream < 2; stream++ {
++		var packets []kernelPacingPacket
+ 		for i := 0; i < 10; i++ {
+ 			id := byte(stream*10 + i)
+ 			timestamp := base + uint64(i)*uint64(time.Duration(stream+2)*time.Millisecond)
+ 			planned[id] = timestamp
+-			if _, err := raw.WritePacketWithTxTime([]byte{id}, &net.UDPAddr{IP: net.ParseIP(peer), Port: 34567 + stream}, nil, 0, protocol.ECT0, timestamp); err != nil {
++			packets = append(packets, kernelPacingPacket{data: []byte{id}, ecn: protocol.ECT0, txtime: timestamp})
++		}
++		for len(packets) > 0 {
++			n, err := raw.WritePacketsWithTxTime(packets, &net.UDPAddr{IP: net.ParseIP(peer), Port: 34567 + stream}, nil)
++			if err != nil {
+ 				t.Fatal(err)
+ 			}
++			if n == 0 {
++				t.Fatal("batch made no progress")
++			}
++			packets = packets[n:]
+ 		}
+ 	}
+ 	udp.SetReadDeadline(time.Now().Add(3 * time.Second))
+diff --git a/send_conn.go b/send_conn.go
+index d646848..651b762 100644
+--- a/send_conn.go
++++ b/send_conn.go
+@@ -41,6 +41,7 @@ type sconn struct {
+ 	// Used to catch the error sometimes returned by the first sendmsg call on Linux,
+ 	// see https://github.com/golang/go/issues/63322.
+ 	wroteFirstPacket        bool
++	kernelPacingBatchFailed bool
+ 	kernelPacingFailed      atomic.Bool
+ 	kernelPacingPathInfo    *remoteAddrInfo
+ 	kernelPacingPathChecked monotime.Time
+diff --git a/send_queue.go b/send_queue.go
+index c1d2d2a..9d53ea8 100644
+--- a/send_queue.go
++++ b/send_queue.go
+@@ -1,7 +1,6 @@
+ package quic
+ 
+ import (
+-	"errors"
+ 	"net"
+ 	"sync/atomic"
+ 	"time"
+@@ -110,97 +109,54 @@ func (h *sendQueue) Available() <-chan struct{} {
+ func (h *sendQueue) Run() error {
+ 	defer close(h.runStopped)
+ 	var shouldClose bool
+-	var nextTx uint64
+-	var lastTx uint64
+-	var lastSize protocol.ByteCount
+-	var lastProvider *kernelPacingProvider
+-	for {
+-		if shouldClose && len(h.queue) == 0 {
+-			return nil
++	var pacing kernelPacingQueueState
++	var pending queueEntry
++	var hasPending bool
++	defer func() {
++		if hasPending {
++			h.releaseEntry(pending)
+ 		}
+-		select {
+-		case <-h.closeCalled:
+-			h.closeCalled = nil // prevent this case from being selected again
+-			// make sure that all queued packets are actually sent out
+-			shouldClose = true
+-		case e := <-h.queue:
+-			var err error
+-			if e.pacing != nil && e.pacing != lastProvider {
+-				nextTx = 0
+-				lastTx = 0
+-				lastProvider = e.pacing
+-			}
+-			if writer, ok := h.conn.(interface {
+-				WriteWithTxTime([]byte, protocol.ECN, uint64) error
+-			}); ok && !e.departure.IsZero() {
+-				clock := kernelTxTime
+-				if e.pacing != nil && e.pacing.clock != nil {
+-					clock = e.pacing.clock
+-				}
+-				for {
+-					txtime, clockErr := clock(e.departure)
+-					if clockErr != nil {
+-						h.kernelPacingClockFallback(e)
+-						err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+-						break
+-					}
+-					// A delayed worker must preserve spacing rather than release
+-					// all overdue entries as an immediate burst.
+-					if lastTx != 0 && e.rate != 0 {
+-						nextTx = lastTx + uint64(kernelPacingInterval(lastSize, e.rate))
+-					}
+-					if txtime < nextTx {
+-						txtime = nextTx
+-					}
+-					kernelNow, clockErr := clock(monotime.Now())
+-					if clockErr != nil {
+-						h.kernelPacingClockFallback(e)
+-						err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+-						break
+-					}
+-					lead := e.lead
+-					if lead == 0 {
+-						lead = kernelPacingMaxLead
+-					}
+-					if txtime > kernelNow+uint64(lead) {
+-						// Catch-up traffic remains in the bounded user-space queue;
+-						// never shift a delayed batch far into the kernel's future.
+-						time.Sleep(time.Duration(txtime-kernelNow) - lead)
+-						continue
+-					}
+-					nextTx = txtime + uint64(e.interval)
+-					lastTx, lastSize = txtime, e.buf.Len()
+-					err = writer.WriteWithTxTime(e.buf.Data, e.ecn, txtime)
+-					if err == nil && e.pacing != nil {
+-						e.pacing.recordDeparture(monotime.Now().Add(time.Duration(txtime-kernelNow)), e.buf.Len())
+-					}
+-					break
+-				}
+-			} else {
+-				err = h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+-			}
+-			if err != nil {
+-				// This additional check enables:
+-				// 1. Checking for "datagram too large" message from the kernel, as such,
+-				// 2. Path MTU discovery,and
+-				// 3. Eventual detection of loss PingFrame.
+-				var tooLarge *DatagramTooLargeError
+-				if !isSendMsgSizeErr(err) && !errors.As(err, &tooLarge) {
+-					return err
+-				}
+-			}
+-			e.buf.Release()
+-			if e.pacing != nil {
+-				h.pacingPending.Add(-1)
+-				if e.pacing.wake != nil {
+-					e.pacing.wake()
+-				}
++	}()
++	for {
++		var e queueEntry
++		if hasPending {
++			e, hasPending = pending, false
++		} else {
++			if shouldClose && len(h.queue) == 0 {
++				return nil
+ 			}
+ 			select {
+-			case h.available <- struct{}{}:
+-			default:
++			case <-h.closeCalled:
++				h.closeCalled = nil // prevent this case from being selected again
++				shouldClose = true
++				continue
++			case e = <-h.queue:
+ 			}
+ 		}
++		var err error
++		if writer, ok := h.conn.(kernelPacingBatchWriter); ok && !e.departure.IsZero() && e.gsoSize == 0 {
++			pending, hasPending, err = pacing.writeBatch(h, e, writer)
++		} else {
++			err = pacing.writeOne(h, e)
++			h.releaseEntry(e)
++		}
++		if err != nil && !isKernelPacingSizeError(err) {
++			return err
++		}
++	}
++}
++
++func (h *sendQueue) releaseEntry(e queueEntry) {
++	e.buf.Release()
++	if e.pacing != nil {
++		h.pacingPending.Add(-1)
++		if e.pacing.wake != nil {
++			e.pacing.wake()
++		}
++	}
++	select {
++	case h.available <- struct{}{}:
++	default:
+ 	}
+ }
+ 
+diff --git a/sys_conn_helper_linux.go b/sys_conn_helper_linux.go
+index 4017754..fc05ed7 100644
+--- a/sys_conn_helper_linux.go
++++ b/sys_conn_helper_linux.go
+@@ -113,7 +113,7 @@ func isGSOError(err error) bool {
+ func isPermissionError(err error) bool {
+ 	var serr *os.SyscallError
+ 	if errors.As(err, &serr) {
+-		return serr.Syscall == "sendmsg" && serr.Err == unix.EPERM
++		return (serr.Syscall == "sendmsg" || serr.Syscall == "sendmmsg") && serr.Err == unix.EPERM
+ 	}
+ 	return false
+ }
+diff --git a/sys_conn_oob.go b/sys_conn_oob.go
+index e56728d..2a6fdb1 100644
+--- a/sys_conn_oob.go
++++ b/sys_conn_oob.go
+@@ -252,6 +252,12 @@ func (c *oobConn) WritePacket(b []byte, addr net.Addr, packetInfoOOB []byte, gso
+ }
+ 
+ func (c *oobConn) WritePacketWithTxTime(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN, txtime uint64) (int, error) {
++	oob := c.packetOOB(b, addr, packetInfoOOB, gsoSize, ecn, txtime)
++	n, _, err := c.WriteMsgUDP(b, oob, addr.(*net.UDPAddr))
++	return n, err
++}
++
++func (c *oobConn) packetOOB(b []byte, addr net.Addr, packetInfoOOB []byte, gsoSize uint16, ecn protocol.ECN, txtime uint64) []byte {
+ 	oob := packetInfoOOB
+ 	if gsoSize > 0 {
+ 		if !c.capabilities().GSO {
+@@ -278,8 +284,7 @@ func (c *oobConn) WritePacketWithTxTime(b []byte, addr net.Addr, packetInfoOOB [
+ 		}
+ 	}
+ 	oob = appendTxTimeMsg(oob, txtime)
+-	n, _, err := c.WriteMsgUDP(b, oob, addr.(*net.UDPAddr))
+-	return n, err
++	return oob
+ }
+ 
+ func (c *oobConn) capabilities() connCapabilities {
