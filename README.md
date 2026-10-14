@@ -4,9 +4,9 @@
 
 本分支在上游 Xray-core 基础上保留的定制功能、使用条件与限制统一记录在 docs：
 
-- [下游功能目录](docs/features.md)：DNS bundle、Cloudflare ECH、Hybrid QUIC、XHTTP 批处理、VLESS MultiBuffer、freedom 零拷贝及 QUIC BBR 调整。
+- [下游功能目录](docs/features.md)：DNS bundle、ECH 透传、Hybrid QUIC、XHTTP 批处理、VLESS MultiBuffer、freedom 零拷贝及 QUIC BBR 调整。
 - [Hybrid QUIC 协议与多跳配置](docs/hybrid-quic.md)。
-- [Cloudflare ECH 补充专题](docs/cloudflare-ech-dns.md)。
+- [Cloudflare ECH 补充历史专题（自动补充已移除）](docs/cloudflare-ech-dns.md)。
 - [本分支构建与依赖补丁](docs/features/build-and-patches.md)：构建、测试前需应用 quic-go 补丁并加载 GOFLAGS。
 
 Xray 自身修改已合入源码；`patches/xray/` 保留历史补丁，正常构建无需重复应用。

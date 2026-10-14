@@ -144,7 +144,6 @@ func (s *DNS) QueryDomain(ctx context.Context, domain string) (*dnsfeature.Recor
 	if address.err != nil {
 		return nil, address.err
 	}
-	service = s.supplementCloudflareECH(ctx, domain, address.ips, address.ttl, service)
 	result := &dnsfeature.RecordResponse{RCode: service.RCode}
 	ttl := address.ttl
 	if service.RCode != mdns.RcodeSuccess {

@@ -1,6 +1,10 @@
-# Cloudflare ECH 元数据补充（Cloudflare ECH Supplementation）
+# ECH 元数据透传（原自动补充功能已移除）
 
 [返回功能目录](../features.md)
+
+当前行为：隧道 DNS 和域名 bundle 仅保留上游提供的 ECH，不再根据 Cloudflare 地址补入 ECH，也不合成 HTTPS 服务记录。显式配置的出站 TLS ECH 功能不受影响。回归测试见 [ECH 透传测试](../../app/dns/ech_passthrough_test.go)。
+
+以下为已移除功能的历史说明，不代表当前行为。
 
 当隧道 DNS 查询返回的真实地址全部位于源码保存的 Cloudflare 代理网段内，而且 HTTPS 记录缺少 ECH 时，尝试补充 ECH 元数据。它改变 DNS 应答，不修改转发中的 TLS 握手。
 
@@ -20,5 +24,4 @@
 
 ## 实现与验证入口
 
-- [ECH 补充实现](../../app/dns/cloudflare_ech.go)
-- [适用性、缓存和异常处理测试](../../app/dns/cloudflare_ech_test.go)
+- 原补充实现和对应测试已移除。

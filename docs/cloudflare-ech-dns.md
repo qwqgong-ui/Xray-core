@@ -1,5 +1,7 @@
 # Cloudflare ECH supplementation in tunnel DNS
 
+This feature has been removed. Tunnel DNS and domain bundles now preserve upstream ECH metadata without adding missing ECH or synthesizing HTTPS records. Explicit outbound TLS ECH configuration remains supported. The following describes historical behavior; the former implementation and supplementation tests have been deleted. Current regression coverage is in `app/dns/ech_passthrough_test.go`.
+
 [返回下游功能目录](features.md) · [中文功能说明](features/cloudflare-ech.md)
 
 When the remote DNS lookup returns only real addresses in Cloudflare's official

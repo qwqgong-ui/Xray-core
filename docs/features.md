@@ -13,7 +13,7 @@ freedom 解析流程调整、Go 1.27 等变化不作为本分支原创功能列�
 
 - [代理隧道内的服务端 DNS（Tunnel DNS）](features/tunnel-dns.md)
 - [地址与 HTTPS 共享缓存（Domain DNS Bundle）](features/domain-dns-bundle.md)
-- [Cloudflare ECH 元数据补充（Cloudflare ECH Supplementation）](features/cloudflare-ech.md)
+- [ECH 元数据透传（原自动补充已移除）](features/cloudflare-ech.md)
 - [通用混合 QUIC 与多跳转发（Generic Hybrid QUIC）](features/hybrid-quic.md)
 
 ## 数据传输与内存开销

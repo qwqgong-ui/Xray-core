@@ -20,8 +20,7 @@ import (
 
 // DNS is a DNS rely server.
 type DNS struct {
-	domains       domainCache
-	cloudflareECH cloudflareECHCache
+	domains domainCache
 	sync.Mutex
 	disableFallback        bool
 	disableFallbackIfMatch bool
