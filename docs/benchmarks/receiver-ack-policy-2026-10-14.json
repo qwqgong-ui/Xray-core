@@ -1,0 +1,182 @@
+{
+  "date": "2026-10-14",
+  "timezone": "America/Los_Angeles",
+  "request": "Latest user instruction supersedes ACK1/50 Mbps: keep ACK2 at low receive rate; permit larger ACK thresholds from 100 Mbps.",
+  "policy": {
+    "scope": "Per QUIC connection, application-data packet number space, both receive directions",
+    "receive_rate_bytes": "Accepted ack-eliciting QUIC packet wire length, including QUIC headers/authentication, excluding IP/UDP headers",
+    "threshold_bits_per_second": 100000000,
+    "below_threshold_ack_queue_packets": 2,
+    "at_or_above_threshold": "Allow existing PMTU-settled, quiet-packet progression; ceiling remains Mihomo 6 and Xray 8",
+    "estimator": {
+      "bucket_ms": 20,
+      "weighted_buckets": 2,
+      "initial_minimum_sample_ms": 1,
+      "clock_regression": "reset",
+      "idle_expiration": "on next received packet; no periodic timer"
+    },
+    "pending_tail": "Retain existing maximum ACK delay and BBR RTT budget; do not postpone the first pending packet's deadline",
+    "idle_without_pending_ack": "No unsolicited ACK or extra ACK timer",
+    "exceptional_packets": "Gaps, previously missing packets and ECN-CE immediately queue ACK and reset learned cadence to 2, including already queued ACK / packet-count boundary",
+    "unchanged_packet_spaces": "Initial and Handshake immediately ACK",
+    "ignored_for_rate": "ACK-only, rejected duplicate/old packets, and internal calls without a packet size",
+    "no_fixed_send_rate_cap": true
+  },
+  "source": {
+    "mihomo_patch": "patches/quic-go/0012-adaptive-receiver-ack-policy.patch",
+    "xray_patch": "patches/quic-go/0011-adaptive-receiver-ack-policy.patch",
+    "implementation_bridge": "Authenticated short-header p.Size() and long-header packetSize reach the ACK tracker after frame validation",
+    "dependency_patch_scripts": "Fresh pinned dependency patch application passed; emitted GOFLAGS used for compilation and tests; root go.mod/go.sum unchanged",
+    "existing_unrelated_changes_preserved": true
+  },
+  "validation": {
+    "full_related_tests": {
+      "status": "passed",
+      "runs": [
+        "r2033",
+        "r2034"
+      ],
+      "scope": "Both QUIC root packages and ACK handlers; Xray HY2/congestion; Mihomo congestion_v2/outbound/HY2 listener"
+    },
+    "race": {
+      "status": "passed",
+      "runs": [
+        "r2037",
+        "r2038"
+      ],
+      "scope": "Receive-rate policy and real connection bridge, decimation, PTO and immediate ACK/pacing gates"
+    },
+    "ablations": [
+      {
+        "run": "r2046",
+        "change": "Disconnect packet-size bridge",
+        "expected_exit": 1,
+        "result": "Low-rate packet 2 no longer queues ACK",
+        "restored_run": "r2048",
+        "restored": "passed"
+      },
+      {
+        "run": "r2047",
+        "change": "Remove early new-gap cadence reset",
+        "expected_exit": 1,
+        "result": "Both packet-count-boundary and already-queued cases retain 8 instead of 2",
+        "restored_run": "r2049",
+        "restored": "passed"
+      }
+    ],
+    "cross_compile": {
+      "status": "passed",
+      "runs": [
+        "r2042",
+        "r2043"
+      ],
+      "targets": [
+        "Windows amd64-v3",
+        "macOS arm64",
+        "Android arm64"
+      ],
+      "scope": "Both QUIC libraries and ACK handlers; compilation only"
+    },
+    "isolated_hy2_fq": {
+      "status": "passed",
+      "run": "r2045",
+      "script": "scripts/test-hy2-bbr-fq.sh",
+      "topology": "veth unavailable (Unknown device type); isolated loopback FQ fallback, without host repair",
+      "shared_udp_receiver_span_ms": [
+        17.979773,
+        26.996494
+      ],
+      "transfer": "Two clients, 4200000 bytes each direction per client, software/EDT/short-RTT/non-FQ modes",
+      "fq_cumulative_drops": 0,
+      "temporary_namespaces": "cleaned by script"
+    },
+    "benchmark": {
+      "runs": [
+        "r2037",
+        "r2038"
+      ],
+      "GOAMD64": "v3",
+      "GOMAXPROCS": 4,
+      "samples_per_case": 3,
+      "scope": "ACK tracker microbenchmark; excludes socket send, full service CPU and WAN throughput",
+      "mihomo": {
+        "legacy_no_size_ns_median": 15.38,
+        "low_50Mbps_ns_median": 16.05,
+        "high_500Mbps_ns_median": 14.71,
+        "low_ACK_per_packet": 0.5,
+        "high_ACK_per_packet": 0.16666666666666666
+      },
+      "xray": {
+        "legacy_no_size_ns_median": 15.47,
+        "low_50Mbps_ns_median": 16.47,
+        "high_500Mbps_ns_median": 15.73,
+        "low_ACK_per_packet": 0.5,
+        "high_ACK_per_packet": 0.125
+      },
+      "bytes_per_operation": 0,
+      "allocations_per_operation": 0,
+      "baseline_note": "Legacy no-size is the new implementation's compatibility path, not an unpatched production A/B comparison"
+    }
+  },
+  "deployment": {
+    "xray": {
+      "version": "9b86960c-rx100-ack2",
+      "sha256": "c088e6e677b338bd802eb3ec69048d665de7b898efec5742131dcc4dd844852e",
+      "artifact": "/home/wudd/文档/xray/.git/ack-policy/xray-linux-amd64-v4",
+      "GOAMD64": "v4",
+      "pid": 12905,
+      "active_state": "active",
+      "sub_state": "running",
+      "NRestarts": 0,
+      "config_sha256": "6ea91b8928c1d3e91681d78a2ce83c3ccb3f0bb412cbaf94e55330a12b39796e",
+      "backup": "/usr/local/bin/xray.before-rx100-ack2-20261015T014010Z-12877",
+      "cpu": "Xeon Platinum 8259CL, all required AVX-512 flags verified",
+      "run": "r2052",
+      "upload_limit_bits_per_second": 16000000
+    },
+    "mihomo": {
+      "version": "6ba9f709-rx100-ack2",
+      "sha256": "a19a53995dc57aebbb4fe678d68e1034a4765f61dd2a29eec261d38ab8b2e6de",
+      "artifact": "/home/wudd/文档/mihomo/.git/ack-policy/mihomo-local-v3",
+      "GOAMD64": "v3",
+      "pid": 50751,
+      "active_state": "active",
+      "sub_state": "running",
+      "NRestarts": 0,
+      "config_sha256": "2d7d8a1fbe6f19c1721be47fc7af533863b5cecff48b05330a62f2582109ef77",
+      "backup": "/usr/bin/mihomo.before-rx100-ack2-20261015T014122Z-50685",
+      "cpu": "i7-12700F, v3 verified",
+      "run": "r2053",
+      "primary_socks_http_status": 204
+    },
+    "actual_process_sha256_verified": true,
+    "configs_unchanged": true,
+    "health": {
+      "node": "🇯🇵 h4",
+      "type": "Hysteria2",
+      "selected": "🇯🇵 h4",
+      "single_small_https_request_delay_ms": 162,
+      "scope": "Functional request only, not ICMP RTT, ACK ratio measurement or before/after weak-network comparison"
+    },
+    "qdisc_snapshot": {
+      "local": {
+        "queue_packets": 0,
+        "cumulative_drops": 0
+      },
+      "japan": {
+        "queue_packets": 0,
+        "cumulative_fq_leaf_drops": 1295
+      },
+      "note": "Japan cumulative drops include earlier history; snapshot is not a packet-loss-rate measurement"
+    },
+    "temporary_server_deployment_unit_and_upload_stage": "removed; prior binaries retained",
+    "warning": "Mihomo config test emitted CacheFile timeout while existing service was active; configuration test and subsequent runtime health succeeded",
+    "no_WAN_upload_speed_test": true,
+    "no_routing_qdisc_or_keepalive_change": true
+  },
+  "limitations": [
+    "Actual weak-network latency/throughput improvement has not been established by this implementation validation.",
+    "Cross-platform checks are compilation, not device runtime tests.",
+    "ACK thresholds govern queueing; event-loop batching can coalesce ACK frames."
+  ]
+}

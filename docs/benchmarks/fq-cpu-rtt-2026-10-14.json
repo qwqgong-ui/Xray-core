@@ -1,0 +1,218 @@
+{
+  "date_utc": "2026-10-14",
+  "source": {
+    "xray": {
+      "branch": "SingleUser",
+      "head": "9b86960c",
+      "working_tree_changes": true
+    },
+    "mihomo": {
+      "branch": "dev",
+      "head": "6ba9f709",
+      "working_tree_changes": true
+    }
+  },
+  "policy": {
+    "continuing_wan_upload_optimization": false,
+    "host_qdisc_modified": false,
+    "nat_or_firewall_workaround_added": false
+  },
+  "native_fq": {
+    "source": "Mihomo patched quic-go rtnetlink FQ stats in isolated network namespace",
+    "peer_responses": 0,
+    "observed_flows_plimit": 120,
+    "offered_rate_before_bytes_per_second": 125000000,
+    "rate_cap_after_bytes_per_second": 62500000,
+    "pauses": 1,
+    "queue_packets_after_drain": 0,
+    "limitations": [
+      "Exit-interface aggregate counters cannot attribute drops to a specific QUIC connection.",
+      "Local FQ occupancy does not measure ISP queue occupancy."
+    ]
+  },
+  "edt_preparation_microbenchmark": {
+    "name": "BenchmarkKernelPacingReadyBatch",
+    "conditions": "Same benchmark helper and persistent send-worker state; three runs per batch size; median; host GOAMD64=v3.",
+    "rows": [
+      {
+        "packets_per_batch": 1,
+        "before_ns": 520,
+        "after_ns": 301.7
+      },
+      {
+        "packets_per_batch": 4,
+        "before_ns": 1670,
+        "after_ns": 650
+      },
+      {
+        "packets_per_batch": 8,
+        "before_ns": 3287,
+        "after_ns": 1121
+      }
+    ],
+    "before_allocations_per_batch": 1,
+    "before_allocated_bytes_per_batch": 384,
+    "after_allocations_per_batch": 0,
+    "after_allocated_bytes_per_batch": 0,
+    "limitations": [
+      "Only EDT preparation; excludes syscalls, encryption and complete service workload."
+    ]
+  },
+  "download_service_cpu": {
+    "conditions": {
+      "existing_hy2_server_port": 443,
+      "client_process_held_fixed": true,
+      "client_socks_port": 45662,
+      "requests_per_round": 4,
+      "bytes_per_request": 25000000,
+      "repetitions": 3,
+      "curl_download_limit": "25 MiB/s",
+      "server_config_sha256": "6ea91b8928c1d3e91681d78a2ce83c3ccb3f0bb412cbaf94e55330a12b39796e"
+    },
+    "before": [
+      {
+        "label": "before",
+        "repeat": 1,
+        "bytes": 100000000,
+        "elapsed_seconds": 4.5635087729997394,
+        "mbps": 175.30370594075455,
+        "cpu_seconds": 1.239272,
+        "cpu_seconds_per_GiB": 13.306581777121279,
+        "memory_bytes": 157597696,
+        "pid": 4659
+      },
+      {
+        "label": "before",
+        "repeat": 2,
+        "bytes": 100000000,
+        "elapsed_seconds": 4.553338645000622,
+        "mbps": 175.6952562441994,
+        "cpu_seconds": 1.251859,
+        "cpu_seconds_per_GiB": 13.441733660508161,
+        "memory_bytes": 157888512,
+        "pid": 4659
+      },
+      {
+        "label": "before",
+        "repeat": 3,
+        "bytes": 100000000,
+        "elapsed_seconds": 4.571385721000297,
+        "mbps": 175.00164038333355,
+        "cpu_seconds": 1.239674,
+        "cpu_seconds_per_GiB": 13.31089821925376,
+        "memory_bytes": 158089216,
+        "pid": 4659
+      }
+    ],
+    "after": [
+      {
+        "label": "after",
+        "repeat": 1,
+        "bytes": 100000000,
+        "elapsed_seconds": 4.465161716999319,
+        "mbps": 179.1648434488542,
+        "cpu_seconds": 1.309828,
+        "cpu_seconds_per_GiB": 14.064171058462719,
+        "memory_bytes": 76537856,
+        "pid": 6628
+      },
+      {
+        "label": "after",
+        "repeat": 2,
+        "bytes": 100000000,
+        "elapsed_seconds": 4.496393700999761,
+        "mbps": 177.92036311725155,
+        "cpu_seconds": 1.082355,
+        "cpu_seconds_per_GiB": 11.6216983191552,
+        "memory_bytes": 78778368,
+        "pid": 6628
+      },
+      {
+        "label": "after",
+        "repeat": 3,
+        "bytes": 100000000,
+        "elapsed_seconds": 4.575070549999509,
+        "mbps": 174.8606914925248,
+        "cpu_seconds": 1.077903,
+        "cpu_seconds_per_GiB": 11.57389533315072,
+        "memory_bytes": 81211392,
+        "pid": 6628
+      }
+    ],
+    "median": {
+      "before_cpu_seconds_per_GiB": 13.31089821925376,
+      "after_cpu_seconds_per_GiB": 11.6216983191552,
+      "before_mbps": 175.30370594075455,
+      "after_mbps": 177.92036311725155
+    },
+    "limitations": [
+      "Whole production xray.service includes background traffic and the SSH sampling path.",
+      "Server restart reconnects QUIC; no NAT or fixed source-port workaround was used.",
+      "BBR and transport fixes also changed; CPU difference cannot be assigned solely to batching.",
+      "100 MB individual source requests returned HTTP 403; valid 25 MB requests were used instead.",
+      "All three post-restart rows are retained, including the slower first round."
+    ]
+  },
+  "clinical_mihomo": {
+    "old_upload_test_preceded_latest_user_constraint": true,
+    "old_fq_drop_deltas": [
+      22027,
+      45292
+    ],
+    "fixed_fq_drop_deltas": [
+      51,
+      0
+    ],
+    "old_loaded_http_ttfb_max_ms": [
+      1542.241,
+      2713.767
+    ],
+    "fixed_loaded_http_ttfb_max_ms": [
+      475.824,
+      324.072
+    ],
+    "metric": "Concurrent 1 KiB HTTP request time_starttransfer; includes request/network/server overhead and is not ICMP RTT.",
+    "finding": "Connection probes OnAppLimited; concrete sent handler previously exposed only NotifyAppLimited. Real bridge added, explicit idle retained during tail flight, sparse readiness gated from STARTUP bandwidth plateau.",
+    "limitations": [
+      "FQ drop counters are interface aggregate, not per-connection.",
+      "Short WAN runs with changing network conditions; no long-term fairness or ISP capacity claim."
+    ]
+  },
+  "validation": {
+    "runtime_linux": [
+      "BBR/HY2/QUIC/ACK handler package tests passed.",
+      "Targeted race checks passed.",
+      "Native FQ pressure test passed with no peer response.",
+      "HY2 shared-server-socket, dual-client, 4.2 MB each direction per client passed in software, EDT and short-RTT fallback modes.",
+      "Non-FQ fallback passed; isolated namespace qdisc drops zero in HY2 test."
+    ],
+    "cross_build": [
+      "Both implementations: Windows amd64-v3, macOS arm64, Android arm64.",
+      "Mihomo native FQ: Linux armv7."
+    ],
+    "limits": [
+      "veth unavailable on host kernel; end-to-end fixture used isolated loopback FQ.",
+      "Cross-platform builds validate compilation, not network behavior on physical Windows/macOS/Android devices.",
+      "Private remote alternate UDP ports did not provide a usable test path; fixtures were removed without firewall changes."
+    ]
+  },
+  "production": {
+    "xray": {
+      "version": "27808cc7-cpu-rtt-idle",
+      "goamd64": "v4",
+      "sha256": "b7460ac4dca0369ecb9fbaf8439add1db7206a29fc0b2c8836fb38a9670f754c",
+      "backup": "/usr/local/bin/xray.before-fq-idle-rtt-20261014T052410Z-6602",
+      "backup_sha256": "ad55c7e554d23543174515f517c794111a6afa426cdf72b86f3de9297ab387df",
+      "state": "active/running, NRestarts=0; actual process binary SHA matched; config test OK; existing HY2 download 1024 bytes HTTP 200."
+    },
+    "mihomo": {
+      "version": "6ba9f709-fq-native-idle-rtt",
+      "goamd64": "v3",
+      "sha256": "aa7f4e9f20c68210036bbb3e4f979a9a97dded95b3b8ea82718ae22a2a82a6fc",
+      "config_sha256": "2d7d8a1fbe6f19c1721be47fc7af533863b5cecff48b05330a62f2582109ef77",
+      "backup": "/usr/bin/mihomo.before-fq-idle-rtt-20261014T052717Z-75555",
+      "state": "active/running, NRestarts=0; actual process binary SHA matched; config hash unchanged; primary SOCKS HTTP 204."
+    },
+    "cleanup": "All task-owned client/server test units stopped or collected. Duplicate private client configs and remote staging removed. Production backups and local raw measurements retained."
+  }
+}

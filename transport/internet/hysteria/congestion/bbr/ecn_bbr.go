@@ -1,8 +1,6 @@
 package bbr
 
 import (
-	"time"
-
 	"github.com/apernet/quic-go/congestion"
 
 	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/common"
@@ -19,14 +17,12 @@ const (
 )
 
 const (
-	ecnAlphaGain              = 1.0 / 16.0
-	ecnMinReduction           = 0.02
-	ecnMaxReduction           = 0.50
-	ecnFloorReductionEpochs   = 3
-	ecnSafetyLossRatio        = 0.10
-	ecnPathMigrationDecay     = 0.50
-	ecnQueueDrainRTTThreshold = 0.50
-	ecnQueueDrainRTTExit      = 0.25
+	ecnAlphaGain            = 1.0 / 16.0
+	ecnMinReduction         = 0.02
+	ecnMaxReduction         = 0.50
+	ecnFloorReductionEpochs = 3
+	ecnSafetyLossRatio      = 0.10
+	ecnPathMigrationDecay   = 0.50
 )
 
 type ecnBBRState struct {
@@ -51,7 +47,6 @@ type ecnBBRState struct {
 	shrinkPending bool
 	pendingSample bool
 	pendingCE     bool
-	rttDrain      bool
 }
 
 func (b *bbrSender) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64) {
@@ -66,7 +61,6 @@ func (b *bbrSender) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64
 		state.ceSamples = 0
 		state.ceEpochs = 0
 		state.shrinkPending = false
-		state.rttDrain = false
 		return
 	}
 	if !capable {
@@ -75,7 +69,6 @@ func (b *bbrSender) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64
 		state.phase = ecnPhaseFallback
 		state.ceSamples = 0
 		state.shrinkPending = false
-		state.rttDrain = false
 		return
 	}
 
@@ -112,18 +105,16 @@ func (b *bbrSender) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64
 		state.shrinkInflight = state.freezeInflight
 		state.shrinkApplied = false
 		state.shrinkPending = false
-		state.rttDrain = false
 		return
 	}
 
 	state.ceSamples++
 	state.phase = ecnPhaseShrink
 	state.shrinkPending = true
-	state.rttDrain = false
 }
 
 func (b *bbrSender) currentECNPhase() ecnBBRPhase {
-	if b.ecn.phase == ecnPhaseFastGrow && (b.ecn.rttDrain || b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt) {
+	if b.ecn.phase == ecnPhaseFastGrow && (b.queueGuard.active || b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt) {
 		return ecnPhaseDrain
 	}
 	return b.ecn.phase
@@ -168,21 +159,9 @@ func (b *bbrSender) applyECNPolicy(isRoundStart, hasSafetyLoss bool) {
 		b.applyECNShrink(isRoundStart)
 		return
 	case ecnPhaseFastGrow:
-		b.updateECNQueueWatchdog()
-		if b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt {
-			return
-		}
-		if state.rttDrain {
-			base := max(state.btlBwFloor, b.bandwidthEstimate())
-			target := Bandwidth(b.drainGain * float64(base))
-			if target != 0 {
-				b.pacingRate = min(b.pacingRate, target)
-			}
-			b.congestionWindow = min(b.congestionWindow, b.getTargetCongestionWindow(1))
-			b.congestionWindow = max(b.congestionWindow, b.minCongestionWindow)
-			return
-		}
-		if hasSafetyLoss {
+		// Zero CE permits STARTUP exploration; it must not turn every steady
+		// PROBE_BW gain cycle into perpetual STARTUP or undo queue draining.
+		if hasSafetyLoss || b.queueGuard.active || b.mode != bbrModeStartup || b.isAtFullBandwidth {
 			return
 		}
 		base := max(state.btlBwFloor, b.bandwidthEstimate())
@@ -223,21 +202,6 @@ func (b *bbrSender) applyECNShrink(isRoundStart bool) {
 	b.congestionWindow = max(b.congestionWindow, b.minCongestionWindow)
 }
 
-func (b *bbrSender) updateECNQueueWatchdog() {
-	minRTT := b.getMinRtt()
-	latestRTT := b.rttStats.LatestRTT()
-	if minRTT <= 0 || latestRTT <= 0 {
-		return
-	}
-	if latestRTT > minRTT+timeFraction(minRTT, ecnQueueDrainRTTThreshold) {
-		b.ecn.rttDrain = true
-		return
-	}
-	if latestRTT <= minRTT+timeFraction(minRTT, ecnQueueDrainRTTExit) {
-		b.ecn.rttDrain = false
-	}
-}
-
 func (b *bbrSender) hasSafetyLoss(priorInFlight congestion.ByteCount, lostPackets []congestion.LostPacketInfo) bool {
 	if len(lostPackets) == 0 {
 		return false
@@ -245,7 +209,10 @@ func (b *bbrSender) hasSafetyLoss(priorInFlight congestion.ByteCount, lostPacket
 	if !b.ecn.capable || b.ecn.failed {
 		return true
 	}
-	var lost congestion.ByteCount
+	// Loss is reported in small callbacks as well as batches. Compare the
+	// cumulative round loss, so many sub-threshold callbacks cannot make a
+	// heavily lossy zero-CE path look congestion-free indefinitely.
+	lost := b.bytesLostInRound
 	for _, packet := range lostPackets {
 		lost += packet.BytesLost
 	}
@@ -275,8 +242,11 @@ func (b *bbrSender) OnPathMigration() {
 	state.shrinkPending = false
 	state.pendingSample = false
 	state.pendingCE = false
-	state.rttDrain = false
 	b.ecn = state
+	b.queueGuard = rttQueueGuard{}
+	b.rateGuard = pacingRateGuard{}
+	b.appIdle = false
+	b.lastDataSent = 0
 
 	b.sampler = newBandwidthSampler(roundTripCount(bandwidthWindowSize))
 	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])
@@ -335,8 +305,4 @@ func scaleWindow(value congestion.ByteCount, factor float64) congestion.ByteCoun
 
 func clampWindow(value, minimum, maximum congestion.ByteCount) congestion.ByteCount {
 	return min(maximum, max(minimum, value))
-}
-
-func timeFraction(value time.Duration, factor float64) time.Duration {
-	return time.Duration(float64(value) * factor)
 }

@@ -1,0 +1,108 @@
+{
+  "date_client": "2026-10-13",
+  "client_timezone": "America/Los_Angeles",
+  "request": {
+    "keep_bbr_adaptive": true,
+    "fixed_upload_cap": false,
+    "repeat_wan_upload_stress": false
+  },
+  "input": {
+    "path": "/home/wudd/下载/speed-results-1791956178.csv",
+    "rows": 53,
+    "upload_samples": 22,
+    "unchanged": true,
+    "upload_groups": [
+      {
+        "bytes": 100000,
+        "samples": 8,
+        "median_mbps": 7.810030816643424,
+        "peak_mbps": 8.031968031997922
+      },
+      {
+        "bytes": 1000000,
+        "samples": 6,
+        "median_mbps": 51.276844982187555,
+        "peak_mbps": 64.78646253041204
+      },
+      {
+        "bytes": 10000000,
+        "samples": 4,
+        "median_mbps": 54.49646115641259,
+        "peak_mbps": 236.74911660803352
+      },
+      {
+        "bytes": 25000000,
+        "samples": 4,
+        "median_mbps": 52.01912582256247,
+        "peak_mbps": 75.33450770212063
+      }
+    ],
+    "peak_upload_request": {
+      "csv_line": 40,
+      "bytes": 10000000,
+      "mbps": 236.74911660803352,
+      "duration_ms": 339.59999999962747
+    },
+    "baseline_latency_median_ms": 65.90000000037253,
+    "upload_loaded_latency_max_ms": 1229.5999999996275,
+    "limitations": [
+      "Per-request bitrate and endpoint latency do not identify which network or proxy queue held data.",
+      "The CSV contains no packet-loss measurements."
+    ]
+  },
+  "source_findings": [
+    "Established idle paths could immediately use STARTUP multiplier after resuming.",
+    "A healthy compressed ACK could remove the RTT drain and restore 288.5 Mbps from 75 Mbps.",
+    "The app-limited early return could suppress actual queue/loss exit from STARTUP."
+  ],
+  "change": {
+    "idle_restart": "Require an actual data-send gap of at least minRTT and an explicit transport-idle signal. Resume with at most the learned delivery-rate estimate; do not arm on sparse readiness estimates or brief producer gaps.",
+    "after_drain": "Maintain the reduced effective pacing rate. Increase at most 25% in one packet round with at least minRTT of elapsed wall-clock time; idle time creates no accumulated credit.",
+    "capacity_model": "Keep bandwidth sampler, windowed capacity estimate and existing profiles. Higher-capacity valid models can regain their rate; no fixed Mbps cap.",
+    "startup": "Real queue/loss exit checks precede app-limited plateau filtering.",
+    "platforms": "Same Go logic in Xray and Mihomo; software and Linux EDT read the effective PacingRate."
+  },
+  "verification": {
+    "controller_tests": "Full controller suites and Xray HY2 passed; new regressions, cold readiness, brief-gap, higher-capacity, ACK-compression/clock, integer and migration cases passed.",
+    "ablation": "Removing each of the three hooks separately reproduced its intended regression; no compile failure was substituted.",
+    "race": "Both controller packages and Xray HY2 passed.",
+    "cross_build": [
+      "Windows amd64-v3",
+      "macOS arm64",
+      "Android arm64"
+    ],
+    "isolated_end_to_end": "Dual HY2 clients each transferred 4,200,000 bytes in both directions through software, EDT, short-RTT and non-FQ fallback. Namespace FQ drops zero.",
+    "limits": [
+      "veth unavailable on this host; isolated loopback FQ used.",
+      "Cross-platform checks are compilation, not measurements on physical devices.",
+      "No WAN upload was repeated after this change. Actual Cloudflare peak improvement remains unverified."
+    ]
+  },
+  "deployment": {
+    "mihomo": {
+      "version": "6ba9f709-fq-adaptive-burst",
+      "sha256": "973f69998f6fbf6677900f506d9fafd52650a91d650b973e7a8b06eb6cd63049",
+      "goamd64": "v3",
+      "pid": 94260,
+      "state": "active/running, NRestarts=0",
+      "config_sha256": "2d7d8a1fbe6f19c1721be47fc7af533863b5cecff48b05330a62f2582109ef77",
+      "backup": "/usr/bin/mihomo.before-fq-idle-rtt-20261014T060451Z-94218"
+    },
+    "xray": {
+      "version": "9b86960c-fq-adaptive-burst",
+      "sha256": "9ad808a48d3368c70d6d24ea0767f6ee2eb0b7b50af636f7d0ba87f0f5f36788",
+      "goamd64": "v4",
+      "pid": 7143,
+      "state": "active/running, NRestarts=0",
+      "config_sha256": "6ea91b8928c1d3e91681d78a2ce83c3ccb3f0bb412cbaf94e55330a12b39796e",
+      "backup": "/usr/local/bin/xray.before-fq-idle-rtt-20261014T060224Z-7116",
+      "managed_deploy_result": "success, ExecMainStatus=0, actual process SHA matched"
+    },
+    "health": [
+      "Primary SOCKS HTTP 204",
+      "Primary SOCKS Cloudflare download HTTP 200, verified 1024 bytes"
+    ],
+    "config": "Current aggressive profile, auto up/down, host qdisc, NAT and firewall unchanged.",
+    "cleanup": "Task-owned managed deployment unit and remote staging removed; previous binaries and local evidence retained."
+  }
+}

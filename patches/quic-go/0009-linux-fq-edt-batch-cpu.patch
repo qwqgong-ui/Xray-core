@@ -1,0 +1,267 @@
+diff --git a/kernel_pacing_batch.go b/kernel_pacing_batch.go
+index 58c9d21..b178d1d 100644
+--- a/kernel_pacing_batch.go
++++ b/kernel_pacing_batch.go
+@@ -24,12 +24,24 @@ type kernelPacingQueueState struct {
+ 	nextTx, lastTx uint64
+ 	lastSize       protocol.ByteCount
+ 	lastProvider   *kernelPacingProvider
++	packets        [sendQueueCapacity]kernelPacingPacket
++}
++
++// One paired clock observation is enough for a ready batch. Project elapsed
++// Go monotonic time within this batch only; a sleep always refreshes the pair.
++// The calibration interval is reserved from the lead budget, so syscall /
++// scheduling latency cannot extend the permitted kernel look-ahead.
++type kernelPacingClockSample struct {
++	mono        monotime.Time
++	kernel      uint64
++	uncertainty time.Duration
++	valid       bool
+ }
+ 
+ // prepare retains the per-datagram schedule, including late-worker spacing.
+ // Only the first entry may wait: an already prepared batch must be submitted
+ // before waiting for a later entry to enter the kernel's look-ahead window.
+-func (s *kernelPacingQueueState) prepare(e queueEntry, wait bool) (kernelPacingPacket, bool, error) {
++func (s *kernelPacingQueueState) prepare(e queueEntry, wait bool, sample *kernelPacingClockSample) (kernelPacingPacket, bool, error) {
+ 	if e.pacing != nil && e.pacing != s.lastProvider {
+ 		*s = kernelPacingQueueState{lastProvider: e.pacing}
+ 	}
+@@ -38,35 +50,43 @@ func (s *kernelPacingQueueState) prepare(e queueEntry, wait bool) (kernelPacingP
+ 		clock = e.pacing.clock
+ 	}
+ 	for {
+-		txtime, err := clock(e.departure)
+-		if err != nil {
+-			return kernelPacingPacket{}, false, err
++		if !sample.valid {
++			sample.mono = monotime.Now()
++			stamp, err := clock(sample.mono)
++			if err != nil {
++				return kernelPacingPacket{}, false, err
++			}
++			sample.kernel = stamp
++			sample.uncertainty = monotime.Now().Sub(sample.mono)
++			sample.valid = true
+ 		}
++		now := monotime.Now()
++		kernelNow := sample.kernel + uint64(max(time.Duration(0), now.Sub(sample.mono)))
++		txtime := sample.kernel + uint64(max(time.Duration(0), e.departure.Sub(sample.mono)))
++		txtime = max(txtime, kernelNow)
+ 		nextTx := s.nextTx
+ 		if s.lastTx != 0 && e.rate != 0 {
+ 			nextTx = s.lastTx + uint64(kernelPacingInterval(s.lastSize, e.rate))
+ 		}
+ 		txtime = max(txtime, nextTx)
+-		kernelNow, err := clock(monotime.Now())
+-		if err != nil {
+-			return kernelPacingPacket{}, false, err
+-		}
+ 		lead := e.lead
+ 		if lead == 0 {
+ 			lead = kernelPacingMaxLead
+ 		}
+-		if txtime > kernelNow+uint64(lead) {
++		budget := max(time.Duration(0), lead-sample.uncertainty)
++		if txtime > kernelNow+uint64(budget) {
+ 			if !wait {
+ 				return kernelPacingPacket{}, false, nil
+ 			}
+-			time.Sleep(time.Duration(txtime-kernelNow) - lead)
++			time.Sleep(time.Duration(txtime-kernelNow) - budget)
++			sample.valid = false
+ 			continue
+ 		}
+ 		s.nextTx = txtime + uint64(e.interval)
+ 		s.lastTx, s.lastSize = txtime, e.buf.Len()
+ 		return kernelPacingPacket{
+ 			data: e.buf.Data, ecn: e.ecn, txtime: txtime,
+-			departure: monotime.Now().Add(time.Duration(txtime) - time.Duration(kernelNow)),
++			departure: sample.mono.Add(time.Duration(txtime - sample.kernel)),
+ 		}, true, nil
+ 	}
+ }
+@@ -78,7 +98,8 @@ func (s *kernelPacingQueueState) writeOne(h *sendQueue, e queueEntry) error {
+ 	if !ok || e.departure.IsZero() {
+ 		return h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+ 	}
+-	p, _, err := s.prepare(e, true)
++	var sample kernelPacingClockSample
++	p, _, err := s.prepare(e, true, &sample)
+ 	if err != nil {
+ 		h.kernelPacingClockFallback(e)
+ 		return h.conn.Write(e.buf.Data, e.gsoSize, e.ecn)
+@@ -92,15 +113,17 @@ func (s *kernelPacingQueueState) writeOne(h *sendQueue, e queueEntry) error {
+ 
+ func (s *kernelPacingQueueState) writeBatch(h *sendQueue, first queueEntry, writer kernelPacingBatchWriter) (pending queueEntry, hasPending bool, err error) {
+ 	var entries [sendQueueCapacity]queueEntry
+-	var packets [sendQueueCapacity]kernelPacingPacket
++	packets := s.packets[:]
+ 	entries[0] = first
+ 	count := 1
+ 	defer func() {
+-		for _, e := range entries[:count] {
+-			h.releaseEntry(e)
++		h.releaseBatchEntries(entries[:count])
++		for i := range count {
++			packets[i] = kernelPacingPacket{}
+ 		}
+ 	}()
+-	p, _, clockErr := s.prepare(first, true)
++	var sample kernelPacingClockSample
++	p, _, clockErr := s.prepare(first, true, &sample)
+ 	if clockErr != nil {
+ 		h.kernelPacingClockFallback(first)
+ 		return pending, false, h.conn.Write(first.buf.Data, first.gsoSize, first.ecn)
+@@ -115,7 +138,7 @@ collect:
+ 				pending, hasPending = e, true
+ 				break collect
+ 			}
+-			p, ready, clockErr := s.prepare(e, false)
++			p, ready, clockErr := s.prepare(e, false, &sample)
+ 			if clockErr != nil || !ready {
+ 				pending, hasPending = e, true
+ 				break collect
+@@ -131,10 +154,9 @@ collect:
+ 		if n < 0 || n > count-sent {
+ 			return pending, hasPending, io.ErrShortWrite
+ 		}
+-		for i := sent; i < sent+n; i++ {
+-			if entries[i].pacing != nil {
+-				entries[i].pacing.recordDeparture(packets[i].departure, entries[i].buf.Len())
+-			}
++		if n > 0 && first.pacing != nil {
++			last := sent + n - 1
++			first.pacing.recordDeparture(packets[last].departure, entries[last].buf.Len())
+ 		}
+ 		sent += n
+ 		if err != nil {
+diff --git a/kernel_pacing_batch_test.go b/kernel_pacing_batch_test.go
+index fb89fb8..596e319 100644
+--- a/kernel_pacing_batch_test.go
++++ b/kernel_pacing_batch_test.go
+@@ -198,9 +198,9 @@ func TestKernelPacingBatchClockFailureFlushesReadyPrefix(t *testing.T) {
+ 		q := newSendQueue(conn).(*sendQueue)
+ 		p := pacingBatchProvider(1_000_000)
+ 		now := monotime.Now()
+-		bad := now.Add(100 * time.Microsecond)
++		bad := now.Add(2 * time.Millisecond)
+ 		p.clock = func(departure monotime.Time) (uint64, error) {
+-			if departure == bad {
++			if departure >= now.Add(time.Millisecond) {
+ 				return 0, errors.New("clock failed")
+ 			}
+ 			return uint64(max(departure, monotime.Now())), nil
+@@ -216,3 +216,23 @@ func TestKernelPacingBatchClockFailureFlushesReadyPrefix(t *testing.T) {
+ 		require.Equal(t, bad, monotime.Now())
+ 	})
+ }
++
++func TestKernelPacingBatchSharesClockAndWake(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		conn := &pacingBatchTestConn{}
++		q := newSendQueue(conn).(*sendQueue)
++		p := pacingBatchProvider(1_000_000)
++		var clocks, wakes int
++		clock := p.clock
++		p.clock = func(now monotime.Time) (uint64, error) { clocks++; return clock(now) }
++		p.wake = func() { wakes++ }
++		for i := range 4 {
++			enqueuePacingBatch(q, p, byte(i), 40, monotime.Now())
++		}
++		require.NoError(t, drainPacingBatch(q))
++		require.Equal(t, 1, clocks)
++		require.Equal(t, 1, wakes)
++		require.Len(t, conn.accepted, 4)
++		require.Zero(t, q.pacingPending.Load())
++	})
++}
+diff --git a/kernel_pacing_cpu_test.go b/kernel_pacing_cpu_test.go
+new file mode 100644
+index 0000000..7a20b15
+--- /dev/null
++++ b/kernel_pacing_cpu_test.go
+@@ -0,0 +1,53 @@
++//go:build linux && !android
++
++package quic
++
++import (
++	"fmt"
++	"testing"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++)
++
++type kernelPacingBenchmarkConn struct{ sendConn }
++
++func (*kernelPacingBenchmarkConn) WriteBatchWithTxTime(p []kernelPacingPacket) (int, error) {
++	return len(p), nil
++}
++
++// Measure the EDT preparation / accounting path, without encryption or waiting
++// for a receiver. The real kernel clock is used so its syscall cost is included.
++func BenchmarkKernelPacingReadyBatch(b *testing.B) {
++	for _, count := range []int{1, 4, sendQueueCapacity} {
++		b.Run(fmt.Sprint(count), func(b *testing.B) {
++			conn := &kernelPacingBenchmarkConn{}
++			q := newSendQueue(conn).(*sendQueue)
++			var clocks, wakes uint64
++			p := &kernelPacingProvider{
++				rate:  func() uint64 { return 1_000_000_000_000 },
++				clock: func(t monotime.Time) (uint64, error) { clocks++; return kernelTxTime(t) },
++				wake:  func() { wakes++ },
++			}
++			b.SetBytes(int64(1200 * count))
++			b.ReportAllocs()
++			var state kernelPacingQueueState
++			b.ResetTimer()
++			for range b.N {
++				now := monotime.Now()
++				for range count {
++					buf := getPacketBuffer()
++					buf.Data = buf.Data[:1200]
++					q.SendWithPacing(buf, protocol.ECT0, now, 2, kernelPacingMaxLead, p)
++				}
++				_, pending, err := state.writeBatch(q, <-q.queue, conn)
++				if err != nil || pending {
++					b.Fatalf("ready batch: pending=%t err=%v", pending, err)
++				}
++			}
++			b.StopTimer()
++			b.ReportMetric(float64(clocks)/float64(b.N*count), "clocks/packet")
++			b.ReportMetric(float64(wakes)/float64(b.N*count), "wakes/packet")
++		})
++	}
++}
+diff --git a/send_queue.go b/send_queue.go
+index 9d53ea8..b72f079 100644
+--- a/send_queue.go
++++ b/send_queue.go
+@@ -160,6 +160,24 @@ func (h *sendQueue) releaseEntry(e queueEntry) {
+ 	}
+ }
+ 
++// A batch has one pacing provider. Publish its released capacity once after
++// freeing every buffer, rather than waking / contending on it per datagram.
++func (h *sendQueue) releaseBatchEntries(entries []queueEntry) {
++	for _, e := range entries {
++		e.buf.Release()
++	}
++	if p := entries[0].pacing; p != nil {
++		h.pacingPending.Add(-int32(len(entries)))
++		if p.wake != nil {
++			p.wake()
++		}
++	}
++	select {
++	case h.available <- struct{}{}:
++	default:
++	}
++}
++
+ func (h *sendQueue) kernelPacingClockFallback(e queueEntry) {
+ 	if e.pacing != nil {
+ 		e.pacing.failed.Store(true)

@@ -1,0 +1,69 @@
+diff --git a/application_idle_test.go b/application_idle_test.go
+new file mode 100644
+index 0000000..5a85afc
+--- /dev/null
++++ b/application_idle_test.go
+@@ -0,0 +1,45 @@
++package quic
++
++import (
++	"github.com/apernet/quic-go/internal/ackhandler"
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/apernet/quic-go/internal/wire"
++	"github.com/stretchr/testify/require"
++	"testing"
++)
++
++type explicitIdleTracker struct {
++	ackhandler.SentPacketHandler
++	idle int
++}
++
++func (h *explicitIdleTracker) OnAppLimited()                            { h.idle++ }
++func (*explicitIdleTracker) SendMode(monotime.Time) ackhandler.SendMode { return ackhandler.SendNone }
++
++func TestExplicitIdleReportedBeforeCongestionBlock(t *testing.T) {
++	h := &explicitIdleTracker{}
++	c := &Conn{handshakeConfirmed: true, framer: newFramer(nil), retransmissionQueue: newRetransmissionQueue(), sentPacketHandler: h}
++	require.NoError(t, c.triggerSending(monotime.Now()))
++	require.Equal(t, 1, h.idle, "an empty application must be reported even when send mode is blocked")
++}
++
++func TestQueuedDataIsNotReportedIdle(t *testing.T) {
++	for _, kind := range []string{"stream-control", "retransmission", "datagram"} {
++		t.Run(kind, func(t *testing.T) {
++			h := &explicitIdleTracker{}
++			c := &Conn{handshakeConfirmed: true, framer: newFramer(nil), retransmissionQueue: newRetransmissionQueue(), sentPacketHandler: h}
++			switch kind {
++			case "stream-control":
++				c.framer.QueueControlFrame(&wire.PingFrame{})
++			case "retransmission":
++				c.retransmissionQueue.addAppData(&wire.PingFrame{})
++			case "datagram":
++				c.datagramQueue = newDatagramQueue(func() {}, utils.DefaultLogger)
++				require.NoError(t, c.datagramQueue.Add(&wire.DatagramFrame{Data: []byte{1}}))
++			}
++			require.NoError(t, c.triggerSending(monotime.Now()))
++			require.Zero(t, h.idle, "backpressure or queued frames must not be mistaken for an idle application")
++		})
++	}
++}
+diff --git a/connection.go b/connection.go
+index 4ad408b..affaf50 100644
+--- a/connection.go
++++ b/connection.go
+@@ -2505,6 +2505,13 @@ func (c *Conn) applyTransportParameters() {
+ 
+ func (c *Conn) triggerSending(now monotime.Time) error {
+ 	c.pacingDeadline = 0
++	// Queue emptiness is known before cwnd / pacing can return early. Report
++	// that fact even while the last application flight is still draining.
++	if c.handshakeConfirmed && c.framer != nil && !c.framer.HasData() &&
++		c.retransmissionQueue != nil && !c.retransmissionQueue.HasData(protocol.Encryption1RTT) &&
++		(c.datagramQueue == nil || c.datagramQueue.Peek() == nil) {
++		c.notifyAppLimited()
++	}
+ 
+ 	sendMode := c.sendMode(now)
+ 	switch sendMode {

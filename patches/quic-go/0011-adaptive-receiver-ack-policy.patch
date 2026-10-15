@@ -1,0 +1,630 @@
+diff --git a/adaptive_ack_policy_test.go b/adaptive_ack_policy_test.go
+new file mode 100644
+index 0000000..cc578f3
+--- /dev/null
++++ b/adaptive_ack_policy_test.go
+@@ -0,0 +1,65 @@
++package quic
++
++import (
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++)
++
++// Exercise the actual authenticated short-header receive entry point. A policy
++// test that only supplies sizes directly to the ACK tracker would miss a broken
++// connection-to-tracker bridge.
++func TestConnectionReceiveRateACKPolicy(t *testing.T) {
++	ctrl := gomock.NewController(t)
++	unpacker := NewMockUnpacker(ctrl)
++	tc := newServerTestConnection(t, ctrl, nil, false, connectionOptUnpacker(unpacker))
++	tc.receivedPacketHandler().SetPathSettled(true)
++	now := monotime.Time(time.Hour)
++	pn := protocol.PacketNumber(1)
++	payload := make([]byte, 1250)
++	payload[0] = 0x1 // PING followed by padding
++	receive := func(interval time.Duration) bool {
++		t.Helper()
++		now = now.Add(interval)
++		packet := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, pn, payload)
++		packet.rcvTime = now
++		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
++			pn, protocol.PacketNumberLen2, protocol.KeyPhaseZero, payload, nil,
++		)
++		processed, err := tc.conn.handleOnePacket(packet, 0)
++		require.NoError(t, err)
++		require.True(t, processed)
++		pn++
++		return tc.receivedPacketHandler().GetAckFrame(protocol.Encryption1RTT, now, true) != nil
++	}
++	for i := 0; i < 2048; i++ {
++		receive(20 * time.Microsecond)
++	}
++	tc.receivedPacketHandler().GetAckFrame(protocol.Encryption1RTT, now, false)
++
++	// Idle ages out the high receive rate; the retained bulk ceiling must not
++	// cause sparse packets to wait for six/eight packets.
++	now = now.Add(100 * time.Millisecond)
++	for i := 1; i <= 96; i++ {
++		require.Equal(t, i%2 == 0, receive(200*time.Microsecond), "low-rate packet %d", i)
++	}
++	require.True(t, tc.receivedPacketHandler().GetAlarmTimeout().IsZero())
++	require.Nil(t, tc.receivedPacketHandler().GetAckFrame(protocol.Encryption1RTT, now.Add(time.Hour), true))
++
++	for i := 0; i < 2048; i++ {
++		receive(20 * time.Microsecond)
++	}
++	tc.receivedPacketHandler().GetAckFrame(protocol.Encryption1RTT, now, false)
++	acks := 0
++	for i := 0; i < 96; i++ {
++		if receive(20 * time.Microsecond) {
++			acks++
++		}
++	}
++	require.Equal(t, 96/8, acks)
++}
+diff --git a/connection.go b/connection.go
+index affaf50..5e15f90 100644
+--- a/connection.go
++++ b/connection.go
+@@ -1286,7 +1286,7 @@ func (c *Conn) handleShortHeaderPacket(
+ 			})
+ 		}
+ 	}
+-	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, log)
++	isNonProbing, pathChallenge, err := c.handleUnpackedShortHeaderPacket(destConnID, pn, data, p.ecn, p.rcvTime, p.Size(), log)
+ 	if err != nil {
+ 		return false, err
+ 	}
+@@ -1779,7 +1779,7 @@ func (c *Conn) handleUnpackedLongHeaderPacket(
+ 		return err
+ 	}
+ 	c.sentPacketHandler.ReceivedPacket(packet.encryptionLevel, rcvTime)
+-	return c.receivedPacketHandler.ReceivedPacket(packet.hdr.PacketNumber, ecn, packet.encryptionLevel, rcvTime, isAckEliciting)
++	return c.receivedPacketHandler.ReceivedPacketWithSize(packet.hdr.PacketNumber, ecn, packet.encryptionLevel, rcvTime, isAckEliciting, packetSize)
+ }
+ 
+ func (c *Conn) handleUnpackedShortHeaderPacket(
+@@ -1788,6 +1788,7 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
+ 	data []byte,
+ 	ecn protocol.ECN,
+ 	rcvTime monotime.Time,
++	packetSize protocol.ByteCount,
+ 	log func([]qlog.Frame),
+ ) (isNonProbing bool, pathChallenge *wire.PathChallengeFrame, _ error) {
+ 	c.lastPacketReceivedTime = rcvTime
+@@ -1799,7 +1800,7 @@ func (c *Conn) handleUnpackedShortHeaderPacket(
+ 		return false, nil, err
+ 	}
+ 	c.sentPacketHandler.ReceivedPacket(protocol.Encryption1RTT, rcvTime)
+-	if err := c.receivedPacketHandler.ReceivedPacket(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting); err != nil {
++	if err := c.receivedPacketHandler.ReceivedPacketWithSize(pn, ecn, protocol.Encryption1RTT, rcvTime, isAckEliciting, packetSize); err != nil {
+ 		return false, nil, err
+ 	}
+ 	return isNonProbing, pathChallenge, nil
+diff --git a/internal/ackhandler/ack_receive_rate.go b/internal/ackhandler/ack_receive_rate.go
+new file mode 100644
+index 0000000..b175236
+--- /dev/null
++++ b/internal/ackhandler/ack_receive_rate.go
+@@ -0,0 +1,62 @@
++package ackhandler
++
++import (
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++)
++
++const (
++	ackDecimationMinBytesPerSecond = 100_000_000 / 8 // decimal 100 Mbps
++	ackReceiveRateWindow           = 20 * time.Millisecond
++	ackReceiveRateMinSample        = time.Millisecond
++)
++
++// ackReceiveRate measures accepted, ack-eliciting QUIC wire bytes, independently
++// of the sender's bandwidth model. Two weighted buckets avoid a rate dip at each
++// window boundary. No timer or allocation is needed: idle state expires on the
++// next received packet, and cannot create unsolicited ACKs.
++type ackReceiveRate struct {
++	windowStart, lastReceived   monotime.Time
++	currentBytes, previousBytes int64
++	known, fullWindow, highRate bool
++}
++
++func (r *ackReceiveRate) record(size protocol.ByteCount, now monotime.Time) {
++	if size <= 0 {
++		return
++	}
++	elapsed := now.Sub(r.windowStart)
++	if !r.known || now.Before(r.lastReceived) || elapsed >= 2*ackReceiveRateWindow {
++		*r = ackReceiveRate{windowStart: now, known: true}
++		elapsed = 0
++	} else if elapsed >= ackReceiveRateWindow {
++		r.previousBytes = r.currentBytes
++		r.currentBytes = 0
++		r.windowStart = r.windowStart.Add(ackReceiveRateWindow)
++		r.fullWindow = true
++		elapsed -= ackReceiveRateWindow
++	}
++	r.lastReceived = now
++	r.currentBytes += int64(size)
++	if !r.fullWindow {
++		// The floor prevents a shared receive timestamp / GRO burst from
++		// turning one small packet into an infinite-rate sample.
++		sample := elapsed
++		if sample < ackReceiveRateMinSample {
++			sample = ackReceiveRateMinSample
++		}
++		r.highRate = r.currentBytes*int64(time.Second) >= ackDecimationMinBytesPerSecond*int64(sample)
++		return
++	}
++	weightedBytes := r.currentBytes*int64(ackReceiveRateWindow) +
++		r.previousBytes*int64(ackReceiveRateWindow-elapsed)
++	r.highRate = weightedBytes >=
++		ackDecimationMinBytesPerSecond*int64(ackReceiveRateWindow)/int64(time.Second)*int64(ackReceiveRateWindow)
++}
++
++func (r *ackReceiveRate) allowsDecimation() bool {
++	// Calls without a size preserve the existing internal API's behavior.
++	return !r.known || r.highRate
++}
+diff --git a/internal/ackhandler/adaptive_ack_policy_test.go b/internal/ackhandler/adaptive_ack_policy_test.go
+new file mode 100644
+index 0000000..ec0b8ab
+--- /dev/null
++++ b/internal/ackhandler/adaptive_ack_policy_test.go
+@@ -0,0 +1,305 @@
++package ackhandler
++
++import (
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++
++	"github.com/stretchr/testify/require"
++)
++
++func warmHighRateACKTracker(t *testing.T) (*appDataReceivedPacketTracker, protocol.PacketNumber, monotime.Time) {
++	t.Helper()
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++	now := monotime.Time(time.Hour)
++	pn := protocol.PacketNumber(1)
++	for ; pn <= 2000; pn++ {
++		now = now.Add(20 * time.Microsecond)
++		require.NoError(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, 1250))
++		tr.GetAckFrame(now, true)
++	}
++	tr.GetAckFrame(now, false)
++	require.Equal(t, maxPacketsBeforeAck, tr.ackThreshold)
++	require.True(t, tr.receiveRate.highRate)
++	return tr, pn, now
++}
++
++func TestReceiveRateACKLowSpeedUsesTwo(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++	// A formerly fast, still-settled path must use two without losing its earned ceiling.
++	tr.ackThreshold = maxPacketsBeforeAck
++	now := monotime.Time(time.Hour)
++	for i := 1; i <= 200; i++ {
++		now = now.Add(200 * time.Microsecond) // 50 Mbps of QUIC wire bytes
++		require.NoError(t, tr.receivedPacketWithSize(protocol.PacketNumber(i), protocol.ECNNon, now, true, 1250))
++		ack := tr.GetAckFrame(now, true)
++		if i%2 == 0 {
++			require.NotNil(t, ack, "packet %d", i)
++			require.True(t, tr.GetAlarmTimeout().IsZero())
++		} else {
++			require.Nil(t, ack, "no ACK1 at packet %d", i)
++		}
++		require.False(t, tr.receiveRate.highRate)
++	}
++	require.Equal(t, maxPacketsBeforeAck, tr.ackThreshold)
++	require.Zero(t, tr.quietPacketsSinceStep)
++}
++
++func TestReceiveRateACKHighSpeedDecimates(t *testing.T) {
++	tr, pn, now := warmHighRateACKTracker(t)
++	acks := 0
++	for i := 0; i < maxPacketsBeforeAck*20; i++ {
++		now = now.Add(20 * time.Microsecond)
++		require.NoError(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, 1250))
++		if tr.GetAckFrame(now, true) != nil {
++			acks++
++		}
++		require.True(t, tr.receiveRate.highRate)
++		pn++
++	}
++	require.Equal(t, 20, acks)
++}
++
++func TestReceiveRateACKOnlyHighSpeedEarnsDecimation(t *testing.T) {
++	tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++	tr.SetPathSettled(true)
++	now := monotime.Time(time.Hour)
++	pn := protocol.PacketNumber(1)
++	for ; pn <= 1000; pn++ {
++		now = now.Add(200 * time.Microsecond)
++		require.NoError(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, 1250))
++		tr.GetAckFrame(now, true)
++	}
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++	require.Zero(t, tr.quietPacketsSinceStep)
++	for i := 0; i < 2000; i++ {
++		now = now.Add(20 * time.Microsecond)
++		require.NoError(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, 1250))
++		tr.GetAckFrame(now, true)
++		pn++
++	}
++	require.Equal(t, maxPacketsBeforeAck, tr.ackThreshold)
++}
++
++func TestReceiveRateACKIdleReturnsToTwoWithoutPeriodicACK(t *testing.T) {
++	tr, pn, now := warmHighRateACKTracker(t)
++	require.Nil(t, tr.GetAckFrame(now.Add(time.Hour), true))
++	require.True(t, tr.GetAlarmTimeout().IsZero())
++	now = now.Add(100 * time.Millisecond)
++	require.NoError(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, 1250))
++	require.False(t, tr.receiveRate.highRate)
++	require.Nil(t, tr.GetAckFrame(now, true), "first sparse packet still uses ACK2")
++	require.Equal(t, now.Add(tr.maxAckDelay), tr.GetAlarmTimeout())
++	now = now.Add(time.Millisecond)
++	require.NoError(t, tr.receivedPacketWithSize(pn+1, protocol.ECNNon, now, true, 1250))
++	require.NotNil(t, tr.GetAckFrame(now, true))
++	require.True(t, tr.GetAlarmTimeout().IsZero())
++	require.Nil(t, tr.GetAckFrame(now.Add(time.Hour), true))
++}
++
++func TestReceiveRateACKTailRetainsDeadline(t *testing.T) {
++	tr, pn, now := warmHighRateACKTracker(t)
++	tr.SetAckDelay(5 * time.Millisecond)
++	first := now.Add(100 * time.Microsecond)
++	for i := 0; i < 4; i++ {
++		at := first.Add(time.Duration(i) * 100 * time.Microsecond)
++		require.NoError(t, tr.receivedPacketWithSize(pn+protocol.PacketNumber(i), protocol.ECNNon, at, true, 1250))
++		require.True(t, tr.receiveRate.highRate)
++		require.Nil(t, tr.GetAckFrame(at, true))
++	}
++	deadline := first.Add(5 * time.Millisecond)
++	require.Equal(t, deadline, tr.GetAlarmTimeout())
++	require.Nil(t, tr.GetAckFrame(deadline.Add(-time.Nanosecond), true))
++	require.NotNil(t, tr.GetAckFrame(deadline, true))
++	require.True(t, tr.GetAlarmTimeout().IsZero())
++}
++
++func TestReceiveRateACKGapResetsCadenceAcrossFastPaths(t *testing.T) {
++	for _, queued := range []bool{false, true} {
++		name := "packet-count-boundary"
++		if queued {
++			name = "already-queued"
++		}
++		t.Run(name, func(t *testing.T) {
++			tr, pn, now := warmHighRateACKTracker(t)
++			count := maxPacketsBeforeAck - 1
++			if queued {
++				count++
++			}
++			for i := 0; i < count; i++ {
++				now = now.Add(20 * time.Microsecond)
++				require.NoError(t, tr.receivedPacketWithSize(pn+protocol.PacketNumber(i), protocol.ECNNon, now, true, 1250))
++			}
++			require.Equal(t, queued, tr.ackQueued)
++			gapPN := pn + 20
++			now = now.Add(20 * time.Microsecond)
++			require.NoError(t, tr.receivedPacketWithSize(gapPN, protocol.ECNNon, now, true, 1250))
++			require.True(t, tr.receiveRate.highRate)
++			require.True(t, tr.hasNewMissingPackets())
++			require.NotNil(t, tr.GetAckFrame(now, true))
++			require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++			for i := 1; i <= packetsBeforeAck; i++ {
++				now = now.Add(20 * time.Microsecond)
++				require.NoError(t, tr.receivedPacketWithSize(gapPN+protocol.PacketNumber(i), protocol.ECNNon, now, true, 1250))
++				if i < packetsBeforeAck {
++					require.Nil(t, tr.GetAckFrame(now, true))
++				}
++			}
++			require.NotNil(t, tr.GetAckFrame(now, true))
++		})
++	}
++}
++
++func TestReceiveRateACKPTOGapAndCEStayImmediate(t *testing.T) {
++	for _, ce := range []bool{false, true} {
++		name := "pto-skipped-number"
++		if ce {
++			name = "ecn-ce"
++		}
++		t.Run(name, func(t *testing.T) {
++			tr, pn, now := warmHighRateACKTracker(t)
++			ecn := protocol.ECNNon
++			if ce {
++				ecn = protocol.ECNCE
++			} else {
++				pn++
++			}
++			now = now.Add(20 * time.Microsecond)
++			require.NoError(t, tr.receivedPacketWithSize(pn, ecn, now, true, 1250))
++			require.NotNil(t, tr.GetAckFrame(now, true))
++			require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++			require.True(t, tr.GetAlarmTimeout().IsZero())
++		})
++	}
++}
++
++func TestReceiveRateACKIgnoresACKOnlyAndRejectedPackets(t *testing.T) {
++	tr, pn, now := warmHighRateACKTracker(t)
++	before := tr.receiveRate
++	require.NoError(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, false, 64000))
++	require.Equal(t, before, tr.receiveRate)
++	require.Nil(t, tr.GetAckFrame(now.Add(time.Second), true))
++	require.True(t, tr.GetAlarmTimeout().IsZero())
++	require.Error(t, tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, 64000))
++	require.Equal(t, before, tr.receiveRate)
++}
++
++func TestReceiveRateACKPacketSpaces(t *testing.T) {
++	h := NewReceivedPacketHandler(utils.DefaultLogger)
++	now := monotime.Time(time.Hour)
++	for _, level := range []protocol.EncryptionLevel{protocol.EncryptionInitial, protocol.EncryptionHandshake} {
++		require.NoError(t, h.ReceivedPacketWithSize(1, protocol.ECNNon, level, now, true, 1250))
++		require.NotNil(t, h.GetAckFrame(level, now, true))
++	}
++	require.False(t, h.appDataPackets.receiveRate.known)
++	require.NoError(t, h.ReceivedPacketWithSize(1, protocol.ECNNon, protocol.Encryption0RTT, now, true, 1250))
++	require.Nil(t, h.GetAckFrame(protocol.Encryption1RTT, now, true))
++	require.NoError(t, h.ReceivedPacketWithSize(2, protocol.ECNNon, protocol.Encryption1RTT, now.Add(time.Millisecond), true, 1250))
++	require.NotNil(t, h.GetAckFrame(protocol.Encryption1RTT, now.Add(time.Millisecond), true))
++	require.True(t, h.appDataPackets.receiveRate.known)
++	require.EqualValues(t, 2500, h.appDataPackets.receiveRate.currentBytes)
++}
++
++func TestReceiveRateACKPathResetClearsRate(t *testing.T) {
++	tr, _, _ := warmHighRateACKTracker(t)
++	tr.SetPathSettled(false)
++	require.Equal(t, ackReceiveRate{}, tr.receiveRate)
++	require.Equal(t, packetsBeforeAck, tr.ackThreshold)
++}
++
++func TestReceiveRateThresholdAndWindowBoundaries(t *testing.T) {
++	now := monotime.Time(time.Hour)
++	for _, sample := range []struct {
++		size protocol.ByteCount
++		high bool
++	}{{12499, false}, {12500, true}, {12501, true}} {
++		var rate ackReceiveRate
++		rate.record(sample.size, now)
++		require.Equal(t, sample.high, rate.highRate, "size %d in minimum 1 ms", sample.size)
++	}
++	for _, sample := range []struct {
++		name     string
++		interval time.Duration
++		high     bool
++	}{
++		{"50Mbps", 200 * time.Microsecond, false},
++		{"99Mbps", 101 * time.Microsecond, false},
++		{"100Mbps", 100 * time.Microsecond, true},
++		{"500Mbps", 20 * time.Microsecond, true},
++	} {
++		t.Run(sample.name, func(t *testing.T) {
++			var rate ackReceiveRate
++			at := now
++			for i := 0; i < 4096; i++ {
++				at = at.Add(sample.interval)
++				rate.record(1250, at)
++				if i > 400 {
++					require.Equal(t, sample.high, rate.highRate, "packet %d across bucket boundary", i)
++				}
++			}
++		})
++	}
++}
++
++func TestReceiveRateIdleAndClockRegression(t *testing.T) {
++	now := monotime.Time(time.Hour)
++	for _, at := range []monotime.Time{now.Add(2 * ackReceiveRateWindow), now.Add(-time.Nanosecond)} {
++		var rate ackReceiveRate
++		rate.record(25000, now)
++		require.True(t, rate.highRate)
++		rate.record(1250, at)
++		require.False(t, rate.highRate)
++		require.Zero(t, rate.previousBytes)
++		require.EqualValues(t, 1250, rate.currentBytes)
++	}
++	var rate ackReceiveRate
++	rate.record(0, now)
++	rate.record(-1, now)
++	require.False(t, rate.known)
++}
++
++func BenchmarkReceiveRateACKTracker(b *testing.B) {
++	for _, sample := range []struct {
++		name     string
++		interval time.Duration
++		size     protocol.ByteCount
++	}{
++		{"legacy-unknown-size", 20 * time.Microsecond, 0},
++		{"50Mbps-ACK2", 200 * time.Microsecond, 1250},
++		{"500Mbps-decimated", 20 * time.Microsecond, 1250},
++	} {
++		b.Run(sample.name, func(b *testing.B) {
++			tr := newAppDataReceivedPacketTracker(utils.DefaultLogger)
++			tr.SetPathSettled(true)
++			now := monotime.Time(time.Hour)
++			pn := protocol.PacketNumber(1)
++			for ; pn <= 2000; pn++ {
++				now = now.Add(sample.interval)
++				if err := tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, sample.size); err != nil {
++					b.Fatal(err)
++				}
++				tr.GetAckFrame(now, true)
++			}
++			tr.GetAckFrame(now, false)
++			acks := 0
++			b.ReportAllocs()
++			b.ResetTimer()
++			for i := 0; i < b.N; i++ {
++				now = now.Add(sample.interval)
++				if err := tr.receivedPacketWithSize(pn, protocol.ECNNon, now, true, sample.size); err != nil {
++					b.Fatal(err)
++				}
++				if tr.GetAckFrame(now, true) != nil {
++					acks++
++				}
++				pn++
++			}
++			b.ReportMetric(float64(acks)/float64(b.N), "ACK/packet")
++		})
++	}
++}
+diff --git a/internal/ackhandler/received_packet_handler.go b/internal/ackhandler/received_packet_handler.go
+index a8cbe47..e410ec9 100644
+--- a/internal/ackhandler/received_packet_handler.go
++++ b/internal/ackhandler/received_packet_handler.go
+@@ -33,6 +33,19 @@ func (h *ReceivedPacketHandler) ReceivedPacket(
+ 	encLevel protocol.EncryptionLevel,
+ 	rcvTime monotime.Time,
+ 	ackEliciting bool,
++) error {
++	return h.ReceivedPacketWithSize(pn, ecn, encLevel, rcvTime, ackEliciting, 0)
++}
++
++// ReceivedPacketWithSize uses the authenticated QUIC packet's wire length to
++// select the application-data ACK cadence. Initial and Handshake stay immediate.
++func (h *ReceivedPacketHandler) ReceivedPacketWithSize(
++	pn protocol.PacketNumber,
++	ecn protocol.ECN,
++	encLevel protocol.EncryptionLevel,
++	rcvTime monotime.Time,
++	ackEliciting bool,
++	size protocol.ByteCount,
+ ) error {
+ 	switch encLevel {
+ 	case protocol.EncryptionInitial:
+@@ -48,12 +61,12 @@ func (h *ReceivedPacketHandler) ReceivedPacket(
+ 		if h.lowest1RTTPacket != protocol.InvalidPacketNumber && pn > h.lowest1RTTPacket {
+ 			return fmt.Errorf("received packet number %d on a 0-RTT packet after receiving %d on a 1-RTT packet", pn, h.lowest1RTTPacket)
+ 		}
+-		return h.appDataPackets.ReceivedPacket(pn, ecn, rcvTime, ackEliciting)
++		return h.appDataPackets.receivedPacketWithSize(pn, ecn, rcvTime, ackEliciting, size)
+ 	case protocol.Encryption1RTT:
+ 		if h.lowest1RTTPacket == protocol.InvalidPacketNumber || pn < h.lowest1RTTPacket {
+ 			h.lowest1RTTPacket = pn
+ 		}
+-		return h.appDataPackets.ReceivedPacket(pn, ecn, rcvTime, ackEliciting)
++		return h.appDataPackets.receivedPacketWithSize(pn, ecn, rcvTime, ackEliciting, size)
+ 	default:
+ 		panic(fmt.Sprintf("received packet with unknown encryption level: %s", encLevel))
+ 	}
+diff --git a/internal/ackhandler/received_packet_tracker.go b/internal/ackhandler/received_packet_tracker.go
+index 59e82e0..324f9f2 100644
+--- a/internal/ackhandler/received_packet_tracker.go
++++ b/internal/ackhandler/received_packet_tracker.go
+@@ -101,7 +101,8 @@ const (
+ )
+ 
+ // The appDataReceivedPacketTracker tracks packets received in the Application Data packet number space.
+-// It waits until at least 2 packets were received before queueing an ACK, or until the max_ack_delay was reached.
++// It normally ACKs every second packet. A settled, quiet path may decimate ACKs
++// at high receive rates, while every mode retains the max_ack_delay bound.
+ type appDataReceivedPacketTracker struct {
+ 	receivedPacketTracker
+ 
+@@ -120,6 +121,7 @@ type appDataReceivedPacketTracker struct {
+ 	pathSettled           bool // path MTU discovery has finished
+ 	ackThreshold          int  // current threshold, never below packetsBeforeAck
+ 	quietPacketsSinceStep int
++	receiveRate           ackReceiveRate
+ 
+ 	logger utils.Logger
+ }
+@@ -144,6 +146,7 @@ func (h *appDataReceivedPacketTracker) SetPathSettled(settled bool) {
+ 	h.pathSettled = settled
+ 	if !settled {
+ 		h.resetAckThreshold()
++		h.receiveRate = ackReceiveRate{}
+ 	}
+ }
+ 
+@@ -177,6 +180,10 @@ func (h *appDataReceivedPacketTracker) recordQuietPacket() {
+ }
+ 
+ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber, ecn protocol.ECN, rcvTime monotime.Time, ackEliciting bool) error {
++	return h.receivedPacketWithSize(pn, ecn, rcvTime, ackEliciting, 0)
++}
++
++func (h *appDataReceivedPacketTracker) receivedPacketWithSize(pn protocol.PacketNumber, ecn protocol.ECN, rcvTime monotime.Time, ackEliciting bool, size protocol.ByteCount) error {
+ 	if err := h.receivedPacketTracker.ReceivedPacket(pn, ecn, ackEliciting); err != nil {
+ 		return err
+ 	}
+@@ -187,17 +194,19 @@ func (h *appDataReceivedPacketTracker) ReceivedPacket(pn protocol.PacketNumber,
+ 	if !ackEliciting {
+ 		return nil
+ 	}
++	// Only accepted, ack-eliciting application packets contribute to receive rate.
++	h.receiveRate.record(size, rcvTime)
+ 	h.ackElicitingPacketsReceivedSinceLastAck++
+ 	isMissing := h.isMissing(pn)
+-	if isMissing || ecn == protocol.ECNCE {
+-		// The path is no longer quiet. Go back to acking every second packet
+-		// until it has been quiet again for a while. shouldQueueACK resets the
+-		// threshold for reordering too, but it only runs while no ACK is queued.
++	newMissing := h.hasNewMissingPackets()
++	if isMissing || newMissing || ecn == protocol.ECNCE {
++		// Reset before the queued-ACK and packet-count fast paths, including
++		// a gap that will be reported by an already pending ACK.
+ 		h.resetAckThreshold()
+-	} else {
++	} else if h.receiveRate.allowsDecimation() {
+ 		h.recordQuietPacket()
+ 	}
+-	if !h.ackQueued && h.shouldQueueACK(pn, ecn, isMissing) {
++	if !h.ackQueued && h.shouldQueueACK(pn, ecn, isMissing, newMissing) {
+ 		h.ackQueued = true
+ 		h.ackAlarm = 0 // cancel the ack alarm
+ 	}
+@@ -250,7 +259,7 @@ func (h *appDataReceivedPacketTracker) hasNewMissingPackets() bool {
+ 	return highestMissing > h.lastAck.LargestAcked()-reorderingThreshold
+ }
+ 
+-func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing bool) bool {
++func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber, ecn protocol.ECN, wasMissing, newMissing bool) bool {
+ 	// Send an ACK if this packet was reported missing in an ACK sent before.
+ 	// Ack decimation with reordering relies on the timer to send an ACK, but if
+ 	// missing packets we reported in the previous ACK, send an ACK immediately.
+@@ -261,18 +270,20 @@ func (h *appDataReceivedPacketTracker) shouldQueueACK(pn protocol.PacketNumber,
+ 		return true
+ 	}
+ 
+-	// send an ACK every ackThreshold ack-eliciting packets
+-	if h.ackElicitingPacketsReceivedSinceLastAck >= h.ackThreshold {
++	threshold := h.ackThreshold
++	if !h.receiveRate.allowsDecimation() {
++		threshold = packetsBeforeAck
++	}
++	if h.ackElicitingPacketsReceivedSinceLastAck >= threshold {
+ 		if h.logger.Debug() {
+-			h.logger.Debugf("\tQueueing ACK because packet %d packets were received after the last ACK (using initial threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, h.ackThreshold)
++			h.logger.Debugf("\tQueueing ACK after %d ack-eliciting packets (threshold: %d).", h.ackElicitingPacketsReceivedSinceLastAck, threshold)
+ 		}
+ 		return true
+ 	}
+ 
+ 	// queue an ACK if there are new missing packets to report
+-	if h.hasNewMissingPackets() {
++	if newMissing {
+ 		h.logger.Debugf("\tQueuing ACK because there's a new missing packet to report.")
+-		h.resetAckThreshold()
+ 		return true
+ 	}
+ 
