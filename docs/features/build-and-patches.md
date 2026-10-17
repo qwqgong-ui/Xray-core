@@ -33,6 +33,16 @@ CGO_ENABLED=0 go build -o xray -trimpath -buildvcs=false ./main
 
 目标只支持 v3 时，将 GOAMD64 改为 v3。Go 版本以 [go.mod](../../go.mod) 为准；当前 Go 1.27 是已合并的上游要求，不单列为下游功能。测试前也应执行补丁脚本并导出其 GOFLAGS。
 
+## DoQ 回归测试
+
+默认测试使用本地 TLS/QUIC 服务验证 DoQ 查询、缓存及 IPv4/IPv6 选择，不依赖公网 DNS 服务。检查公网 AdGuard DoQ 连通性时，在加载上文依赖补丁和构建环境后执行：
+
+```bash
+XRAY_TEST_DNS_QUIC_PUBLIC=1 go test -run '^TestQUICNameServerPublic$' -count=1 ./app/dns
+```
+
+这项联网检查保留真实失败结果；UDP 853 不通时会失败，不影响默认回归。
+
 ## 工作流范围
 
 [发布工作流](../../.github/workflows/release.yml)的 Linux AMD64 发布项使用 v4，并以 `linux-amd64-v4` 标识；本地为特定目标编译的 v3 不能当作 v4 产物分发。
