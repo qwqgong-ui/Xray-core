@@ -124,7 +124,7 @@ func TestBBRFQEndToEnd(t *testing.T) {
 	start := time.Now()
 	for range 2 {
 		go func() {
-			c := &client{dest: net.UDPDestination(net.IPAddress(remote.IP), net.Port(remote.Port)), config: &Config{Auth: "fq-test"}, tlsConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}, quicParams: params}
+			c := &client{lock: make(chan struct{}, 1), dest: net.UDPDestination(net.IPAddress(remote.IP), net.Port(remote.Port)), config: &Config{Auth: "fq-test"}, tlsConfig: &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"h3"}}, quicParams: params}
 			conn, err := c.tcp(ctx)
 			if err != nil {
 				done <- err
