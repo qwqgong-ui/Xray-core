@@ -1,0 +1,769 @@
+{
+  "task_date": "2026-10-18",
+  "status": "validated in isolated Linux network namespaces; not deployed",
+  "problem": "Custom RTT queue protection in the unchanged Xray server starved already-queued MAX_STREAM_DATA frames, limiting one upload stream to about 580 Mbps and causing long stalls under jitter.",
+  "history": {
+    "xray_guard_introduced": "8d1f52704bf288e19bcb19ccc27252980e53e1aa",
+    "mihomo_guard_and_recovery_cap_introduced": "2b44b3db"
+  },
+  "changes": [
+    "Delete both custom RTT queue guards and the extra idle/recovery pacing-rate caps, including state, call sites and obsolete tests.",
+    "ACK-only packets no longer debit the software data pacer; paced data and receive-credit frames still debit it.",
+    "Keep standard BBR RTT/BDP, DRAIN, PROBE_BW, PROBE_RTT, loss recovery, ECN and explicit app-limited sampler notifications.",
+    "Remove the old RTT watchdog from the executable historical Xray patch series, and include the ACK starvation regression there.",
+    "Mark the earlier burst-control evidence as historical and withdrawn."
+  ],
+  "method": {
+    "topology": "app -> Mihomo TPROXY -> router netem -> Xray -> TCP/TLS target",
+    "router_only_rate_Mbps_each_direction": 1000,
+    "base_delay_ms_each_direction": 20,
+    "router_queue_packets": 8192,
+    "proxy_bandwidth_parameters_changed": false,
+    "jitter": "20ms base delay with a 10ms normal-distribution jitter parameter in each direction, seed 424242",
+    "delay_spikes": "server-to-client delay 20ms -> 220ms for 300ms at seconds 5,10,15, then restored",
+    "speed": "iperf3 TCP, one stream, 12 measured seconds after 3 omitted warmup seconds; receiver throughput",
+    "latency": "20-second TLS1.3 HTTP1.1 uploads with 20 scheduled 4KiB requests/s, four warmed connections, 4-second timeout from dispatch; requests use HY2 too",
+    "missed_ticks": "Busy ticks are not dispatched or counted as timeout; all 400 scheduled ticks are accounted for.",
+    "upload": "Target journals actual received bytes every 100ms and validates the received payload prefix.",
+    "control_client": "Previous candidate: client RTT guard already removed and ACK debit fixed, but idle recovery cap still present.",
+    "control_server": "Exact production source 65d2736d01b7a9349fbd1989ee79806dfde7b697 rebuilt for this host amd64-v3; original options retained.",
+    "fixed": "Fresh normal builds of both working trees; no diagnostic switches, qlog or perf in the final measurements."
+  },
+  "earlier_same_topology_raw_TCP_reference_Mbps": 935.296,
+  "final_speed": [
+    {
+      "case": "verify-control",
+      "variant": "control",
+      "download": false,
+      "received_Mbps": 579.0461383659821,
+      "sender_retransmits": 17
+    },
+    {
+      "case": "verify-client-only",
+      "variant": "client-only",
+      "download": false,
+      "received_Mbps": 579.4708891074442,
+      "sender_retransmits": 141
+    },
+    {
+      "case": "verify-server-only",
+      "variant": "server-only",
+      "download": false,
+      "received_Mbps": 928.9270872273099,
+      "sender_retransmits": 1
+    },
+    {
+      "case": "verify-both-up",
+      "variant": "both",
+      "download": false,
+      "received_Mbps": 929.0566547602125,
+      "sender_retransmits": 3
+    },
+    {
+      "case": "verify-both-up-repeat",
+      "variant": "both",
+      "download": false,
+      "received_Mbps": 930.135918579561,
+      "sender_retransmits": 2
+    },
+    {
+      "case": "verify-both-down",
+      "variant": "both",
+      "download": true,
+      "received_Mbps": 931.4842370964691,
+      "sender_retransmits": 671
+    }
+  ],
+  "final_latency": [
+    {
+      "profile": "jitter",
+      "variant": "control",
+      "scheduled_requests": 400,
+      "dispatched_requests": 24,
+      "successful_requests": 4,
+      "request_errors": 20,
+      "not_dispatched_busy_ticks": 376,
+      "response_ms": {
+        "count": 24,
+        "mean": 3352.808,
+        "p50": 4001.127,
+        "p95": 4002.11,
+        "p99": 4002.134,
+        "max": 4002.134
+      },
+      "target_upload_Mbps": 13.402112,
+      "upload_integrity_ok": true,
+      "upload_per_second": [
+        {
+          "end_s": 1,
+          "received_bytes": 2490368,
+          "Mbit_per_second": 19.922944
+        },
+        {
+          "end_s": 2,
+          "received_bytes": 6012928,
+          "Mbit_per_second": 48.103424
+        },
+        {
+          "end_s": 3,
+          "received_bytes": 11141120,
+          "Mbit_per_second": 89.12896
+        },
+        {
+          "end_s": 4,
+          "received_bytes": 13860864,
+          "Mbit_per_second": 110.886912
+        },
+        {
+          "end_s": 5,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 6,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 7,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 8,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 9,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 10,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 11,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 12,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 13,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 14,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 15,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 16,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 17,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 18,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 19,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        },
+        {
+          "end_s": 20,
+          "received_bytes": 0,
+          "Mbit_per_second": 0.0
+        }
+      ],
+      "link_events": []
+    },
+    {
+      "profile": "jitter",
+      "variant": "both",
+      "scheduled_requests": 400,
+      "dispatched_requests": 396,
+      "successful_requests": 396,
+      "request_errors": 0,
+      "not_dispatched_busy_ticks": 4,
+      "response_ms": {
+        "count": 396,
+        "mean": 117.281,
+        "p50": 118.47,
+        "p95": 131.861,
+        "p99": 236.59,
+        "max": 299.114
+      },
+      "target_upload_Mbps": 863.4761216,
+      "upload_integrity_ok": true,
+      "upload_per_second": [
+        {
+          "end_s": 1,
+          "received_bytes": 9797632,
+          "Mbit_per_second": 78.381056
+        },
+        {
+          "end_s": 2,
+          "received_bytes": 83427328,
+          "Mbit_per_second": 667.418624
+        },
+        {
+          "end_s": 3,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        },
+        {
+          "end_s": 4,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 5,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 6,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 7,
+          "received_bytes": 118636544,
+          "Mbit_per_second": 949.092352
+        },
+        {
+          "end_s": 8,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 9,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 10,
+          "received_bytes": 83394560,
+          "Mbit_per_second": 667.15648
+        },
+        {
+          "end_s": 11,
+          "received_bytes": 118505472,
+          "Mbit_per_second": 948.043776
+        },
+        {
+          "end_s": 12,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 13,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        },
+        {
+          "end_s": 14,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 15,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 16,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 17,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        },
+        {
+          "end_s": 18,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 19,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 20,
+          "received_bytes": 86786048,
+          "Mbit_per_second": 694.288384
+        }
+      ],
+      "link_events": []
+    },
+    {
+      "profile": "delay_spikes",
+      "variant": "control",
+      "scheduled_requests": 400,
+      "dispatched_requests": 55,
+      "successful_requests": 51,
+      "request_errors": 4,
+      "not_dispatched_busy_ticks": 345,
+      "response_ms": {
+        "count": 55,
+        "mean": 1400.249,
+        "p50": 887.232,
+        "p95": 4000.695,
+        "p99": 4000.965,
+        "max": 4000.965
+      },
+      "target_upload_Mbps": 678.2189568,
+      "upload_integrity_ok": true,
+      "upload_per_second": [
+        {
+          "end_s": 1,
+          "received_bytes": 66502656,
+          "Mbit_per_second": 532.021248
+        },
+        {
+          "end_s": 2,
+          "received_bytes": 84279296,
+          "Mbit_per_second": 674.234368
+        },
+        {
+          "end_s": 3,
+          "received_bytes": 82739200,
+          "Mbit_per_second": 661.9136
+        },
+        {
+          "end_s": 4,
+          "received_bytes": 84819968,
+          "Mbit_per_second": 678.559744
+        },
+        {
+          "end_s": 5,
+          "received_bytes": 81494016,
+          "Mbit_per_second": 651.952128
+        },
+        {
+          "end_s": 6,
+          "received_bytes": 52543488,
+          "Mbit_per_second": 420.347904
+        },
+        {
+          "end_s": 7,
+          "received_bytes": 95535104,
+          "Mbit_per_second": 764.280832
+        },
+        {
+          "end_s": 8,
+          "received_bytes": 100630528,
+          "Mbit_per_second": 805.044224
+        },
+        {
+          "end_s": 9,
+          "received_bytes": 101466112,
+          "Mbit_per_second": 811.728896
+        },
+        {
+          "end_s": 10,
+          "received_bytes": 99368960,
+          "Mbit_per_second": 794.95168
+        },
+        {
+          "end_s": 11,
+          "received_bytes": 47775744,
+          "Mbit_per_second": 382.205952
+        },
+        {
+          "end_s": 12,
+          "received_bytes": 92815360,
+          "Mbit_per_second": 742.52288
+        },
+        {
+          "end_s": 13,
+          "received_bytes": 88588288,
+          "Mbit_per_second": 708.706304
+        },
+        {
+          "end_s": 14,
+          "received_bytes": 85164032,
+          "Mbit_per_second": 681.312256
+        },
+        {
+          "end_s": 15,
+          "received_bytes": 82395136,
+          "Mbit_per_second": 659.161088
+        },
+        {
+          "end_s": 16,
+          "received_bytes": 73154560,
+          "Mbit_per_second": 585.23648
+        },
+        {
+          "end_s": 17,
+          "received_bytes": 94453760,
+          "Mbit_per_second": 755.63008
+        },
+        {
+          "end_s": 18,
+          "received_bytes": 91357184,
+          "Mbit_per_second": 730.857472
+        },
+        {
+          "end_s": 19,
+          "received_bytes": 97615872,
+          "Mbit_per_second": 780.926976
+        },
+        {
+          "end_s": 20,
+          "received_bytes": 92848128,
+          "Mbit_per_second": 742.785024
+        }
+      ],
+      "link_events": [
+        {
+          "scheduled_ms": 5000,
+          "actual_start_ms": 5004.897011,
+          "actual_end_ms": 5007.391999,
+          "device": "c0",
+          "event": "delay+200ms",
+          "delay_ms": 220,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 5300.0,
+          "actual_start_ms": 5304.448887,
+          "actual_end_ms": 5306.848797,
+          "device": "c0",
+          "event": "restore",
+          "delay_ms": 20,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 10000,
+          "actual_start_ms": 10004.835791,
+          "actual_end_ms": 10007.532871,
+          "device": "c0",
+          "event": "delay+200ms",
+          "delay_ms": 220,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 10300.0,
+          "actual_start_ms": 10302.74245,
+          "actual_end_ms": 10305.189718,
+          "device": "c0",
+          "event": "restore",
+          "delay_ms": 20,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 15000,
+          "actual_start_ms": 15003.635384,
+          "actual_end_ms": 15006.351056,
+          "device": "c0",
+          "event": "delay+200ms",
+          "delay_ms": 220,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 15300.0,
+          "actual_start_ms": 15301.841743,
+          "actual_end_ms": 15304.30432,
+          "device": "c0",
+          "event": "restore",
+          "delay_ms": 20,
+          "loss_percent": 0
+        }
+      ]
+    },
+    {
+      "profile": "delay_spikes",
+      "variant": "both",
+      "scheduled_requests": 400,
+      "dispatched_requests": 391,
+      "successful_requests": 391,
+      "request_errors": 0,
+      "not_dispatched_busy_ticks": 9,
+      "response_ms": {
+        "count": 391,
+        "mean": 77.465,
+        "p50": 64.68,
+        "p95": 125.981,
+        "p99": 293.991,
+        "max": 335.872
+      },
+      "target_upload_Mbps": 881.4526463999999,
+      "upload_integrity_ok": true,
+      "upload_per_second": [
+        {
+          "end_s": 1,
+          "received_bytes": 77463552,
+          "Mbit_per_second": 619.708416
+        },
+        {
+          "end_s": 2,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 3,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 4,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 5,
+          "received_bytes": 118636544,
+          "Mbit_per_second": 949.092352
+        },
+        {
+          "end_s": 6,
+          "received_bytes": 81575936,
+          "Mbit_per_second": 652.607488
+        },
+        {
+          "end_s": 7,
+          "received_bytes": 119308288,
+          "Mbit_per_second": 954.466304
+        },
+        {
+          "end_s": 8,
+          "received_bytes": 118636544,
+          "Mbit_per_second": 949.092352
+        },
+        {
+          "end_s": 9,
+          "received_bytes": 118652928,
+          "Mbit_per_second": 949.223424
+        },
+        {
+          "end_s": 10,
+          "received_bytes": 118390784,
+          "Mbit_per_second": 947.126272
+        },
+        {
+          "end_s": 11,
+          "received_bytes": 62865408,
+          "Mbit_per_second": 502.923264
+        },
+        {
+          "end_s": 12,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        },
+        {
+          "end_s": 13,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 14,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 15,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        },
+        {
+          "end_s": 16,
+          "received_bytes": 85606400,
+          "Mbit_per_second": 684.8512
+        },
+        {
+          "end_s": 17,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        },
+        {
+          "end_s": 18,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 19,
+          "received_bytes": 118325248,
+          "Mbit_per_second": 946.601984
+        },
+        {
+          "end_s": 20,
+          "received_bytes": 118308864,
+          "Mbit_per_second": 946.470912
+        }
+      ],
+      "link_events": [
+        {
+          "scheduled_ms": 5000,
+          "actual_start_ms": 5002.71335,
+          "actual_end_ms": 5006.036995,
+          "device": "c0",
+          "event": "delay+200ms",
+          "delay_ms": 220,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 5300.0,
+          "actual_start_ms": 5302.120084,
+          "actual_end_ms": 5304.945671,
+          "device": "c0",
+          "event": "restore",
+          "delay_ms": 20,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 10000,
+          "actual_start_ms": 10003.903944,
+          "actual_end_ms": 10006.636648,
+          "device": "c0",
+          "event": "delay+200ms",
+          "delay_ms": 220,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 10300.0,
+          "actual_start_ms": 10302.053926,
+          "actual_end_ms": 10304.163424,
+          "device": "c0",
+          "event": "restore",
+          "delay_ms": 20,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 15000,
+          "actual_start_ms": 15002.214829,
+          "actual_end_ms": 15004.948425,
+          "device": "c0",
+          "event": "delay+200ms",
+          "delay_ms": 220,
+          "loss_percent": 0
+        },
+        {
+          "scheduled_ms": 15300.0,
+          "actual_start_ms": 15301.532888,
+          "actual_end_ms": 15304.091829,
+          "device": "c0",
+          "event": "restore",
+          "delay_ms": 20,
+          "loss_percent": 0
+        }
+      ]
+    }
+  ],
+  "diagnostic_ablation": [
+    {
+      "case": "server-control",
+      "received_Mbps": 561.9768681465098,
+      "skip_server_rtt_guard": false,
+      "skip_server_ack_debit": false,
+      "credit_packetization_samples": 33,
+      "credit_queue_wait_median_us": 353007,
+      "credit_queue_wait_max_us": 367228
+    },
+    {
+      "case": "server-ackfree",
+      "received_Mbps": 604.7879662550661,
+      "skip_server_rtt_guard": false,
+      "skip_server_ack_debit": true,
+      "credit_packetization_samples": 78,
+      "credit_queue_wait_median_us": 25.5,
+      "credit_queue_wait_max_us": 731256
+    },
+    {
+      "case": "server-rttfree",
+      "received_Mbps": 930.0702883049896,
+      "skip_server_rtt_guard": true,
+      "skip_server_ack_debit": false,
+      "credit_packetization_samples": 206,
+      "credit_queue_wait_median_us": 18.0,
+      "credit_queue_wait_max_us": 70
+    },
+    {
+      "case": "server-bothfree",
+      "received_Mbps": 928.9460425447758,
+      "skip_server_rtt_guard": true,
+      "skip_server_ack_debit": true,
+      "credit_packetization_samples": 205,
+      "credit_queue_wait_median_us": 21,
+      "credit_queue_wait_max_us": 78
+    }
+  ],
+  "causal_qlog": {
+    "control_stream_id": 8,
+    "control_stream_blocked_count": 31,
+    "control_wait_for_stream_credit_ms": 7216,
+    "control_min_connection_credit_bytes": 33550525,
+    "rtt_guard_skipped_stream_blocked_count": 0,
+    "rtt_guard_skipped_min_stream_credit_bytes": 14033176,
+    "timing_example_ms": {
+      "server_already_consumed_bytes_when_credit_queued": 25168289,
+      "server_credit_queued": 718.039149,
+      "client_stream_data_blocked": 858.3345,
+      "server_credit_packetized": 1079.373807,
+      "server_consumed_bytes_at_packetization": 50334113,
+      "client_received_credit": 1099.503255
+    },
+    "interpretation": "Server had consumed data and queued a window update, but pacing delayed packetization by 361ms; delivery after packetization took 20ms. RTT-guard-only ablation removes the wait and restores about 930Mbps.",
+    "packetized_is_not_wire_sent": true
+  },
+  "validation": {
+    "regression_red_before_fix": {
+      "xray": [
+        "ACK traffic postponed next paced send",
+        "Application idle added an extra pacing cap"
+      ],
+      "mihomo": [
+        "Application idle added an extra pacing cap"
+      ]
+    },
+    "related_suites_passed": [
+      "Mihomo transport/tuic/...",
+      "Xray transport/internet/hysteria/..."
+    ],
+    "race_passed": [
+      "Mihomo congestion_v2",
+      "Xray bbr and common pacer"
+    ],
+    "historical_patch": "Modified 0007 applies cleanly on 80a262d parent; controller tests with that historical baseline and its pinned dependencies pass.",
+    "historical_dependency_limit": "Current full quic-go patch set cannot be replayed on the old historical go.mod (0003 connection.go context mismatch). The full historical patch workflow was not validated; normal current builds use their canonical patched dependencies and pass.",
+    "production_state": "Mihomo PID2194595 and Xray PID2046 remain active/running with zero restarts; original configuration and Xray production binary hashes unchanged.",
+    "not_measured": [
+      "Public WAN improvement",
+      "Physical-device cross-platform behavior",
+      "Long-duration fairness"
+    ],
+    "local_build_level": "amd64-v3; local CPU lacks the AVX-512 set required for v4",
+    "fixed_binary_sha256": {
+      "mihomo-fixed": "bf1ff5588fe704f69b9238757e2947f42ba3191bad0e278877f272b56c61261c",
+      "xray-fixed": "2fc97a8a5a611ac3cb852a806a1e12c1a32af0f4b9b4b9b05d6ed6f08fd4ce81"
+    },
+    "control_binary_sha256": {
+      "mihomo": "76d3bdcf92960fbfc78c84c6b8b675d2102ec30f79394ac8d8132681c2dcc95d",
+      "xray": "668079bfbbebaae739dcbe8969c7bd2c680a45f93e09c3cfc06c86168a30f2e5"
+    }
+  }
+}

@@ -114,7 +114,7 @@ func (b *bbrSender) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64
 }
 
 func (b *bbrSender) currentECNPhase() ecnBBRPhase {
-	if b.ecn.phase == ecnPhaseFastGrow && (b.queueGuard.active || b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt) {
+	if b.ecn.phase == ecnPhaseFastGrow && (b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt) {
 		return ecnPhaseDrain
 	}
 	return b.ecn.phase
@@ -161,7 +161,7 @@ func (b *bbrSender) applyECNPolicy(isRoundStart, hasSafetyLoss bool) {
 	case ecnPhaseFastGrow:
 		// Zero CE permits STARTUP exploration; it must not turn every steady
 		// PROBE_BW gain cycle into perpetual STARTUP or undo queue draining.
-		if hasSafetyLoss || b.queueGuard.active || b.mode != bbrModeStartup || b.isAtFullBandwidth {
+		if hasSafetyLoss || b.mode != bbrModeStartup || b.isAtFullBandwidth {
 			return
 		}
 		base := max(state.btlBwFloor, b.bandwidthEstimate())
@@ -243,10 +243,6 @@ func (b *bbrSender) OnPathMigration() {
 	state.pendingSample = false
 	state.pendingCE = false
 	b.ecn = state
-	b.queueGuard = rttQueueGuard{}
-	b.rateGuard = pacingRateGuard{}
-	b.appIdle = false
-	b.lastDataSent = 0
 
 	b.sampler = newBandwidthSampler(roundTripCount(bandwidthWindowSize))
 	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])

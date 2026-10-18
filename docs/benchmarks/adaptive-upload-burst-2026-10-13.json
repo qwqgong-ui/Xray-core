@@ -1,6 +1,12 @@
 {
   "date_client": "2026-10-13",
   "client_timezone": "America/Los_Angeles",
+  "implementation_status": "withdrawn",
+  "withdrawal": {
+    "date_client": "2026-10-18",
+    "reason": "RTT queue guard and the extra pacing recovery cap can starve receive-window updates. Both custom limits are removed; the measurements below remain historical data.",
+    "historical_test_scope": "The old ablations established the intended cap behavior, not absence of a normal-throughput regression."
+  },
   "request": {
     "keep_bbr_adaptive": true,
     "fixed_upload_cap": false,

@@ -18,6 +18,19 @@ index 26e7bb7..10a60b9 100644
  	debug bool
  }
  
+@@ -448,7 +450,11 @@ func (b *bbrSender) OnPacketSent(
+ 	bytes congestion.ByteCount,
+ 	isRetransmittable bool,
+ ) {
+-	b.pacer.SentPacket(sentTime, bytes)
++	if isRetransmittable {
++		// Pure ACKs bypass pacing in QUIC. Keep their traffic from consuming
++		// the data budget needed by receive-credit updates.
++		b.pacer.SentPacket(sentTime, bytes)
++	}
+ 
+ 	b.lastSentPacket = packetNumber
+ 	b.bytesInFlight = bytesInFlight
 @@ -495,7 +497,9 @@ func (b *bbrSender) SetMaxDatagramSize(s congestion.ByteCount) {
  	}
  	oldMinCongestionWindow := b.minCongestionWindow
@@ -81,15 +94,13 @@ index 26e7bb7..10a60b9 100644
  	// This is where we clean up obsolete (acked or lost) packets from the bandwidth sampler.
 diff --git a/transport/internet/hysteria/congestion/bbr/ecn_bbr.go b/transport/internet/hysteria/congestion/bbr/ecn_bbr.go
 new file mode 100644
-index 0000000..e9b3cc6
+index 0000000..0a3255a
 --- /dev/null
 +++ b/transport/internet/hysteria/congestion/bbr/ecn_bbr.go
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,275 @@
 +package bbr
 +
 +import (
-+	"time"
-+
 +	"github.com/apernet/quic-go/congestion"
 +
 +	"github.com/xtls/xray-core/transport/internet/hysteria/congestion/common"
@@ -106,14 +117,12 @@ index 0000000..e9b3cc6
 +)
 +
 +const (
-+	ecnAlphaGain              = 1.0 / 16.0
-+	ecnMinReduction           = 0.02
-+	ecnMaxReduction           = 0.50
-+	ecnFloorReductionEpochs   = 3
-+	ecnSafetyLossRatio        = 0.10
-+	ecnPathMigrationDecay     = 0.50
-+	ecnQueueDrainRTTThreshold = 0.50
-+	ecnQueueDrainRTTExit      = 0.25
++	ecnAlphaGain            = 1.0 / 16.0
++	ecnMinReduction         = 0.02
++	ecnMaxReduction         = 0.50
++	ecnFloorReductionEpochs = 3
++	ecnSafetyLossRatio      = 0.10
++	ecnPathMigrationDecay   = 0.50
 +)
 +
 +type ecnBBRState struct {
@@ -138,7 +147,6 @@ index 0000000..e9b3cc6
 +	shrinkPending bool
 +	pendingSample bool
 +	pendingCE     bool
-+	rttDrain      bool
 +}
 +
 +func (b *bbrSender) OnECNFeedback(capable, failed bool, ect0, ect1, ecnce uint64) {
@@ -153,7 +161,6 @@ index 0000000..e9b3cc6
 +		state.ceSamples = 0
 +		state.ceEpochs = 0
 +		state.shrinkPending = false
-+		state.rttDrain = false
 +		return
 +	}
 +	if !capable {
@@ -162,7 +169,6 @@ index 0000000..e9b3cc6
 +		state.phase = ecnPhaseFallback
 +		state.ceSamples = 0
 +		state.shrinkPending = false
-+		state.rttDrain = false
 +		return
 +	}
 +
@@ -199,18 +205,16 @@ index 0000000..e9b3cc6
 +		state.shrinkInflight = state.freezeInflight
 +		state.shrinkApplied = false
 +		state.shrinkPending = false
-+		state.rttDrain = false
 +		return
 +	}
 +
 +	state.ceSamples++
 +	state.phase = ecnPhaseShrink
 +	state.shrinkPending = true
-+	state.rttDrain = false
 +}
 +
 +func (b *bbrSender) currentECNPhase() ecnBBRPhase {
-+	if b.ecn.phase == ecnPhaseFastGrow && (b.ecn.rttDrain || b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt) {
++	if b.ecn.phase == ecnPhaseFastGrow && (b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt) {
 +		return ecnPhaseDrain
 +	}
 +	return b.ecn.phase
@@ -245,18 +249,7 @@ index 0000000..e9b3cc6
 +		b.applyECNShrink(isRoundStart)
 +		return
 +	case ecnPhaseFastGrow:
-+		b.updateECNQueueWatchdog()
 +		if b.mode == bbrModeDrain || b.mode == bbrModeProbeRtt {
-+			return
-+		}
-+		if state.rttDrain {
-+			base := max(state.btlBwFloor, b.bandwidthEstimate())
-+			target := Bandwidth(b.drainGain * float64(base))
-+			if target != 0 {
-+				b.pacingRate = min(b.pacingRate, target)
-+			}
-+			b.congestionWindow = min(b.congestionWindow, b.getTargetCongestionWindow(1))
-+			b.congestionWindow = max(b.congestionWindow, b.minCongestionWindow)
 +			return
 +		}
 +		if hasSafetyLoss {
@@ -300,21 +293,6 @@ index 0000000..e9b3cc6
 +	b.congestionWindow = max(b.congestionWindow, b.minCongestionWindow)
 +}
 +
-+func (b *bbrSender) updateECNQueueWatchdog() {
-+	minRTT := b.getMinRtt()
-+	latestRTT := b.rttStats.LatestRTT()
-+	if minRTT <= 0 || latestRTT <= 0 {
-+		return
-+	}
-+	if latestRTT > minRTT+timeFraction(minRTT, ecnQueueDrainRTTThreshold) {
-+		b.ecn.rttDrain = true
-+		return
-+	}
-+	if latestRTT <= minRTT+timeFraction(minRTT, ecnQueueDrainRTTExit) {
-+		b.ecn.rttDrain = false
-+	}
-+}
-+
 +func (b *bbrSender) hasSafetyLoss(priorInFlight congestion.ByteCount, lostPackets []congestion.LostPacketInfo) bool {
 +	if len(lostPackets) == 0 {
 +		return false
@@ -352,7 +330,6 @@ index 0000000..e9b3cc6
 +	state.shrinkPending = false
 +	state.pendingSample = false
 +	state.pendingCE = false
-+	state.rttDrain = false
 +	b.ecn = state
 +
 +	b.sampler = newBandwidthSampler(roundTripCount(bandwidthWindowSize))
@@ -396,16 +373,12 @@ index 0000000..e9b3cc6
 +func clampWindow(value, minimum, maximum congestion.ByteCount) congestion.ByteCount {
 +	return min(maximum, max(minimum, value))
 +}
-+
-+func timeFraction(value time.Duration, factor float64) time.Duration {
-+	return time.Duration(float64(value) * factor)
-+}
 diff --git a/transport/internet/hysteria/congestion/bbr/ecn_bbr_test.go b/transport/internet/hysteria/congestion/bbr/ecn_bbr_test.go
 new file mode 100644
-index 0000000..9c36aa0
+index 0000000..f56d59c
 --- /dev/null
 +++ b/transport/internet/hysteria/congestion/bbr/ecn_bbr_test.go
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,154 @@
 +package bbr
 +
 +import (
@@ -543,30 +516,6 @@ index 0000000..9c36aa0
 +	require.True(t, b.hasSafetyLoss(100_000, []congestion.LostPacketInfo{{BytesLost: 10_000}}))
 +}
 +
-+func TestECNRTTWatchdogDrainsBandwidthDropAndRecovers(t *testing.T) {
-+	b, rtt := newECNTestSender()
-+	confirmZeroCE(b)
-+	floor := b.ecn.btlBwFloor
-+	beforeDrain := b.pacingRate
-+	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])
-+	b.maxBandwidth.Update(testBandwidth/4, b.roundTripCount)
-+	rtt.latestRTT = 40 * time.Millisecond
-+	b.applyECNPolicy(false, false)
-+
-+	require.Equal(t, testBandwidth/4, b.bandwidthEstimate())
-+	require.Equal(t, ecnPhaseDrain, b.currentECNPhase())
-+	require.Less(t, b.pacingRate, beforeDrain)
-+	require.Equal(t, floor, b.ecn.btlBwFloor)
-+
-+	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])
-+	b.maxBandwidth.Update(testBandwidth, b.roundTripCount)
-+	rtt.latestRTT = 22 * time.Millisecond
-+	b.OnECNFeedback(true, false, 32, 0, 0)
-+	b.applyECNPolicy(false, false)
-+	require.Equal(t, ecnPhaseFastGrow, b.currentECNPhase())
-+	require.Greater(t, b.pacingRate, Bandwidth(float64(floor)))
-+}
-+
 +func TestECNPathMigrationDecaysPathStateAndRevalidates(t *testing.T) {
 +	b, _ := newECNTestSender()
 +	confirmZeroCE(b)
@@ -583,4 +532,39 @@ index 0000000..9c36aa0
 +	require.Equal(t, max(b.minCongestionWindow, scaleWindow(oldInflightFloor, ecnPathMigrationDecay)), b.ecn.inflightFloor)
 +	require.Zero(t, b.bandwidthEstimate())
 +	require.Zero(t, b.minRtt)
++}
+diff --git a/transport/internet/hysteria/congestion/bbr/pacer_ack_test.go b/transport/internet/hysteria/congestion/bbr/pacer_ack_test.go
+new file mode 100644
+index 0000000..1382736
+--- /dev/null
++++ b/transport/internet/hysteria/congestion/bbr/pacer_ack_test.go
+@@ -0,0 +1,29 @@
++package bbr
++
++import (
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/congestion"
++	"github.com/apernet/quic-go/monotime"
++	"github.com/stretchr/testify/require"
++)
++
++func TestAckOnlyDoesNotStarvePacing(t *testing.T) {
++	b, _ := newECNTestSender()
++	b.pacingRate = 8_000 // Receive-credit updates must progress on slow links too.
++	now := monotime.Now()
++	var number congestion.PacketNumber
++	for b.HasPacingBudget(now) {
++		number++
++		b.OnPacketSent(now, congestion.ByteCount(number)*b.maxDatagramSize,
++			number, b.maxDatagramSize, true)
++	}
++	nextSend := b.TimeUntilSend(0)
++	for i := 1; i <= 100; i++ {
++		number++
++		b.OnPacketSent(now.Add(time.Duration(i)*20*time.Millisecond), 0, number, 60, false)
++	}
++	require.Equal(t, nextSend, b.TimeUntilSend(0), "unpaced ACKs must not postpone the next paced packet")
++	require.True(t, b.HasPacingBudget(now.Add(2*time.Second)), "a data/control packet must regain send credit")
 +}

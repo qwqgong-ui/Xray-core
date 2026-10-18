@@ -194,8 +194,7 @@ type bbrSender struct {
 
 	// Minimum RTT estimate.  Automatically expires within 10 seconds (and
 	// triggers PROBE_RTT mode) if no new value is sampled during that period.
-	minRtt     time.Duration
-	queueGuard rttQueueGuard
+	minRtt time.Duration
 	// The time at which the current value of |min_rtt_| was assigned.
 	minRttTimestamp monotime.Time
 
@@ -252,9 +251,6 @@ type bbrSender struct {
 
 	// Set to true upon exiting quiescence.
 	exitingQuiescence bool
-	rateGuard         pacingRateGuard
-	appIdle           bool
-	lastDataSent      monotime.Time
 
 	// Time at which PROBE_RTT has to be exited.  Setting it to zero indicates
 	// that the time is yet unknown as the number of packets in flight has not
@@ -454,16 +450,10 @@ func (b *bbrSender) OnPacketSent(
 	isRetransmittable bool,
 ) {
 	if isRetransmittable {
-		if b.appIdle && !b.lastDataSent.IsZero() && sentTime.Sub(b.lastDataSent) >= b.getMinRtt() {
-			b.limitIdleRestart()
-		}
-		b.appIdle = false
-		b.lastDataSent = max(b.lastDataSent, sentTime)
-		if b.rateGuard.rate != 0 && b.rateGuard.lastIncrease.IsZero() {
-			b.rateGuard.lastIncrease = sentTime
-		}
+		// Pure ACKs bypass pacing in QUIC. Charging them here can prevent
+		// receive-credit updates from ever accumulating a data packet's budget.
+		b.pacer.SentPacket(sentTime, bytes)
 	}
-	b.pacer.SentPacket(sentTime, bytes)
 
 	b.lastSentPacket = packetNumber
 	b.bytesInFlight = bytesInFlight
@@ -650,8 +640,6 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	b.calculateCongestionWindow(bytesAcked, excessAcked)
 	b.calculateRecoveryWindow(bytesAcked, pacingLoss)
 	b.applyECNPolicy(isRoundStart, hasSafetyLoss)
-	b.applyRTTQueueGuard(isRoundStart)
-	b.limitPacingRateIncrease(eventTime, isRoundStart)
 
 	// Cleanup internal state.
 	// This is where we clean up obsolete (acked or lost) packets from the bandwidth sampler.
@@ -681,9 +669,6 @@ func (b *bbrSender) PacingRate() Bandwidth {
 		))
 	}
 
-	if b.rateGuard.rate != 0 {
-		return min(rate, b.rateGuard.rate)
-	}
 	return rate
 }
 
@@ -847,9 +832,9 @@ func (b *bbrSender) updateGainCyclePhase(now monotime.Time, priorInFlight conges
 func (b *bbrSender) checkIfFullBandwidthReached(lastPacketSendState *sendTimeState) {
 	// Authentication, readiness requests and sparse control traffic cannot
 	// establish that the bottleneck is full. Keep the initial probing window
-	// available until a real flight exercises it. Loss / RTT drain remains an
+	// available until a real flight exercises it. Loss remains an
 	// independent exit, including paths too slow to fill that window.
-	if b.shouldExitStartupDueToLoss(lastPacketSendState) || b.queueGuard.active {
+	if b.shouldExitStartupDueToLoss(lastPacketSendState) {
 		b.isAtFullBandwidth = true
 		return
 	}
@@ -886,7 +871,6 @@ func (b *bbrSender) OnAppLimited() {
 	// a large remaining flight must not make sparse later requests overwrite
 	// the capacity estimate with artificially low delivery samples.
 	b.sampler.OnAppLimited()
-	b.appIdle = true
 }
 
 // Transitions from STARTUP to DRAIN and from DRAIN to PROBE_BW if

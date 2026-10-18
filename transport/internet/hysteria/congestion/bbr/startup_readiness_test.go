@@ -30,15 +30,20 @@ func TestReadinessTrafficDoesNotEndStartup(t *testing.T) {
 	require.True(t, b.isAtFullBandwidth, "a saturated plateau still exits STARTUP")
 }
 
-func TestReadinessGuardPreservesLossAndRTTExit(t *testing.T) {
+func TestReadinessGuardPreservesLossExit(t *testing.T) {
 	b, _ := newECNTestSender()
 	small := sendTimeState{isValid: true, bytesInFlight: 1200}
 	b.numLossEventsInRound = defaultStartupFullLossCount
 	b.bytesLostInRound = congestion.ByteCount(1200)
 	b.checkIfFullBandwidthReached(&small)
 	require.True(t, b.isAtFullBandwidth)
-	b, _ = newECNTestSender()
-	b.queueGuard.active = true
-	b.checkIfFullBandwidthReached(&small)
-	require.True(t, b.isAtFullBandwidth)
+}
+
+func TestAppLimitedSamplesCannotSuppressLossStartupExit(t *testing.T) {
+	b, _ := newECNTestSender()
+	b.lastSampleIsAppLimited = true
+	b.numLossEventsInRound = defaultStartupFullLossCount
+	b.bytesLostInRound = 1200
+	b.checkIfFullBandwidthReached(&sendTimeState{isValid: true, isAppLimited: true, bytesInFlight: 1200})
+	require.True(t, b.isAtFullBandwidth, "loss still ends STARTUP for an application-limited sample")
 }

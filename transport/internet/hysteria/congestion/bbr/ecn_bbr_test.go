@@ -167,34 +167,15 @@ func TestECNCapablePathUsesOnlySafetyLoss(t *testing.T) {
 	require.True(t, b.hasSafetyLoss(100_000, []congestion.LostPacketInfo{{BytesLost: 10_000}}))
 }
 
-func TestECNRTTWatchdogDrainsBandwidthDropAndRecovers(t *testing.T) {
-	b, rtt := newECNTestSender()
-	confirmZeroCE(b)
-	floor := b.ecn.btlBwFloor
-	beforeDrain := b.pacingRate
-	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])
-	b.maxBandwidth.Update(testBandwidth/4, b.roundTripCount)
-	rtt.latestRTT = 40 * time.Millisecond
-	for i := 0; i < 2; i++ {
-		b.calculatePacingRate(0)
-		b.applyECNPolicy(true, false)
-		b.applyRTTQueueGuard(true)
-	}
-
-	require.Equal(t, testBandwidth/4, b.bandwidthEstimate())
-	require.Equal(t, ecnPhaseDrain, b.currentECNPhase())
-	require.Less(t, b.pacingRate, beforeDrain)
-	require.Equal(t, floor, b.ecn.btlBwFloor)
-
-	b.maxBandwidth = NewWindowedFilter(roundTripCount(bandwidthWindowSize), MaxFilter[Bandwidth])
-	b.maxBandwidth.Update(testBandwidth, b.roundTripCount)
-	rtt.latestRTT = 22 * time.Millisecond
-	b.OnECNFeedback(true, false, 32, 0, 0)
-	b.calculatePacingRate(0)
-	b.applyECNPolicy(false, false)
-	b.applyRTTQueueGuard(false)
-	require.Equal(t, ecnPhaseFastGrow, b.currentECNPhase())
-	require.Greater(t, b.pacingRate, Bandwidth(float64(floor)))
+func TestZeroCESteadyStatePreservesProbeGain(t *testing.T) {
+	b, _ := newECNTestSender()
+	b.mode, b.isAtFullBandwidth = bbrModeProbeBw, true
+	b.pacingRate = testBandwidth * 3 / 4
+	window := b.congestionWindow
+	b.OnECNFeedback(true, false, 64, 0, 0)
+	b.applyECNPolicy(true, false)
+	require.Equal(t, testBandwidth*3/4, b.pacingRate)
+	require.Equal(t, window, b.congestionWindow)
 }
 
 func TestECNPathMigrationDecaysPathStateAndRevalidates(t *testing.T) {
