@@ -132,8 +132,12 @@ Negotiation. Short packets initially use the stream, plus one raw probe at most
 every 250 ms. No raw reply within three seconds, or 15 seconds without a raw
 reply after activation, returns the flow to the stream. The watchdog runs
 independently of new application writes, so an idle flow loses raw acceleration
-after 15 seconds. A raw write/read failure gives raw up for the life of the
-flow. The server notifies the client on raw socket failure.
+after 15 seconds. An unrecoverable client raw socket write/read error gives raw
+up for the life of the flow. The client counts transient ICMP errors; a raw write
+that fails this way sends the current packet over the reliable stream, retaining
+raw activation and the lease without refreshing `lastRaw` or extending expiry.
+Probe retries keep their existing interval, and probe, silence and lease timeouts
+still apply. The server notifies the client on raw socket failure.
 
 HQS2 supports zero-length CIDs through a source address and port lease created
 only on the reserved reliable stream. A registered upstream packet digest proves
@@ -154,8 +158,9 @@ that was busy sends the zero-length frame first, then probes again after 30
 seconds, doubling to at most 10 minutes and giving raw up after eight attempts.
 A raw packet that arrives in the meantime resumes the flow with no probe at all.
 The client's zero-length frame keeps the tuple and the CID claims, so the
-client's next raw packet resumes raw in both directions; only a raw failure on
-either side, or a client that has given up, is permanent. Packets already in
+client's next raw packet resumes raw in both directions; an unrecoverable client
+raw socket error, a server raw socket failure, or a client that has given up is
+permanent. Packets already in
 flight may be lost; application QUIC retransmits.
 
 A legacy HQS1 binding that has seen no raw packet for 60 seconds stops carrying downstream
