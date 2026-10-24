@@ -5,6 +5,8 @@ import (
 	go_errors "errors"
 	"io"
 	"math"
+	"net/netip"
+	"strings"
 	"sync/atomic"
 
 	"github.com/apernet/quic-go"
@@ -266,7 +268,14 @@ func (r *UDPReader) ReadFrom(p []byte) (n int, addr *net.Destination, err error)
 			continue
 		}
 
-		dest, err := net.ParseDestination("udp:" + dfMsg.Addr)
+		address := dfMsg.Addr
+		// 官方 TProxy 的 %0 表示未指定 IPv6 作用域，不是域名的一部分。
+		if strings.Contains(address, "%") {
+			if endpoint, err := netip.ParseAddrPort(address); err == nil && endpoint.Addr().Is6() && endpoint.Addr().Zone() == "0" {
+				address = netip.AddrPortFrom(endpoint.Addr().WithZone(""), endpoint.Port()).String()
+			}
+		}
+		dest, err := net.ParseDestination("udp:" + address)
 		if err != nil {
 			continue
 		}

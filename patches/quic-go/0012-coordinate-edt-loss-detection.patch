@@ -1,0 +1,248 @@
+diff --git a/internal/ackhandler/packet.go b/internal/ackhandler/packet.go
+--- a/internal/ackhandler/packet.go
++++ b/internal/ackhandler/packet.go
+@@ -25,6 +25,7 @@
+
+ 	includedInBytesInFlight bool
+ 	isPathProbePacket       bool
++	kernelPaced             bool
+ }
+
+ func (p *packet) Outstanding() bool {
+@@ -48,6 +49,7 @@
+ 	p.IsPathMTUProbePacket = false
+ 	p.includedInBytesInFlight = false
+ 	p.isPathProbePacket = false
++	p.kernelPaced = false
+ 	return p
+ }
+
+diff --git a/internal/ackhandler/sent_packet_handler.go b/internal/ackhandler/sent_packet_handler.go
+--- a/internal/ackhandler/sent_packet_handler.go
++++ b/internal/ackhandler/sent_packet_handler.go
+@@ -47,8 +47,9 @@
+ 	lossTime                   monotime.Time
+ 	lastAckElicitingPacketTime monotime.Time
+
+-	largestAcked protocol.PacketNumber
+-	largestSent  protocol.PacketNumber
++	largestAcked       protocol.PacketNumber
++	largestSent        protocol.PacketNumber
++	largestKernelAcked protocol.PacketNumber
+ }
+
+ func newPacketNumberSpace(initialPN protocol.PacketNumber, isAppData bool) *packetNumberSpace {
+@@ -59,10 +60,11 @@
+ 		pns = newSequentialPacketNumberGenerator(initialPN)
+ 	}
+ 	return &packetNumberSpace{
+-		history:      *newSentPacketHistory(isAppData),
+-		pns:          pns,
+-		largestSent:  protocol.InvalidPacketNumber,
+-		largestAcked: protocol.InvalidPacketNumber,
++		history:            *newSentPacketHistory(isAppData),
++		pns:                pns,
++		largestSent:        protocol.InvalidPacketNumber,
++		largestAcked:       protocol.InvalidPacketNumber,
++		largestKernelAcked: protocol.InvalidPacketNumber,
+ 	}
+ }
+
+@@ -341,6 +343,18 @@
+ 	h.setLossDetectionTimer(t)
+ }
+
++// MarkKernelPaced 只标记刚登记且将进入同一路 EDT 队列的数据包。
++func (h *sentPacketHandler) MarkKernelPaced(pn protocol.PacketNumber) {
++	space := h.appDataPackets
++	if space.largestSent != pn || len(space.history.packets) == 0 {
++		return
++	}
++	p := space.history.packets[len(space.history.packets)-1]
++	if p != nil && p.IsAckEliciting() && !p.isPathProbePacket && !p.IsPathMTUProbePacket {
++		p.kernelPaced = true
++	}
++}
++
+ func (h *sentPacketHandler) qlogMetricsUpdated() {
+ 	var metricsUpdatedEvent qlog.MetricsUpdated
+ 	var updated bool
+@@ -471,6 +485,11 @@
+ 	}
+
+ 	pnSpace.largestAcked = max(pnSpace.largestAcked, largestAcked)
++	for _, p := range ackedPackets {
++		if p.kernelPaced {
++			pnSpace.largestKernelAcked = max(pnSpace.largestKernelAcked, p.PacketNumber)
++		}
++	}
+
+ 	h.detectLostPackets(rcvTime, encLevel)
+ 	h.ackedPacketsInfo = h.ackedPacketsInfo[:0]
+@@ -848,9 +867,6 @@
+ 	// Minimum time of granularity before packets are deemed lost.
+ 	lossDelay = max(lossDelay, protocol.TimerGranularity)
+
+-	// Packets sent before this time are deemed lost.
+-	lostSendTime := now.Add(-lossDelay)
+-
+ 	cc := h.getCongestionControl()
+
+ 	priorInFlight := h.bytesInFlight
+@@ -860,6 +876,13 @@
+ 		}
+
+ 		var packetLost bool
++		packetLossDelay := lossDelay
++		thresholdAcked := pnSpace.largestAcked
++		if p.kernelPaced {
++			packetLossDelay += protocol.KernelPacingMaxLead
++			thresholdAcked = pnSpace.largestKernelAcked
++		}
++		lostSendTime := now.Add(-packetLossDelay)
+ 		if !p.SendTime.After(lostSendTime) {
+ 			packetLost = true
+ 			if !p.isPathProbePacket && p.IsAckEliciting() {
+@@ -876,7 +899,7 @@
+ 					})
+ 				}
+ 			}
+-		} else if pnSpace.history.Difference(pnSpace.largestAcked, pn) >= packetThreshold {
++		} else if thresholdAcked >= pn && pnSpace.history.Difference(thresholdAcked, pn) >= packetThreshold {
+ 			packetLost = true
+ 			if !p.isPathProbePacket && p.IsAckEliciting() {
+ 				if h.logger.Debug() {
+@@ -892,9 +915,7 @@
+ 					})
+ 				}
+ 			}
+-		} else if pnSpace.lossTime.IsZero() {
+-			// Note: This conditional is only entered once per call
+-			lossTime := p.SendTime.Add(lossDelay)
++		} else if lossTime := p.SendTime.Add(packetLossDelay); pnSpace.lossTime.IsZero() || lossTime.Before(pnSpace.lossTime) {
+ 			if h.logger.Debug() {
+-				h.logger.Debugf("\tsetting loss timer for packet %d (%s) to %s (in %s)", pn, encLevel, lossDelay, lossTime)
++				h.logger.Debugf("\tsetting loss timer for packet %d (%s) to %s (in %s)", pn, encLevel, packetLossDelay, lossTime)
+ 			}
+@@ -1214,6 +1235,7 @@
+ }
+
+ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSize protocol.ByteCount) {
++	h.appDataPackets.largestKernelAcked = protocol.InvalidPacketNumber
+ 	h.congestionMutex.Lock()
+ 	h.maxDatagramSize = initialMaxDatagramSize
+ 	h.congestionMutex.Unlock()
+diff --git a/kernel_pacing.go b/kernel_pacing.go
+--- a/kernel_pacing.go
++++ b/kernel_pacing.go
+@@ -80,7 +80,7 @@
+ 	lastSize      protocol.ByteCount
+ }
+
+-const kernelPacingMaxLead = time.Millisecond
++const kernelPacingMaxLead = protocol.KernelPacingMaxLead
+
+ // EnableKernelPacing asks Linux fq to schedule individual 1-RTT datagrams.
+ // The congestion controller must implement PacingRateBytesPerSecond() uint64.
+@@ -282,6 +282,9 @@
+ 			return nil
+ 		}
+ 		departure, interval := c.kernelPacer.schedule(now, size, rate)
++		if marker, ok := c.sentPacketHandler.(interface{ MarkKernelPaced(protocol.PacketNumber) }); ok {
++			marker.MarkKernelPaced(packet.PacketNumber)
++		}
+ 		// Keep QUIC's existing enqueue-time accounting. Kernel lead is bounded to
+ 		// 1 ms and 32 datagrams; never inject future or foreign-clock timestamps
+ 		// into bandwidth / RTT / PTO accounting.
+diff --git a/internal/protocol/kernel_pacing.go b/internal/protocol/kernel_pacing.go
+new file mode 100644
+--- /dev/null
++++ b/internal/protocol/kernel_pacing.go
+@@ -0,0 +1,6 @@
++package protocol
++
++import "time"
++
++// KernelPacingMaxLead 统一预约提前量与丢失检测的发送时间余量。
++const KernelPacingMaxLead = time.Millisecond
+diff --git a/internal/ackhandler/kernel_pacing_loss_test.go b/internal/ackhandler/kernel_pacing_loss_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/ackhandler/kernel_pacing_loss_test.go
+@@ -0,0 +1,76 @@
++package ackhandler
++
++import (
++	"testing"
++	"time"
++
++	"github.com/apernet/quic-go/internal/monotime"
++	"github.com/apernet/quic-go/internal/protocol"
++	"github.com/apernet/quic-go/internal/utils"
++	"github.com/apernet/quic-go/internal/wire"
++	"github.com/stretchr/testify/require"
++)
++
++// 后发控制包的确认不能把正常预约中的数据误判为丢失。
++func TestKernelPacingLossOrdering(t *testing.T) {
++	for _, laterData := range []bool{false, true} {
++		t.Run(map[bool]string{false: "ControlACK", true: "DataACK"}[laterData], func(t *testing.T) {
++			rtt := utils.NewRTTStats()
++			rtt.UpdateRTT(10*time.Millisecond, 0)
++			h := NewSentPacketHandler(0, 1200, rtt, &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, false, nil, utils.DefaultLogger).(*sentPacketHandler)
++			now := monotime.Now()
++			var tracker packetTracker
++			for pn := protocol.PacketNumber(0); pn <= 4; pn++ {
++				var frames []Frame
++				if pn == 0 || laterData {
++					frames = []Frame{tracker.NewPingFrame(pn)}
++				}
++				h.SentPacket(now, pn, protocol.InvalidPacketNumber, nil, frames, protocol.Encryption1RTT, protocol.ECNNon, 1200, false, false)
++				if pn == 0 || laterData {
++					if marker, ok := any(h).(interface{ MarkKernelPaced(protocol.PacketNumber) }); ok {
++						marker.MarkKernelPaced(pn)
++					}
++				}
++			}
++			_, err := h.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(4)}, protocol.Encryption1RTT, now.Add(500*time.Microsecond))
++			require.NoError(t, err)
++			if laterData {
++				require.Contains(t, tracker.Lost, protocol.PacketNumber(0))
++				return
++			}
++			require.Empty(t, tracker.Lost)
++			h.detectLostPackets(now.Add(11500*time.Microsecond), protocol.Encryption1RTT)
++			require.Empty(t, tracker.Lost, "时间阈值须包含预约提前量")
++			h.detectLostPackets(now.Add(12500*time.Microsecond), protocol.Encryption1RTT)
++			require.Contains(t, tracker.Lost, protocol.PacketNumber(0), "超过预约和RTT后仍须检出真实丢失")
++		})
++	}
++}
++
++func TestKernelPacingMixedDeadlinesAndReset(t *testing.T) {
++	rtt := utils.NewRTTStats()
++	rtt.UpdateRTT(10*time.Millisecond, 0)
++	h := NewSentPacketHandler(0, 1200, rtt, &utils.ConnectionStats{}, false, false, nil, protocol.PerspectiveServer, false, nil, utils.DefaultLogger).(*sentPacketHandler)
++	now := monotime.Now()
++	var tracker packetTracker
++	h.SentPacket(now, 0, protocol.InvalidPacketNumber, nil, []Frame{tracker.NewPingFrame(0)}, protocol.Encryption1RTT, protocol.ECNNon, 1200, false, false)
++	h.MarkKernelPaced(0)
++	h.SentPacket(now.Add(250*time.Microsecond), 1, protocol.InvalidPacketNumber, nil, []Frame{tracker.NewPingFrame(1)}, protocol.Encryption1RTT, protocol.ECNNon, 1200, false, false)
++	h.SentPacket(now.Add(400*time.Microsecond), 2, protocol.InvalidPacketNumber, nil, nil, protocol.Encryption1RTT, protocol.ECNNon, 40, false, false)
++	h.MarkKernelPaced(2)
++	require.False(t, h.appDataPackets.history.packets[2].kernelPaced, "纯ACK不能标记EDT")
++	_, err := h.ReceivedAck(&wire.AckFrame{AckRanges: ackRanges(2)}, protocol.Encryption1RTT, now.Add(500*time.Microsecond))
++	require.NoError(t, err)
++	require.Equal(t, now.Add(11500*time.Microsecond), h.appDataPackets.lossTime)
++	h.detectLostPackets(now.Add(11600*time.Microsecond), protocol.Encryption1RTT)
++	require.Equal(t, []protocol.PacketNumber{1}, tracker.Lost, "软件包不增加预约余量")
++	h.appDataPackets.largestKernelAcked = 2
++	h.MigratedPath(now.Add(12*time.Millisecond), 1200)
++	require.Equal(t, protocol.InvalidPacketNumber, h.appDataPackets.largestKernelAcked)
++	p := getPacket()
++	p.kernelPaced = true
++	putPacket(p)
++	p = getPacket()
++	require.False(t, p.kernelPaced, "包池不能继承EDT标记")
++	putPacket(p)
++}

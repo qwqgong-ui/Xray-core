@@ -2,13 +2,13 @@
 
 [返回功能目录](../features.md)
 
-增加 aggressive 档位的拥塞窗口增益，并缩短确认到 1400 字节之前的 QUIC MTU 探测间隔。这是两项不同层面的调整。
+保留 aggressive 档位的启动窗口调整，并缩短确认到 1400 字节之前的 QUIC MTU 探测间隔。这是两项不同层面的调整。
 
 ## aggressive 窗口
 
-使用 `streamSettings.finalmask.quicParams.bbrProfile: "aggressive"` 选择该档位，并确保实际拥塞控制为 BBR。当前配置中 `highCwndGain` 从上游的 2.25 调整为 2.5，`congestionWindowGainConstant` 从 2.5 调整为 3.0。
+使用 `streamSettings.finalmask.quicParams.bbrProfile: "aggressive"` 选择该档位，并确保实际拥塞控制为 BBR。`highCwndGain` 保持 2.5；稳态 `congestionWindowGainConstant` 已从 3.0 恢复为 2.0，避免双向流量中额外窗口加重反向确认排队。
 
-standard 和 conservative 的档位参数未随此修改一同放大。更大的窗口可能增加在途数据与排队，不代表对所有网络都更快。
+三档稳态窗口增益统一为 2.0，启动、采样保护参数仍有区别。更大的窗口可能增加在途数据与排队，不代表对所有网络都更快。
 
 ## PMTU 探测
 

@@ -1,11 +1,31 @@
 package hysteria
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/apernet/quic-go"
 	"github.com/xtls/xray-core/common/buf"
+	"github.com/xtls/xray-core/common/net"
 )
+
+// 官方透明代理会给无作用域 IPv6 写出 %0，不能误送域名解析。
+func TestUDPReaderIPv6ZeroScope(t *testing.T) {
+	for _, address := range []string{"[2001:db8::1]:53", "[2001:db8::1%0]:53"} {
+		message := UDPMessage{FragCount: 1, Addr: address, Data: []byte{7}}
+		packet := make([]byte, message.Size())
+		message.Serialize(packet)
+		reader := UDPReader{reader: bytes.NewReader(packet), df: &Defragger{}}
+		var payload [8]byte
+		n, destination, err := reader.ReadFrom(payload[:])
+		if err != nil || n != 1 || payload[0] != 7 {
+			t.Fatalf("载荷解析失败: %d %v", n, err)
+		}
+		if destination.Address.Family() != net.AddressFamilyIPv6 || destination.NetAddr() != "[2001:db8::1]:53" {
+			t.Fatalf("%s 被解析为 %v", address, destination)
+		}
+	}
+}
 
 // recorder stands in for the QUIC datagram writer, keeping every serialized
 // message and optionally refusing ones over limit the way quic-go does.

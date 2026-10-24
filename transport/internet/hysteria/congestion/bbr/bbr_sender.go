@@ -105,7 +105,6 @@ type profileConfig struct {
 	highCwndGain                        float64
 	congestionWindowGainConstant        float64
 	numStartupRtts                      int64
-	drainToTarget                       bool
 	detectOvershooting                  bool
 	bytesLostMultiplier                 uint8
 	enableAckAggregationStartup         bool
@@ -133,9 +132,8 @@ func configForProfile(profile Profile) profileConfig {
 		return profileConfig{
 			highGain:                            2.25,
 			highCwndGain:                        1.75,
-			congestionWindowGainConstant:        1.75,
+			congestionWindowGainConstant:        2.0,
 			numStartupRtts:                      2,
-			drainToTarget:                       true,
 			detectOvershooting:                  true,
 			bytesLostMultiplier:                 1,
 			enableOverestimateAvoidance:         true,
@@ -145,7 +143,7 @@ func configForProfile(profile Profile) profileConfig {
 		return profileConfig{
 			highGain:                     3.0,
 			highCwndGain:                 2.5,
-			congestionWindowGainConstant: 3.0,
+			congestionWindowGainConstant: 2.0,
 			numStartupRtts:               4,
 			bytesLostMultiplier:          2,
 			enableAckAggregationStartup:  true,
@@ -287,10 +285,6 @@ type bbrSender struct {
 	// bandwidth increases more than 25%.
 	expireAckAggregationInStartup bool
 
-	// If true, will not exit low gain mode until bytes_in_flight drops below BDP
-	// or it's time for high gain mode.
-	drainToTarget bool
-
 	// If true, slow down pacing rate in STARTUP when overshooting is detected.
 	detectOvershooting bool
 	// Bytes lost while detect_overshooting_ is true.
@@ -327,7 +321,8 @@ func NewBbrSender(
 		clock,
 		initialMaxDatagramSize,
 		initialCongestionWindowPackets*initialMaxDatagramSize,
-		congestion.MaxCongestionWindowPackets*initialMaxDatagramSize,
+		// Leave room for a 2 Gbit/s, 200 ms path without increasing packet-history limits.
+		2*congestion.MaxCongestionWindowPackets*initialMaxDatagramSize,
 		profile,
 	)
 }
@@ -391,7 +386,6 @@ func (b *bbrSender) applyProfile(profile Profile) {
 	b.drainGain = 1.0 / cfg.highGain
 	b.congestionWindowGainConstant = cfg.congestionWindowGainConstant
 	b.numStartupRtts = cfg.numStartupRtts
-	b.drainToTarget = cfg.drainToTarget
 	b.detectOvershooting = cfg.detectOvershooting
 	b.bytesLostMultiplierWhileDetectingOvershooting = cfg.bytesLostMultiplier
 	b.enableAckAggregationDuringStartup = cfg.enableAckAggregationStartup
@@ -464,8 +458,12 @@ func (b *bbrSender) OnPacketSent(
 		priorInFlight = max(0, bytesInFlight-bytes)
 	}
 
-	if isRetransmittable && priorInFlight == 0 {
+	if isRetransmittable && priorInFlight == 0 && b.sampler.IsAppLimited() {
 		b.exitingQuiescence = true
+	}
+	// 满窗口恢复普通采样；独立探测边界仍须等真实 ACK 解除。
+	if isRetransmittable && b.mode != bbrModeProbeRtt && !b.sampler.probeRTTLimited && bytesInFlight+b.maxDatagramSize >= b.GetCongestionWindow() {
+		b.sampler.isAppLimited = false
 	}
 
 	b.sampler.OnPacketSent(sentTime, packetNumber, bytes, priorInFlight, isRetransmittable)
@@ -641,20 +639,6 @@ func (b *bbrSender) OnCongestionEventEx(priorInFlight congestion.ByteCount, even
 	b.calculateRecoveryWindow(bytesAcked, pacingLoss)
 	b.applyECNPolicy(isRoundStart, hasSafetyLoss)
 
-	// Cleanup internal state.
-	// This is where we clean up obsolete (acked or lost) packets from the bandwidth sampler.
-	// The "least unacked" should actually be FirstOutstanding, but since we are not passing
-	// that through OnCongestionEventEx, we will only do an estimate using acked/lost packets
-	// for now. Because of fast retransmission, they should differ by no more than 2 packets.
-	// (this is controlled by packetThreshold in quic-go's sentPacketHandler)
-	var leastUnacked congestion.PacketNumber
-	if len(ackedPackets) != 0 {
-		leastUnacked = ackedPackets[len(ackedPackets)-1].PacketNumber - 2
-	} else {
-		leastUnacked = lostPackets[len(lostPackets)-1].PacketNumber + 1
-	}
-	b.sampler.RemoveObsoletePackets(leastUnacked)
-
 	if isRoundStart {
 		b.numLossEventsInRound = 0
 		b.bytesLostInRound = 0
@@ -693,7 +677,12 @@ func (b *bbrSender) bandwidthForPacer() congestion.ByteCount {
 }
 
 // PacingRateBytesPerSecond exposes the effective rate to optional Linux EDT.
+// A window-limited feedback path keeps software pacing / GSO; zero only
+// disables EDT and never changes the BBR model rate or congestion window.
 func (b *bbrSender) PacingRateBytesPerSecond() uint64 {
+	if b.rttStats != nil && b.GetCongestionWindow() < bdpFromRttAndBandwidth(b.rttStats.SmoothedRTT(), b.PacingRate()) {
+		return 0
+	}
 	return uint64(b.bandwidthForPacer())
 }
 
@@ -816,13 +805,7 @@ func (b *bbrSender) updateGainCyclePhase(now monotime.Time, priorInFlight conges
 	if shouldAdvanceGainCycling {
 		b.cycleCurrentOffset = (b.cycleCurrentOffset + 1) % gainCycleLength
 		b.lastCycleStart = now
-		// Stay in low gain mode until the target BDP is hit.
-		// Low gain mode will be exited immediately when the target BDP is achieved.
-		if b.drainToTarget && b.pacingGain < 1 &&
-			pacingGain[b.cycleCurrentOffset] == 1 &&
-			b.bytesInFlight > b.getTargetCongestionWindow(1) {
-			return
-		}
+		// 保留六个巡航阶段，排空不能覆盖整个带宽探测周期。
 		b.pacingGain = pacingGain[b.cycleCurrentOffset]
 	}
 }
@@ -910,6 +893,8 @@ func (b *bbrSender) maybeEnterOrExitProbeRtt(now monotime.Time, isRoundStart, mi
 
 	if b.mode == bbrModeProbeRtt {
 		b.sampler.OnAppLimited()
+		b.sampler.probeRTTLimited = true
+		b.sampler.endOfProbeRTTPhase = b.sampler.lastSentPacket
 		// b.maybeTraceStateChange(logging.CongestionStateApplicationLimited)
 
 		if b.exitProbeRttAt.IsZero() {

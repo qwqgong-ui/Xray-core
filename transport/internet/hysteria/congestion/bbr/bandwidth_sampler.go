@@ -472,6 +472,9 @@ type bandwidthSampler struct {
 	// Indicates whether the bandwidth sampler is currently in an app-limited
 	// phase.
 	isAppLimited bool
+	// RTT 探测的受限标记只能由后续真实 ACK 解除。
+	probeRTTLimited    bool
+	endOfProbeRTTPhase congestion.PacketNumber
 
 	// The packet that will be acknowledged after this one will cause the sampler
 	// to exit the app-limited phase.
@@ -483,9 +486,6 @@ type bandwidthSampler struct {
 
 	recentAckPoints recentAckPoints
 	a0Candidates    RingBuffer[ackPoint]
-
-	// Maximum number of tracked packets.
-	maxTrackedPackets congestion.ByteCount
 
 	maxAckHeightTracker              *maxAckHeightTracker
 	totalBytesAckedAfterLastAckEvent congestion.ByteCount
@@ -588,6 +588,11 @@ func (b *bandwidthSampler) OnPacketSent(
 		b.lastAckedPacketSentTime = sentTime
 	}
 
+	// 包号跨度有界，控制包形成的大间隙不能造成无界稀疏槽分配。
+	const maxTrackedPacketSpan = 65536
+	if !b.connectionStateMap.IsEmpty() && packetNumber-b.connectionStateMap.FirstPacket() >= maxTrackedPacketSpan {
+		b.connectionStateMap.RemoveUpTo(packetNumber - maxTrackedPacketSpan + 1)
+	}
 	b.connectionStateMap.Emplace(packetNumber, newConnectionStateOnSentPacket(
 		sentTime,
 		bytes,
@@ -679,6 +684,7 @@ func (b *bandwidthSampler) OnPacketLost(packetNumber congestion.PacketNumber, by
 	b.totalBytesLost += bytesLost
 	if sentPacketPointer := b.connectionStateMap.GetEntry(packetNumber); sentPacketPointer != nil {
 		sentPacketToSendTimeState(sentPacketPointer, &s)
+		b.connectionStateMap.Remove(packetNumber, nil)
 	}
 	return s
 }
@@ -692,15 +698,6 @@ func (b *bandwidthSampler) OnPacketNeutered(packetNumber congestion.PacketNumber
 func (b *bandwidthSampler) OnAppLimited() {
 	b.isAppLimited = true
 	b.endOfAppLimitedPhase = b.lastSentPacket
-}
-
-func (b *bandwidthSampler) RemoveObsoletePackets(leastUnacked congestion.PacketNumber) {
-	// A packet can become obsolete when it is removed from QuicUnackedPacketMap's
-	// view of inflight before it is acked or marked as lost. For example, when
-	// QuicSentPacketManager::RetransmitCryptoPackets retransmits a crypto packet,
-	// the packet is removed from QuicUnackedPacketMap's inflight, but is not
-	// marked as acked or lost in the BandwidthSampler.
-	b.connectionStateMap.RemoveUpTo(leastUnacked)
 }
 
 func (b *bandwidthSampler) TotalBytesSent() congestion.ByteCount {
@@ -767,6 +764,7 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime monotime.Time, packetNum
 	if sentPacketPointer == nil {
 		return *sample
 	}
+	defer b.connectionStateMap.Remove(packetNumber, nil)
 
 	// OnPacketAcknowledgedInner
 	b.totalBytesAcked += sentPacketPointer.size
@@ -787,6 +785,9 @@ func (b *bandwidthSampler) onPacketAcknowledged(ackTime monotime.Time, packetNum
 			packetNumber > b.endOfAppLimitedPhase {
 			b.isAppLimited = false
 		}
+	}
+	if b.probeRTTLimited && (b.endOfProbeRTTPhase == invalidPacketNumber || packetNumber > b.endOfProbeRTTPhase) {
+		b.probeRTTLimited = false
 	}
 
 	// There might have been no packets acknowledged at the moment when the

@@ -40,6 +40,28 @@ func (c *fqTestPacketConn) WriteBatch(messages []ipv4.Message, flags int) (int, 
 	return c.batch.WriteBatch(messages, flags)
 }
 
+// Dynamic window checks can legitimately leave the connection in software
+// pacing after its final write. Observe activation over the entire transfer.
+func observeKernelPacing(parent context.Context, conn *quic.Conn) func() bool {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan bool, 1)
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		seen := conn.KernelPacingEnabled()
+		for {
+			select {
+			case <-ticker.C:
+				seen = seen || conn.KernelPacingEnabled()
+			case <-ctx.Done():
+				done <- seen || conn.KernelPacingEnabled()
+				return
+			}
+		}
+	}()
+	return func() bool { cancel(); return <-done }
+}
+
 // Run the server and client roles in isolated veth namespaces with fq. This
 // exercises HY2 HTTP/3 authentication, controller replacement, TCP streams,
 // bidirectional ACKs, PMTU and two clients sharing the server UDP socket.
@@ -69,7 +91,7 @@ func TestBBRFQEndToEnd(t *testing.T) {
 		defer ql.Close()
 		done := make(chan error, 2)
 		listener := &Listener{config: &Config{Auth: "fq-test"}, quicParams: params}
-		var accepted []*quic.Conn
+		var observations []func() bool
 		listener.addConn = func(conn stat.Connection) {
 			go func() {
 				defer conn.Close()
@@ -90,7 +112,7 @@ func TestBBRFQEndToEnd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			accepted = append(accepted, conn)
+			observations = append(observations, observeKernelPacing(ctx, conn))
 			go listener.handleClient(conn)
 		}
 		for range 2 {
@@ -103,9 +125,10 @@ func TestBBRFQEndToEnd(t *testing.T) {
 				t.Fatal(ctx.Err())
 			}
 		}
-		for _, conn := range accepted {
-			if expected := os.Getenv("QUIC_KERNEL_PACING_EXPECT_FQ"); expected != "" && conn.KernelPacingEnabled() != (expected != "0") {
-				t.Fatalf("server EDT active=%t, expected=%s", conn.KernelPacingEnabled(), expected)
+		for _, observed := range observations {
+			seen := observed()
+			if expected := os.Getenv("QUIC_KERNEL_PACING_EXPECT_FQ"); expected != "" && seen != (expected != "0") {
+				t.Fatalf("server EDT observed=%t, expected=%s", seen, expected)
 			}
 		}
 		// Wait for peer closure so final stream data and ACKs have been received.
@@ -132,6 +155,7 @@ func TestBBRFQEndToEnd(t *testing.T) {
 			}
 			defer c.close()
 			defer conn.Close()
+			observed := observeKernelPacing(ctx, c.conn)
 			conn.SetDeadline(time.Now().Add(20 * time.Second))
 			_, err = conn.Write(payload)
 			if err != nil {
@@ -147,8 +171,9 @@ func TestBBRFQEndToEnd(t *testing.T) {
 					err = fmt.Errorf("download contents differ")
 				}
 			}
-			if expected := os.Getenv("QUIC_KERNEL_PACING_EXPECT_FQ"); err == nil && expected != "" && c.conn.KernelPacingEnabled() != (expected != "0") {
-				err = fmt.Errorf("client EDT active=%t, expected=%s", c.conn.KernelPacingEnabled(), expected)
+			seen := observed()
+			if expected := os.Getenv("QUIC_KERNEL_PACING_EXPECT_FQ"); err == nil && expected != "" && seen != (expected != "0") {
+				err = fmt.Errorf("client EDT observed=%t, expected=%s", seen, expected)
 			}
 			done <- err
 		}()

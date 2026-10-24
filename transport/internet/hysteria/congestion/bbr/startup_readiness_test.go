@@ -2,6 +2,7 @@ package bbr
 
 import (
 	"github.com/apernet/quic-go/congestion"
+	"github.com/apernet/quic-go/monotime"
 	"github.com/stretchr/testify/require"
 	"testing"
 )
@@ -46,4 +47,24 @@ func TestAppLimitedSamplesCannotSuppressLossStartupExit(t *testing.T) {
 	b.bytesLostInRound = 1200
 	b.checkIfFullBandwidthReached(&sendTimeState{isValid: true, isAppLimited: true, bytesInFlight: 1200})
 	require.True(t, b.isAtFullBandwidth, "loss still ends STARTUP for an application-limited sample")
+}
+
+func TestFullFlightPlateauExitsDespiteProducerQueueGaps(t *testing.T) {
+	for _, fullFlight := range []bool{false, true} {
+		b, _ := newECNTestSender()
+		b.congestionWindow = b.getTargetCongestionWindow(b.highCwndGain)
+		b.lastSampleIsAppLimited = true
+		state := sendTimeState{isValid: true, isAppLimited: true, bytesInFlight: 1200}
+		if fullFlight {
+			state.bytesInFlight = b.congestionWindow
+		}
+		for i := int64(0); i <= b.numStartupRtts; i++ {
+			b.OnAppLimited()
+			b.OnPacketSent(monotime.Now(), state.bytesInFlight, congestion.PacketNumber(i+1), 1200, true)
+			state = b.sampler.connectionStateMap.GetEntry(congestion.PacketNumber(i + 1)).sendTimeState
+			b.lastSampleIsAppLimited = state.isAppLimited
+			b.checkIfFullBandwidthReached(&state)
+		}
+		require.Equal(t, fullFlight, b.isAtFullBandwidth, "满窗口与真正稀疏流量必须区分")
+	}
 }

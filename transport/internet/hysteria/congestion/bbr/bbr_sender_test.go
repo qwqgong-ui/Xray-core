@@ -38,13 +38,14 @@ func TestBBRPostSendFlightStartsAndRestartsSampler(t *testing.T) {
 	const size = congestion.ByteCount(1200)
 	now := monotime.Now()
 	b.OnPacketSent(now, size, 1, size, true)
-	require.True(t, b.exitingQuiescence)
+	require.False(t, b.exitingQuiescence, "empty flight alone is not an idle application")
 	state := b.sampler.connectionStateMap.GetEntry(1)
 	require.Equal(t, size, state.sendTimeState.bytesInFlight)
 	require.Equal(t, now, state.lastAckedPacketSentTime)
 	b.OnCongestionEventEx(size, now.Add(20*time.Millisecond), []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: size}}, nil)
 	require.Positive(t, b.bandwidthEstimate())
 	b.exitingQuiescence = false
+	b.OnAppLimited()
 	b.OnPacketSent(now.Add(time.Second), size, 2, size, true)
 	require.True(t, b.exitingQuiescence)
 	require.Equal(t, now.Add(time.Second), b.sampler.connectionStateMap.GetEntry(2).lastAckedPacketSentTime)
@@ -81,6 +82,7 @@ func TestBBREffectivePacingRatePreservesSlowLink(t *testing.T) {
 func TestBBRSmallFlightACKIsNotApplicationLimited(t *testing.T) {
 	b, _ := newECNTestSender()
 	now := monotime.Now()
+	b.minRttTimestamp = now
 	b.OnPacketSent(now, 1200, 1, 1200, true)
 	b.OnCongestionEventEx(1200, now.Add(20*time.Millisecond), []congestion.AckedPacketInfo{{PacketNumber: 1, BytesAcked: 1200}}, nil)
 	require.False(t, b.sampler.IsAppLimited())
@@ -119,7 +121,6 @@ func TestNewBbrSenderAppliesProfiles(t *testing.T) {
 		highCwndGain                        float64
 		congestionWindowGainConstant        float64
 		numStartupRtts                      int64
-		drainToTarget                       bool
 		detectOvershooting                  bool
 		bytesLostMultiplier                 uint8
 		enableAckAggregationDuringStartup   bool
@@ -141,9 +142,8 @@ func TestNewBbrSenderAppliesProfiles(t *testing.T) {
 			profile:                             ProfileConservative,
 			highGain:                            2.25,
 			highCwndGain:                        1.75,
-			congestionWindowGainConstant:        1.75,
+			congestionWindowGainConstant:        2.0,
 			numStartupRtts:                      2,
-			drainToTarget:                       true,
 			detectOvershooting:                  true,
 			bytesLostMultiplier:                 1,
 			enableOverestimateAvoidance:         true,
@@ -154,7 +154,7 @@ func TestNewBbrSenderAppliesProfiles(t *testing.T) {
 			profile:                           ProfileAggressive,
 			highGain:                          3.0,
 			highCwndGain:                      2.5,
-			congestionWindowGainConstant:      3.0,
+			congestionWindowGainConstant:      2.0,
 			numStartupRtts:                    4,
 			bytesLostMultiplier:               2,
 			enableAckAggregationDuringStartup: true,
@@ -170,7 +170,6 @@ func TestNewBbrSenderAppliesProfiles(t *testing.T) {
 			require.Equal(t, tc.highCwndGain, b.highCwndGain)
 			require.Equal(t, tc.congestionWindowGainConstant, b.congestionWindowGainConstant)
 			require.Equal(t, tc.numStartupRtts, b.numStartupRtts)
-			require.Equal(t, tc.drainToTarget, b.drainToTarget)
 			require.Equal(t, tc.detectOvershooting, b.detectOvershooting)
 			require.Equal(t, tc.bytesLostMultiplier, b.bytesLostMultiplierWhileDetectingOvershooting)
 			require.Equal(t, tc.enableAckAggregationDuringStartup, b.enableAckAggregationDuringStartup)
